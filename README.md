@@ -164,9 +164,47 @@ For optimal isolation and management of dependencies, use Anaconda. This setup e
    pip install python-binance ta-lib numpy pandas sqlalchemy requests tenacity
    ```  
    - Note: If `ta-lib` fails, install the system library first:  
-     ```bash
-     sudo apt update && sudo apt install libta-lib0 libta-lib0-dev
-     ```
+     ### Simplified TA-Lib Installation (Version 0.6.4) on Ubuntu 24.04
+
+To install the latest TA-Lib (v0.6.4) on Ubuntu 24.04:
+
+1. **Install Build Tools**:
+   ```bash
+   sudo apt update
+   sudo apt install -y build-essential wget autoconf automake libtool pkg-config python3-dev python3-pip
+   ```
+
+2. **Download and Build TA-Lib**:
+   ```bash
+   wget https://github.com/TA-Lib/ta-lib/releases/download/v0.6.4/ta-lib-0.6.4-src.tar.gz
+   tar -xzf ta-lib-0.6.4-src.tar.gz
+   cd ta-lib-0.6.4
+   ./autogen.sh
+   ./configure --prefix=/usr
+   make -j$(nproc)
+   sudo make install
+   sudo ldconfig
+   ```
+
+3. **Install Python TA-Lib (v0.6.8)**:
+   ```bash
+   pip3 install TA-Lib==0.6.8
+   ```
+
+4. **Verify Installation**:
+   ```bash
+   pkg-config --modversion ta-lib  # Should show "0.6.4"
+   python3 -c "import talib; print(talib.__version__)"  # Should show "0.6.8"
+   ```
+
+### Notes
+- If `pip3 install` fails, try:
+  ```bash
+  TA_INCLUDE_PATH=/usr/include TA_LIBRARY_PATH=/usr/lib pip3 install TA-Lib==0.6.8
+  ```
+- If errors occur during `./configure` or `make`, ensure all dependencies are installed or run `autoreconf -fiv` before `./configure`.
+
+Let me know if you hit any issues!
 
 6. **Verify Installation**:  
    Run `conda list` to check packages. Test Python:  
