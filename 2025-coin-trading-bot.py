@@ -27,7 +27,7 @@ RSI_PERIOD = 14
 HISTORY_DAYS = 15  # Track 15 days of history
 KLINE_INTERVAL = '1h'  # Hourly klines for history
 PROFIT_TARGET = 0.008  # 0.8% profit
-FEE_BUFFER = 0.0002  # 0.02% round-trip fee estimate (based on 0% maker, 0.01% taker)
+FEE_BUFFER = 0.02  # 2% round-trip fee (1% per buy/sell)
 RISK_PER_TRADE = 0.10  # 10% of balance per trade
 MIN_BALANCE = 2.0  # Minimum USDT to keep
 ORDER_TIMEOUT = 300  # 5 minutes for limit orders
@@ -224,7 +224,8 @@ def store_historical_data(client, session, symbol):
     try:
         end_time = datetime.now(CST_TZ)
         start_time = end_time - timedelta(days=HISTORY_DAYS)
-        klines = client.get_historical_klines(symbol, KLINE_INTERVAL, start_time.strftime("%d %b %Y %H:%M:%S"))
+        start_ms = int(start_time.timestamp() * 1000)
+        klines = client.get_historical_klines(symbol, KLINE_INTERVAL, start_ms)
         for kline in klines:
             ts = datetime.fromtimestamp(kline[0]/1000, tz=CST_TZ)
             candle = Candle(
@@ -323,10 +324,11 @@ def execute_buy(client, session, symbol):
         order_status = client.get_order(symbol=symbol, orderId=order['orderId'])
         if order_status['status'] == 'FILLED':
             entry_time = datetime.now(CST_TZ)
-            pos = Position(symbol=symbol, qty=qty, entry_price=current_price, entry_time=entry_time)
+            entry_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])  # Actual filled price
+            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time)
             session.add(pos)
             session.commit()
-            send_whatsapp_alert(f"BUY filled {symbol} @ {current_price} qty {qty}")
+            send_whatsapp_alert(f"BUY filled {symbol} @ {entry_price} qty {qty}")
             return
         time.sleep(30)
     cancel_order(client, symbol, order['orderId'])
@@ -335,10 +337,11 @@ def execute_buy(client, session, symbol):
         try:
             mkt_order = client.order_market_buy(symbol=symbol, quantity=qty)
             entry_time = datetime.now(CST_TZ)
-            pos = Position(symbol=symbol, qty=qty, entry_price=mkt_order['fills'][0]['price'], entry_time=entry_time)
+            entry_price = sum(float(f['price']) * float(f['qty']) for f in mkt_order['fills']) / sum(float(f['qty']) for f in mkt_order['fills'])
+            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time)
             session.add(pos)
             session.commit()
-            send_whatsapp_alert(f"BUY market filled {symbol} qty {qty}")
+            send_whatsapp_alert(f"BUY market filled {symbol} @ {entry_price} qty {qty}")
         except Exception as e:
             logger.error(f"Market buy fallback failed: {e}")
 
@@ -368,7 +371,7 @@ def execute_sell(client, session, symbol, position):
         order = place_limit_sell(client, symbol, sell_price, qty)
     if order:
         exit_time = datetime.now(CST_TZ)
-        exit_price = float(order['fills'][0]['price']) if 'fills' in order else current_price
+        exit_price = float(order['cummulativeQuoteQty']) / float(order['executedQty']) if 'cummulativeQuoteQty' in order else current_price
         profit = (exit_price - position['entry_price']) * qty
         trade = Trade(
             symbol=symbol, entry_time=position['entry_time'], entry_price=position['entry_price'],
@@ -386,6 +389,18 @@ def get_all_usdt_symbols(client):
     except Exception as e:
         logger.error(f"Failed to get symbols: {e}")
         return []
+
+def graceful_shutdown(session):
+    try:
+        session.commit()
+        logger.info("Committed pending changes")
+    except Exception as e:
+        logger.error(f"Commit failed during shutdown: {e}")
+        session.rollback()
+    finally:
+        session.close()
+        logger.info("Database session closed")
+        send_whatsapp_alert("Bot Shutdown: Gracefully stopped. All data saved.")
 
 # === MAIN EXECUTION ===
 if __name__ == "__main__":
@@ -415,7 +430,10 @@ if __name__ == "__main__":
 
             time.sleep(LOOP_INTERVAL)
     except KeyboardInterrupt:
-        logger.info("Shutdown initiated")
+        logger.info("KeyboardInterrupt: Initiating graceful shutdown")
+        graceful_shutdown(session)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        graceful_shutdown(session)
     finally:
-        session.close()
         logger.info("Shutdown complete")
