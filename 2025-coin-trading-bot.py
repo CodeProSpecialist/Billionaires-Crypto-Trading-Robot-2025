@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import math
 from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException
@@ -112,6 +113,116 @@ def calculate_rsi(prices, period=RSI_PERIOD):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+def get_symbol_filters(client, symbol):
+    """Fetch and parse exchange filters for a symbol."""
+    try:
+        info = client.get_exchange_info(symbol=symbol)
+        symbol_info = next(s for s in info['symbols'] if s['symbol'] == symbol)
+        filters = {}
+        for f in symbol_info['filters']:
+            ftype = f['filterType']
+            params = {}
+            if ftype == 'LOT_SIZE':
+                params = {
+                    'minQty': float(f.get('minQty')),
+                    'maxQty': float(f.get('maxQty')),
+                    'stepSize': float(f.get('stepSize'))
+                }
+            elif ftype == 'MIN_NOTIONAL':
+                params = {'minNotional': float(f.get('minNotional'))}
+            elif ftype == 'PRICE_FILTER':
+                params = {
+                    'minPrice': float(f.get('minPrice')),
+                    'maxPrice': float(f.get('maxPrice')),
+                    'tickSize': float(f.get('tickSize'))
+                }
+            filters[ftype] = params
+        return filters
+    except Exception as e:
+        logger.error(f"Failed to get filters for {symbol}: {e}")
+        return {}
+
+def round_to_step_size(value, step_size):
+    """Round value to the nearest multiple of step_size."""
+    if value == 0 or step_size == 0:
+        return 0
+    return round(value / step_size) * step_size
+
+def round_to_tick_size(value, tick_size):
+    """Round value to the nearest multiple of tick_size."""
+    if value == 0 or tick_size == 0:
+        return 0
+    return round(value / tick_size) * tick_size
+
+def validate_and_adjust_order(client, symbol, side, order_type, quantity, price=None, current_price=None):
+    """Validate and adjust order parameters based on exchange filters."""
+    filters = get_symbol_filters(client, symbol)
+    adjusted_qty = quantity
+    adjusted_price = price
+
+    # Adjust quantity for LOT_SIZE
+    lot_filter = filters.get('LOT_SIZE', {})
+    if lot_filter:
+        step_size = lot_filter.get('stepSize', 0)
+        adjusted_qty = round_to_step_size(adjusted_qty, step_size)
+        min_qty = lot_filter.get('minQty', 0)
+        max_qty = lot_filter.get('maxQty', float('inf'))
+        if adjusted_qty < min_qty:
+            adjusted_qty = min_qty
+        if adjusted_qty > max_qty:
+            adjusted_qty = max_qty
+        if adjusted_qty < min_qty:
+            return None, f"Quantity below minQty after adjustment: {adjusted_qty}"
+
+    # Adjust price for PRICE_FILTER if provided
+    if adjusted_price is not None:
+        price_filter = filters.get('PRICE_FILTER', {})
+        if price_filter:
+            tick_size = price_filter.get('tickSize', 0)
+            adjusted_price = round_to_tick_size(adjusted_price, tick_size)
+            min_price = price_filter.get('minPrice', 0)
+            max_price = price_filter.get('maxPrice', float('inf'))
+            if adjusted_price < min_price:
+                adjusted_price = min_price
+            if adjusted_price > max_price:
+                adjusted_price = max_price
+            if adjusted_price < min_price:
+                return None, f"Price below minPrice after adjustment: {adjusted_price}"
+
+    # Check MIN_NOTIONAL
+    min_notional_filter = filters.get('MIN_NOTIONAL', {})
+    min_notional = min_notional_filter.get('minNotional', 0)
+    if min_notional > 0:
+        effective_price = adjusted_price or current_price
+        if effective_price is None:
+            return None, "No effective price available for MIN_NOTIONAL check"
+        notional = adjusted_qty * effective_price
+        if notional < min_notional:
+            # Adjust qty upward
+            needed_qty = min_notional / effective_price
+            adjusted_qty = max(adjusted_qty, needed_qty)
+            # Re-apply LOT_SIZE rounding
+            if lot_filter:
+                step_size = lot_filter.get('stepSize', 0)
+                adjusted_qty = round_to_step_size(adjusted_qty, step_size)
+                max_qty = lot_filter.get('maxQty', float('inf'))
+                if adjusted_qty > max_qty:
+                    return None, f"Adjusted qty exceeds maxQty for MIN_NOTIONAL: {adjusted_qty}"
+            notional = adjusted_qty * effective_price
+            if notional < min_notional:
+                return None, f"Still below MIN_NOTIONAL after adjustment: {notional}"
+
+    # Optionally test the order (uncomment if using test orders)
+    # try:
+    #     test_params = {'symbol': symbol, 'side': side, 'type': order_type, 'quantity': adjusted_qty}
+    #     if adjusted_price:
+    #         test_params['price'] = adjusted_price
+    #     client.create_test_order(**test_params)
+    # except BinanceOrderException as e:
+    #     return None, f"Test order failed: {e.message}"
+
+    return {'quantity': adjusted_qty, 'price': adjusted_price}, None
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_momentum_status(client, symbol):
     try:
@@ -190,35 +301,106 @@ def get_balance(client, asset='USDT'):
 def get_open_positions(session):
     return {p.symbol: {'qty': p.qty, 'entry_price': p.entry_price, 'entry_time': p.entry_time, 'buy_fee': p.buy_fee} for p in session.query(Position).all()}
 
-def place_limit_buy(client, symbol, price, qty):
+def place_limit_buy(client, symbol, price, qty, current_price):
+    adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', 'LIMIT', qty, price, current_price)
+    if error:
+        logger.error(f"Order validation failed for {symbol}: {error}")
+        send_whatsapp_alert(f"BUY validation failed {symbol}: {error}")
+        return None
     try:
-        order = client.order_limit_buy(symbol=symbol, quantity=qty, price=price)
-        logger.info(f"Placed limit buy for {symbol} at {price} qty {qty}: {order}")
-        send_whatsapp_alert(f"Placed BUY limit {symbol} @ {price} qty {qty}")
+        order = client.order_limit_buy(symbol=symbol, quantity=adjusted['quantity'], price=adjusted['price'])
+        logger.info(f"Placed limit buy for {symbol} at {adjusted['price']} qty {adjusted['quantity']}: {order}")
+        send_whatsapp_alert(f"Placed BUY limit {symbol} @ {adjusted['price']} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
+        if 'Filter failure' in str(e) or '-201' in str(e.code):
+            logger.error(f"Filter error in buy for {symbol}: {e}. Retrying once...")
+            # Retry once with fresh validation
+            adjusted_retry, error_retry = validate_and_adjust_order(client, symbol, 'BUY', 'LIMIT', qty, price, current_price)
+            if not error_retry:
+                try:
+                    order = client.order_limit_buy(symbol=symbol, quantity=adjusted_retry['quantity'], price=adjusted_retry['price'])
+                    return order
+                except BinanceOrderException:
+                    pass
         logger.error(f"Buy order failed for {symbol}: {e}")
         send_whatsapp_alert(f"BUY failed {symbol}: {e.message}")
         return None
 
-def place_market_sell(client, symbol, qty):
+def place_market_buy(client, symbol, qty, current_price):
+    adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', 'MARKET', qty, current_price=current_price)
+    if error:
+        logger.error(f"Order validation failed for {symbol}: {error}")
+        send_whatsapp_alert(f"MARKET BUY validation failed {symbol}: {error}")
+        return None
     try:
-        order = client.order_market_sell(symbol=symbol, quantity=qty)
-        logger.info(f"Placed market sell for {symbol} qty {qty}: {order}")
-        send_whatsapp_alert(f"Placed SELL market {symbol} qty {qty}")
+        order = client.order_market_buy(symbol=symbol, quantity=adjusted['quantity'])
+        logger.info(f"Placed market buy for {symbol} qty {adjusted['quantity']}: {order}")
+        send_whatsapp_alert(f"Placed BUY market {symbol} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
+        if 'Filter failure' in str(e) or '-201' in str(e.code):
+            logger.error(f"Filter error in market buy for {symbol}: {e}. Retrying once...")
+            # Retry once
+            adjusted_retry, _ = validate_and_adjust_order(client, symbol, 'BUY', 'MARKET', qty, current_price=current_price)
+            if adjusted_retry:
+                try:
+                    order = client.order_market_buy(symbol=symbol, quantity=adjusted_retry['quantity'])
+                    return order
+                except BinanceOrderException:
+                    pass
+        logger.error(f"Market buy order failed for {symbol}: {e}")
+        send_whatsapp_alert(f"MARKET BUY failed {symbol}: {e.message}")
+        return None
+
+def place_market_sell(client, symbol, qty):
+    adjusted, error = validate_and_adjust_order(client, symbol, 'SELL', 'MARKET', qty)
+    if error:
+        logger.error(f"Order validation failed for {symbol}: {error}")
+        send_whatsapp_alert(f"MARKET SELL validation failed {symbol}: {error}")
+        return None
+    try:
+        order = client.order_market_sell(symbol=symbol, quantity=adjusted['quantity'])
+        logger.info(f"Placed market sell for {symbol} qty {adjusted['quantity']}: {order}")
+        send_whatsapp_alert(f"Placed SELL market {symbol} qty {adjusted['quantity']}")
+        return order
+    except BinanceOrderException as e:
+        if 'Filter failure' in str(e) or '-201' in str(e.code):
+            logger.error(f"Filter error in sell for {symbol}: {e}. Retrying once...")
+            # Retry once
+            adjusted_retry, _ = validate_and_adjust_order(client, symbol, 'SELL', 'MARKET', qty)
+            if adjusted_retry:
+                try:
+                    order = client.order_market_sell(symbol=symbol, quantity=adjusted_retry['quantity'])
+                    return order
+                except BinanceOrderException:
+                    pass
         logger.error(f"Sell order failed for {symbol}: {e}")
         send_whatsapp_alert(f"SELL failed {symbol}: {e.message}")
         return None
 
 def place_limit_sell(client, symbol, price, qty):
+    adjusted, error = validate_and_adjust_order(client, symbol, 'SELL', 'LIMIT', qty, price)
+    if error:
+        logger.error(f"Order validation failed for {symbol}: {error}")
+        send_whatsapp_alert(f"SELL validation failed {symbol}: {error}")
+        return None
     try:
-        order = client.order_limit_sell(symbol=symbol, quantity=qty, price=price)
-        logger.info(f"Placed limit sell for {symbol} at {price} qty {qty}: {order}")
-        send_whatsapp_alert(f"Placed SELL limit {symbol} @ {price} qty {qty}")
+        order = client.order_limit_sell(symbol=symbol, quantity=adjusted['quantity'], price=adjusted['price'])
+        logger.info(f"Placed limit sell for {symbol} at {adjusted['price']} qty {adjusted['quantity']}: {order}")
+        send_whatsapp_alert(f"Placed SELL limit {symbol} @ {adjusted['price']} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
+        if 'Filter failure' in str(e) or '-201' in str(e.code):
+            logger.error(f"Filter error in sell for {symbol}: {e}. Retrying once...")
+            # Retry once with fresh validation
+            adjusted_retry, error_retry = validate_and_adjust_order(client, symbol, 'SELL', 'LIMIT', qty, price)
+            if not error_retry:
+                try:
+                    order = client.order_limit_sell(symbol=symbol, quantity=adjusted_retry['quantity'], price=adjusted_retry['price'])
+                    return order
+                except BinanceOrderException:
+                    pass
         logger.error(f"Sell order failed for {symbol}: {e}")
         send_whatsapp_alert(f"SELL failed {symbol}: {e.message}")
         return None
@@ -323,12 +505,15 @@ def execute_buy(client, session, symbol):
     if balance <= MIN_BALANCE:
         send_whatsapp_alert("Low balance, skipping buy")
         return
-    current_price = fetch_current_data(client, symbol)['price']
+    current = fetch_current_data(client, symbol)
+    if not current:
+        return
+    current_price = current['price']
     maker_fee, taker_fee = get_trade_fees(client, symbol)
     alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
     qty = alloc / current_price
     buy_price = current_price * 0.999  # Slippage buffer
-    order = place_limit_buy(client, symbol, buy_price, qty)
+    order = place_limit_buy(client, symbol, buy_price, qty, current_price)
     if not order:
         return
     start = time.time()
@@ -338,29 +523,33 @@ def execute_buy(client, session, symbol):
             entry_time = datetime.now(CST_TZ)
             entry_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])
             buy_fee = maker_fee  # Limit buy uses maker fee
-            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time, buy_fee=buy_fee)
+            pos = Position(symbol=symbol, qty=float(order_status['executedQty']), entry_price=entry_price, entry_time=entry_time, buy_fee=buy_fee)
             session.add(pos)
             session.commit()
-            send_whatsapp_alert(f"BUY filled {symbol} @ {entry_price} qty {qty} fee {buy_fee*100:.2f}%")
+            send_whatsapp_alert(f"BUY filled {symbol} @ {entry_price} qty {order_status['executedQty']} fee {buy_fee*100:.2f}%")
             return
         time.sleep(30)
     cancel_order(client, symbol, order['orderId'])
     # Fallback to market if still signal
     if check_buy_signal(client, session, symbol, get_open_positions(session)):
         try:
-            mkt_order = client.order_market_buy(symbol=symbol, quantity=qty)
-            entry_time = datetime.now(CST_TZ)
-            entry_price = sum(float(f['price']) * float(f['qty']) for f in mkt_order['fills']) / sum(float(f['qty']) for f in mkt_order['fills'])
-            buy_fee = taker_fee  # Market buy uses taker fee
-            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time, buy_fee=buy_fee)
-            session.add(pos)
-            session.commit()
-            send_whatsapp_alert(f"BUY market filled {symbol} @ {entry_price} qty {qty} fee {buy_fee*100:.2f}%")
+            mkt_order = place_market_buy(client, symbol, qty, current_price)
+            if mkt_order:
+                entry_time = datetime.now(CST_TZ)
+                entry_price = sum(float(f['price']) * float(f['qty']) for f in mkt_order['fills']) / sum(float(f['qty']) for f in mkt_order['fills'])
+                buy_fee = taker_fee  # Market buy uses taker fee
+                pos = Position(symbol=symbol, qty=sum(float(f['qty']) for f in mkt_order['fills']), entry_price=entry_price, entry_time=entry_time, buy_fee=buy_fee)
+                session.add(pos)
+                session.commit()
+                send_whatsapp_alert(f"BUY market filled {symbol} @ {entry_price} qty {mkt_order['executedQty']} fee {buy_fee*100:.2f}%")
         except Exception as e:
             logger.error(f"Market buy fallback failed: {e}")
 
 def check_sell_signal(client, symbol, position):
-    current_price = fetch_current_data(client, symbol)['price']
+    current = fetch_current_data(client, symbol)
+    if not current:
+        return False, None
+    current_price = current['price']
     maker_fee, taker_fee = get_trade_fees(client, symbol)
     # Use actual buy fee from position, estimate sell fee (worst-case taker for market, maker for limit)
     buy_fee = position['buy_fee']
@@ -376,27 +565,54 @@ def check_sell_signal(client, symbol, position):
 
 def execute_sell(client, session, symbol, position):
     qty = position['qty']
-    current_price = fetch_current_data(client, symbol)['price']
+    current = fetch_current_data(client, symbol)
+    if not current:
+        return
+    current_price = current['price']
     should_sell, order_type, sell_fee = check_sell_signal(client, symbol, position)
     if not should_sell:
         return
     if order_type == 'market':
         order = place_market_sell(client, symbol, qty)
+        if order:
+            exit_time = datetime.now(CST_TZ)
+            exit_price = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / sum(float(f['qty']) for f in order['fills'])
+            profit = (exit_price - position['entry_price']) * sum(float(f['qty']) for f in order['fills']) - (sell_fee * exit_price * sum(float(f['qty']) for f in order['fills']))
+            trade = Trade(
+                symbol=symbol, entry_time=position['entry_time'], entry_price=position['entry_price'],
+                qty=sum(float(f['qty']) for f in order['fills']), exit_time=exit_time, exit_price=exit_price, profit=profit
+            )
+            session.add(trade)
+            session.query(Position).filter(Position.symbol == symbol).delete()
+            session.commit()
+            send_whatsapp_alert(f"SOLD market {symbol} @ {exit_price} profit {profit:.2f} USDT fee {sell_fee*100:.2f}%")
     else:
         sell_price = position['entry_price'] * (1 + PROFIT_TARGET + position['buy_fee'] + sell_fee)
         order = place_limit_sell(client, symbol, sell_price, qty)
-    if order:
-        exit_time = datetime.now(CST_TZ)
-        exit_price = float(order['cummulativeQuoteQty']) / float(order['executedQty']) if 'cummulativeQuoteQty' in order else current_price
-        profit = (exit_price - position['entry_price']) * qty
-        trade = Trade(
-            symbol=symbol, entry_time=position['entry_time'], entry_price=position['entry_price'],
-            qty=qty, exit_time=exit_time, exit_price=exit_price, profit=profit
-        )
-        session.add(trade)
-        session.query(Position).filter(Position.symbol == symbol).delete()
-        session.commit()
-        send_whatsapp_alert(f"SOLD {symbol} @ {exit_price} profit {profit:.2f} USDT fee {sell_fee*100:.2f}%")
+        if order:
+            # For limit sell, wait for fill similar to buy
+            start = time.time()
+            while time.time() - start < ORDER_TIMEOUT:
+                order_status = client.get_order(symbol=symbol, orderId=order['orderId'])
+                if order_status['status'] == 'FILLED':
+                    exit_time = datetime.now(CST_TZ)
+                    exit_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])
+                    profit = (exit_price - position['entry_price']) * float(order_status['executedQty']) - (sell_fee * exit_price * float(order_status['executedQty']))
+                    trade = Trade(
+                        symbol=symbol, entry_time=position['entry_time'], entry_price=position['entry_price'],
+                        qty=float(order_status['executedQty']), exit_time=exit_time, exit_price=exit_price, profit=profit
+                    )
+                    session.add(trade)
+                    session.query(Position).filter(Position.symbol == symbol).delete()
+                    session.commit()
+                    send_whatsapp_alert(f"SOLD limit {symbol} @ {exit_price} profit {profit:.2f} USDT fee {sell_fee*100:.2f}%")
+                    return
+                time.sleep(30)
+            cancel_order(client, symbol, order['orderId'])
+            # Fallback to market if still signal
+            should_sell_retry, _, _ = check_sell_signal(client, symbol, position)
+            if should_sell_retry:
+                execute_sell(client, session, symbol, position)  # Recursive fallback
 
 def get_all_usdt_symbols(client):
     try:
