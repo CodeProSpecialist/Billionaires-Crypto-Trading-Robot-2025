@@ -1,9 +1,9 @@
 # 🚀 Billionaires Crypto Trading Robot 2025: Binance.US Edition 🚀
 **Skyrocketing Wealth Creation with Precision Automation – But Losses Can Hit Hard!**  
 
-#####
+*****
 This trading robot is 95% complete. The final code changes are being finished. 
-#####
+*****
 
 Unleash the power of automated crypto trading with the Billionaires Crypto Trading Robot 2025, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using smart mean-reversion and momentum strategies. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
