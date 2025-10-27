@@ -40,6 +40,8 @@ ORDER_TIMEOUT = 300  # 5 minutes for limit orders
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
+api_url = "https://api.binance.us"
+
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
