@@ -17,14 +17,14 @@ import pandas as pd
 # === CONFIGURATION ===
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
-MAX_PRICE = 25.00  # Max price for consideration
+MAX_PRICE = 1000.00  # Max price for consideration
 MIN_PRICE = 1.00   # Min price for consideration
-CURRENT_PRICE_MAX = 25.00  # Filter coins with current price < $25.00
+CURRENT_PRICE_MAX = 1000.00  # Filter coins with current price < $1000.00
 LOOP_INTERVAL = 60  # 1 minute for real-time trading
 LOG_FILE = "crypto_trading_bot.log"
-VOLUME_THRESHOLD = 100000  # 24h volume > $100,000
+VOLUME_THRESHOLD = 15000  # 24h volume > $15,000
 RSI_PERIOD = 14
-HISTORY_DAYS = 15  # Track 15 days of history
+HISTORY_DAYS = 30  # Track 15 days of history
 KLINE_INTERVAL = '1h'  # Hourly klines for history
 PROFIT_TARGET = 0.008  # 0.8% profit
 RISK_PER_TRADE = 0.10  # 10% of balance per trade
