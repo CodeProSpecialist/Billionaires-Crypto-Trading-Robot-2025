@@ -108,7 +108,7 @@ pip3 install python-binance ta-lib numpy pandas sqlalchemy requests tenacity
 
 Run Program: 
 
-python3 
+python3 2025-coin-trading-bot.py
 
 
 
