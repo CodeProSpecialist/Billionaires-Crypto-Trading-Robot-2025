@@ -99,3 +99,17 @@ The bot profits by buying low (near 15-day lows with bullish filters) and sellin
   - Compounds: 10 trades/month at 0.8% net = ~8% monthly (pre-compound), minus losses (filtered to minimize).
   - Enhancements: 15d history for opportunities, alerts for monitoring, graceful shutdown/restart with DB persistence.
 
+Install in Ubuntu 24.04 Linux. 
+( Anaconda Python Environment is preferred )
+
+Install: 
+
+pip3 install python-binance ta-lib numpy pandas sqlalchemy requests tenacity
+
+Run Program: 
+
+python3 
+
+
+
+
