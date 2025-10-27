@@ -27,7 +27,6 @@ RSI_PERIOD = 14
 HISTORY_DAYS = 15  # Track 15 days of history
 KLINE_INTERVAL = '1h'  # Hourly klines for history
 PROFIT_TARGET = 0.008  # 0.8% profit
-FEE_BUFFER = 0.02  # 2% round-trip fee (1% per buy/sell)
 RISK_PER_TRADE = 0.10  # 10% of balance per trade
 MIN_BALANCE = 2.0  # Minimum USDT to keep
 ORDER_TIMEOUT = 300  # 5 minutes for limit orders
@@ -90,6 +89,7 @@ class Position(Base):
     qty = Column(Float, nullable=False)
     entry_price = Column(Float, nullable=False)
     entry_time = Column(DateTime, nullable=False)
+    buy_fee = Column(Float, nullable=False)  # Store actual buy fee
 
 engine = create_engine(DATABASE_URL, echo=False)
 Base.metadata.create_all(engine)
@@ -150,6 +150,17 @@ def get_volume_24h(client, symbol):
         logger.error(f"Volume fetch failed for {symbol}: {e}")
         return 0
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+def get_trade_fees(client, symbol):
+    try:
+        fee_info = client.get_trade_fee(symbol=symbol)
+        maker_fee = float(fee_info[0]['makerCommission'])
+        taker_fee = float(fee_info[0]['takerCommission'])
+        return maker_fee, taker_fee
+    except Exception as e:
+        logger.error(f"Fee fetch failed for {symbol}: {e}")
+        return 0.004, 0.006  # Fallback to Tier I defaults
+
 def send_whatsapp_alert(message: str):
     try:
         if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
@@ -177,7 +188,7 @@ def get_balance(client, asset='USDT'):
         return 0.0
 
 def get_open_positions(session):
-    return {p.symbol: {'qty': p.qty, 'entry_price': p.entry_price, 'entry_time': p.entry_time} for p in session.query(Position).all()}
+    return {p.symbol: {'qty': p.qty, 'entry_price': p.entry_price, 'entry_time': p.entry_time, 'buy_fee': p.buy_fee} for p in session.query(Position).all()}
 
 def place_limit_buy(client, symbol, price, qty):
     try:
@@ -313,6 +324,7 @@ def execute_buy(client, session, symbol):
         send_whatsapp_alert("Low balance, skipping buy")
         return
     current_price = fetch_current_data(client, symbol)['price']
+    maker_fee, taker_fee = get_trade_fees(client, symbol)
     alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
     qty = alloc / current_price
     buy_price = current_price * 0.999  # Slippage buffer
@@ -324,11 +336,12 @@ def execute_buy(client, session, symbol):
         order_status = client.get_order(symbol=symbol, orderId=order['orderId'])
         if order_status['status'] == 'FILLED':
             entry_time = datetime.now(CST_TZ)
-            entry_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])  # Actual filled price
-            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time)
+            entry_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])
+            buy_fee = maker_fee  # Limit buy uses maker fee
+            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time, buy_fee=buy_fee)
             session.add(pos)
             session.commit()
-            send_whatsapp_alert(f"BUY filled {symbol} @ {entry_price} qty {qty}")
+            send_whatsapp_alert(f"BUY filled {symbol} @ {entry_price} qty {qty} fee {buy_fee*100:.2f}%")
             return
         time.sleep(30)
     cancel_order(client, symbol, order['orderId'])
@@ -338,36 +351,39 @@ def execute_buy(client, session, symbol):
             mkt_order = client.order_market_buy(symbol=symbol, quantity=qty)
             entry_time = datetime.now(CST_TZ)
             entry_price = sum(float(f['price']) * float(f['qty']) for f in mkt_order['fills']) / sum(float(f['qty']) for f in mkt_order['fills'])
-            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time)
+            buy_fee = taker_fee  # Market buy uses taker fee
+            pos = Position(symbol=symbol, qty=qty, entry_price=entry_price, entry_time=entry_time, buy_fee=buy_fee)
             session.add(pos)
             session.commit()
-            send_whatsapp_alert(f"BUY market filled {symbol} @ {entry_price} qty {qty}")
+            send_whatsapp_alert(f"BUY market filled {symbol} @ {entry_price} qty {qty} fee {buy_fee*100:.2f}%")
         except Exception as e:
             logger.error(f"Market buy fallback failed: {e}")
 
 def check_sell_signal(client, symbol, position):
     current_price = fetch_current_data(client, symbol)['price']
-    profit_pct = (current_price - position['entry_price']) / position['entry_price'] - FEE_BUFFER
+    maker_fee, taker_fee = get_trade_fees(client, symbol)
+    # Use actual buy fee from position, estimate sell fee (worst-case taker for market, maker for limit)
+    buy_fee = position['buy_fee']
+    profit_pct = (current_price - position['entry_price']) / position['entry_price'] - (buy_fee + taker_fee)
     if profit_pct < PROFIT_TARGET:
         return False, None
-    # Check velocity for fast/slow
     klines = client.get_klines(symbol=symbol, interval='1m', limit=2)
     prev_close = float(klines[0][4])
     delta = (current_price - prev_close) / prev_close
     if delta > 0.005:  # Fast rise
-        return True, 'market'
-    return True, 'limit'
+        return True, 'market', taker_fee
+    return True, 'limit', maker_fee
 
 def execute_sell(client, session, symbol, position):
     qty = position['qty']
     current_price = fetch_current_data(client, symbol)['price']
-    should_sell, order_type = check_sell_signal(client, symbol, position)
+    should_sell, order_type, sell_fee = check_sell_signal(client, symbol, position)
     if not should_sell:
         return
     if order_type == 'market':
         order = place_market_sell(client, symbol, qty)
     else:
-        sell_price = position['entry_price'] * (1 + PROFIT_TARGET + FEE_BUFFER)
+        sell_price = position['entry_price'] * (1 + PROFIT_TARGET + position['buy_fee'] + sell_fee)
         order = place_limit_sell(client, symbol, sell_price, qty)
     if order:
         exit_time = datetime.now(CST_TZ)
@@ -380,7 +396,7 @@ def execute_sell(client, session, symbol, position):
         session.add(trade)
         session.query(Position).filter(Position.symbol == symbol).delete()
         session.commit()
-        send_whatsapp_alert(f"SOLD {symbol} @ {exit_price} profit {profit:.2f} USDT")
+        send_whatsapp_alert(f"SOLD {symbol} @ {exit_price} profit {profit:.2f} USDT fee {sell_fee*100:.2f}%")
 
 def get_all_usdt_symbols(client):
     try:
