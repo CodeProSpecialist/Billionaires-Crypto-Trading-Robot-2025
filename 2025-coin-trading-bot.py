@@ -26,12 +26,12 @@ import requests
 # === CONFIGURATION ===
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
-MAX_PRICE = 1000.00  # Max price for consideration
-MIN_PRICE = 1.00     # Min price for consideration
-CURRENT_PRICE_MAX = 1000.00  # Filter coins with current price < $1000.00
-LOOP_INTERVAL = 60   # 1 minute for real-time trading
+MAX_PRICE = 1000.00
+MIN_PRICE = 1.00
+CURRENT_PRICE_MAX = 1000.00
+LOOP_INTERVAL = 60
 LOG_FILE = "crypto_trading_bot.log"
-VOLUME_THRESHOLD = 15000  # 24h volume > $15,000
+VOLUME_THRESHOLD = 15000
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_DEV = 2
@@ -40,22 +40,20 @@ STOCH_D_PERIOD = 3
 ATR_PERIOD = 14
 SMA_PERIOD = 50
 EMA_PERIOD = 21
-HISTORY_DAYS = 60  # Increased to ensure enough data for SMA/EMA
-KLINE_INTERVAL = '1h'  # Hourly klines for history
-PROFIT_TARGET = 0.008  # 0.8% profit
-RISK_PER_TRADE = 0.10  # 10% of balance per trade
-MIN_BALANCE = 2.0  # Minimum USDT to keep
-ORDER_TIMEOUT = 300  # 5 minutes for limit orders
+HISTORY_DAYS = 60
+KLINE_INTERVAL = '1h'
+PROFIT_TARGET = 0.008  # 0.8%
+RISK_PER_TRADE = 0.10
+MIN_BALANCE = 2.0
+ORDER_TIMEOUT = 300
 
-# Set Binance.US API keys
+# API Keys
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
-api_url = "https://api.binance.us"
-
 # Logging setup
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(message)s',
     handlers=[
         TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=7),
@@ -64,20 +62,95 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Timezone setup
+# Timezone
 CST_TZ = pytz.timezone('America/Chicago')
+
+# In-memory positions
+positions = {}
+
+# === Helper Functions ===
+def now_cst():
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def format_time_central(ts_ms):
     if not ts_ms:
         return "N/A"
     dt_utc = datetime.utcfromtimestamp(ts_ms / 1000).replace(tzinfo=pytz.UTC)
     dt_central = dt_utc.astimezone(CST_TZ)
-    return dt_central.strftime("%Y-%m-%d %H:%M:%S CST")
+    return dt_central.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# In-memory positions
-positions = {}
+# === PROFESSIONAL DASHBOARD ===
+def print_status_dashboard(client):
+    try:
+        balance = get_balance(client, 'USDT')
+        total_value = balance
+        total_profit_usdt = 0.0
 
-# === Helper Functions ===
+        print("\n" + "="*100)
+        print(f" PROFESSIONAL TRADING DASHBOARD - {now_cst()} ")
+        print("="*100)
+        print(f"Account Balance (USDT):        ${balance:,.6f}")
+        print(f"Available Cash (USDT):         ${balance:,.6f}")
+        print(f"Active Positions:              {len(positions)}")
+        print("-" * 100)
+
+        if not positions:
+            print(" No open positions.")
+            print("="*100 + "\n")
+            return
+
+        print(f"{'SYMBOL':<10} {'QTY':>10} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT $':>10} {'SELL PRICE':>12} {'AGE':>12}")
+        print("-" * 100)
+
+        for symbol, pos in positions.items():
+            current_data = fetch_current_data(client, symbol)
+            if not current_data:
+                logger.warning(f"Skipping {symbol}: no price data")
+                continue
+
+            current_price = current_data['price']
+            qty = pos['qty']
+            entry_price = pos['entry_price']
+            entry_time = pos['entry_time']
+            buy_fee = pos['buy_fee']
+
+            # Fetch RSI and fees
+            metrics = get_historical_metrics(client, symbol)
+            rsi = metrics['rsi'] if metrics and metrics['rsi'] is not None else -1
+            maker_fee, taker_fee = get_trade_fees(client, symbol)
+            total_fees = buy_fee + taker_fee
+
+            # Profit calculations
+            gross_profit = (current_price - entry_price) * qty
+            fee_cost = total_fees * current_price * qty
+            net_profit_usdt = gross_profit - fee_cost
+            profit_pct = ((current_price - entry_price) / entry_price - total_fees) * 100
+
+            # Target sell price to achieve PROFIT_TARGET
+            target_sell_price = entry_price * (1 + PROFIT_TARGET + buy_fee + taker_fee)
+
+            # Position age
+            age = datetime.now(CST_TZ) - entry_time
+            age_str = str(age).split('.')[0]
+
+            total_value += current_price * qty
+            total_profit_usdt += net_profit_usdt
+
+            rsi_display = f"{rsi:5.1f}" if rsi >= 0 else " N/A "
+
+            print(f"{symbol:<10} {qty:>10.6f} {entry_price:>12.6f} {current_price:>12.6f} "
+                  f"{rsi_display} {profit_pct:>7.2f}% {net_profit_usdt:>10.2f} {target_sell_price:>12.6f} {age_str:>12}")
+
+        print("-" * 100)
+        print(f"Total Portfolio Value:         ${total_value:,.6f}")
+        print(f"Total Unrealized P&L:          ${total_profit_usdt:,.2f}")
+        print(f"Bot Running... Next update in {LOOP_INTERVAL} seconds.\n")
+        print("="*100 + "\n")
+
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+
+# === Indicator & Data Functions ===
 def calculate_rsi(prices, period=RSI_PERIOD):
     if len(prices) < period + 1:
         return None
@@ -103,19 +176,11 @@ def get_symbol_filters(client, symbol):
             ftype = f['filterType']
             params = {}
             if ftype == 'LOT_SIZE':
-                params = {
-                    'minQty': float(f.get('minQty')),
-                    'maxQty': float(f.get('maxQty')),
-                    'stepSize': float(f.get('stepSize'))
-                }
+                params = {k: float(f.get(k)) for k in ['minQty', 'maxQty', 'stepSize']}
             elif ftype == 'MIN_NOTIONAL':
                 params = {'minNotional': float(f.get('minNotional'))}
             elif ftype == 'PRICE_FILTER':
-                params = {
-                    'minPrice': float(f.get('minPrice')),
-                    'maxPrice': float(f.get('maxPrice')),
-                    'tickSize': float(f.get('tickSize'))
-                }
+                params = {k: float(f.get(k)) for k in ['minPrice', 'maxPrice', 'tickSize']}
             filters[ftype] = params
         return filters
     except Exception as e:
@@ -137,7 +202,6 @@ def validate_and_adjust_order(client, symbol, side, order_type, quantity, price=
     adjusted_qty = quantity
     adjusted_price = price
 
-    # LOT_SIZE
     lot_filter = filters.get('LOT_SIZE', {})
     if lot_filter:
         step_size = lot_filter.get('stepSize', 0)
@@ -149,9 +213,8 @@ def validate_and_adjust_order(client, symbol, side, order_type, quantity, price=
         if adjusted_qty > max_qty:
             adjusted_qty = max_qty
         if adjusted_qty < min_qty:
-            return None, f"Quantity below minQty: {adjusted_qty}"
+            return None, f"Qty below minQty: {adjusted_qty}"
 
-    # PRICE_FILTER
     if adjusted_price is not None:
         price_filter = filters.get('PRICE_FILTER', {})
         if price_filter:
@@ -166,26 +229,18 @@ def validate_and_adjust_order(client, symbol, side, order_type, quantity, price=
             if adjusted_price < min_price:
                 return None, f"Price below minPrice: {adjusted_price}"
 
-    # MIN_NOTIONAL
-    min_notional_filter = filters.get('MIN_NOTIONAL', {})
-    min_notional = min_notional_filter.get('minNotional', 0)
+    min_notional = filters.get('MIN_NOTIONAL', {}).get('minNotional', 0)
     if min_notional > 0:
         effective_price = adjusted_price or current_price
-        if effective_price is None:
-            return None, "No price for MIN_NOTIONAL check"
-        notional = adjusted_qty * effective_price
-        if notional < min_notional:
-            needed_qty = min_notional / effective_price
-            adjusted_qty = max(adjusted_qty, needed_qty)
-            if lot_filter:
-                step_size = lot_filter.get('stepSize', 0)
-                adjusted_qty = round_to_step_size(adjusted_qty, step_size)
-                max_qty = lot_filter.get('maxQty', float('inf'))
-                if adjusted_qty > max_qty:
-                    return None, f"Qty exceeds maxQty for MIN_NOTIONAL: {adjusted_qty}"
+        if effective_price:
             notional = adjusted_qty * effective_price
             if notional < min_notional:
-                return None, f"Still below MIN_NOTIONAL: {notional}"
+                needed_qty = min_notional / effective_price
+                adjusted_qty = max(adjusted_qty, needed_qty)
+                if lot_filter:
+                    adjusted_qty = round_to_step_size(adjusted_qty, lot_filter.get('stepSize', 0))
+                if adjusted_qty * effective_price < min_notional:
+                    return None, f"Cannot meet MIN_NOTIONAL: {adjusted_qty * effective_price}"
 
     return {'quantity': adjusted_qty, 'price': adjusted_price}, None
 
@@ -199,23 +254,15 @@ def get_momentum_status(client, symbol):
         highs = np.array([float(k[2]) for k in klines])
         lows = np.array([float(k[3]) for k in klines])
         closes = np.array([float(k[4]) for k in klines])
-        bullish_score = sum([
-            np.any(talib.CDLHAMMER(opens, highs, lows, closes) > 0),
-            np.any(talib.CDLENGULFING(opens, highs, lows, closes) > 0),
-            np.any(talib.CDLMORNINGSTAR(opens, highs, lows, closes) > 0)
-        ])
-        bearish_score = sum([
-            np.any(talib.CDLSHOOTINGSTAR(opens, highs, lows, closes) > 0),
-            np.any(talib.CDLENGULFING(opens, highs, lows, closes) < 0),
-            np.any(talib.CDLEVENINGSTAR(opens, highs, lows, closes) > 0)
-        ])
-        if bullish_score > bearish_score:
-            return "bullish"
-        elif bearish_score > bullish_score:
-            return "bearish"
-        return "sideways"
+        bullish_score = sum([np.any(talib.CDLHAMMER(opens, highs, lows, closes) > 0),
+                             np.any(talib.CDLENGULFING(opens, highs, lows, closes) > 0),
+                             np.any(talib.CDLMORNINGSTAR(opens, highs, lows, closes) > 0)])
+        bearish_score = sum([np.any(talib.CDLSHOOTINGSTAR(opens, highs, lows, closes) > 0),
+                             np.any(talib.CDLENGULFING(opens, highs, lows, closes) < 0),
+                             np.any(talib.CDLEVENINGSTAR(opens, highs, lows, closes) > 0)])
+        return "bullish" if bullish_score > bearish_score else "bearish" if bearish_score > bullish_score else "sideways"
     except Exception as e:
-        logger.error(f"Momentum failed for {symbol}: {e}")
+        logger.error(f"Momentum failed {symbol}: {e}")
         return "sideways"
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -224,33 +271,28 @@ def get_volume_24h(client, symbol):
         ticker = client.get_ticker(symbol=symbol)
         return float(ticker.get('quoteVolume', 0))
     except Exception as e:
-        logger.error(f"Volume fetch failed for {symbol}: {e}")
+        logger.error(f"Volume failed {symbol}: {e}")
         return 0
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_trade_fees(client, symbol):
     try:
         fee_info = client.get_trade_fee(symbol=symbol)
-        maker_fee = float(fee_info[0]['makerCommission'])
-        taker_fee = float(fee_info[0]['takerCommission'])
-        return maker_fee, taker_fee
+        return float(fee_info[0]['makerCommission']), float(fee_info[0]['takerCommission'])
     except Exception as e:
-        logger.error(f"Fee fetch failed for {symbol}: {e}")
+        logger.debug(f"Using default fees for {symbol}")
         return 0.004, 0.006
 
 def send_whatsapp_alert(message: str):
     try:
         if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
-            logger.error("CallMeBot config missing.")
             return
         url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
         resp = requests.get(url, timeout=30)
         if resp.status_code == 200:
-            logger.info(f"Alert sent: {message[:50]}...")
-        else:
-            logger.error(f"Alert failed: {resp.status_code} - {resp.text}")
+            logger.info(f"WhatsApp alert: {message[:50]}...")
     except Exception as e:
-        logger.error(f"Send alert error: {e}")
+        logger.error(f"Alert failed: {e}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_balance(client, asset='USDT'):
@@ -299,31 +341,14 @@ def get_historical_metrics(client, symbol):
         sma = talib.SMA(closes, timeperiod=SMA_PERIOD)[-1] if len(closes) >= SMA_PERIOD else None
         ema = talib.EMA(closes, timeperiod=EMA_PERIOD)[-1] if len(closes) >= EMA_PERIOD else None
         return {
-            'fifteen_low': fifteen_low,
-            'avg_volume': avg_volume,
-            'rsi': rsi,
-            'roc_5d': roc_5d,
-            'max_dd': max_dd,
-            'current_price': closes[-1],
-            'macd': macd_val,
-            'signal': signal_val,
-            'hist': hist_val,
-            'mfi': mfi,
-            'bb_upper': bb_upper,
-            'bb_middle': bb_middle,
-            'bb_lower': bb_lower,
-            'stoch_k': stoch_k,
-            'stoch_d': stoch_d,
-            'atr': atr,
-            'sma': sma,
-            'ema': ema,
-            'opens': opens,
-            'highs': highs,
-            'lows': lows,
-            'closes': closes
+            'fifteen_low': fifteen_low, 'avg_volume': avg_volume, 'rsi': rsi, 'roc_5d': roc_5d,
+            'max_dd': max_dd, 'current_price': closes[-1], 'macd': macd_val, 'signal': signal_val,
+            'hist': hist_val, 'mfi': mfi, 'bb_upper': bb_upper, 'bb_middle': bb_middle,
+            'bb_lower': bb_lower, 'stoch_k': stoch_k, 'stoch_d': stoch_d, 'atr': atr,
+            'sma': sma, 'ema': ema, 'opens': opens, 'highs': highs, 'lows': lows, 'closes': closes
         }
     except Exception as e:
-        logger.error(f"History fetch failed for {symbol}: {e}")
+        logger.error(f"History failed {symbol}: {e}")
         return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -336,7 +361,7 @@ def fetch_current_data(client, symbol):
             'price_change_pct': float(ticker['priceChangePercent'])
         }
     except Exception as e:
-        logger.error(f"Current data failed for {symbol}: {e}")
+        logger.error(f"Current data failed {symbol}: {e}")
         return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -347,53 +372,40 @@ def get_order_book_pressure(client, symbol):
         ask_qty = sum(float(a[1]) for a in book['asks'])
         return bid_qty > ask_qty
     except Exception as e:
-        logger.error(f"Order book failed for {symbol}: {e}")
+        logger.error(f"Order book failed {symbol}: {e}")
         return False
 
 def is_bullish_candlestick_pattern(metrics):
-    if not metrics:
+    if not metrics or len(metrics['opens']) < 3:
         return False
     opens = metrics['opens'][-3:]
     highs = metrics['highs'][-3:]
     lows = metrics['lows'][-3:]
     closes = metrics['closes'][-3:]
-    if len(opens) < 3:
-        return False
     patterns = [
         talib.CDLHAMMER(opens, highs, lows, closes)[-1] > 0,
         talib.CDLINVERTEDHAMMER(opens, highs, lows, closes)[-1] > 0,
         talib.CDLENGULFING(opens, highs, lows, closes)[-1] > 0,
         talib.CDLMORNINGSTAR(opens, highs, lows, closes)[-1] > 0,
         talib.CDL3WHITESOLDIERS(opens, highs, lows, closes)[-1] > 0,
-        talib.CDLPIERCING(opens, highs, lows, closes)[-1] > 0,
-        talib.CDLMORNINGDOJISTAR(opens, highs, lows, closes)[-1] > 0,
-        talib.CDL3LINESTRIKE(opens, highs, lows, closes)[-1] > 0,
-        talib.CDLBULLISHABANDONEDBABY(opens, highs, lows, closes)[-1] > 0
     ]
     return any(patterns)
 
 def is_bearish_candlestick_pattern(metrics):
-    if not metrics:
+    if not metrics or len(metrics['opens']) < 3:
         return False
     opens = metrics['opens'][-3:]
     highs = metrics['highs'][-3:]
     lows = metrics['lows'][-3:]
     closes = metrics['closes'][-3:]
-    if len(opens) < 3:
-        return False
     patterns = [
         talib.CDLSHOOTINGSTAR(opens, highs, lows, closes)[-1] > 0,
         talib.CDLHANGINGMAN(opens, highs, lows, closes)[-1] > 0,
         talib.CDLENGULFING(opens, highs, lows, closes)[-1] < 0,
-        talib.CDLEVENINGSTAR(opens, highs, lows, closes)[-1] > 0,
-        talib.CDL3BLACKCROWS(opens, highs, lows, closes)[-1] > 0,
-        talib.CDLGRAVESTONEDOJI(opens, highs, lows, closes)[-1] > 0,
-        talib.CDLEVENINGDOJISTAR(opens, highs, lows, closes)[-1] > 0,
-        talib.CDL3LINESTRIKE(opens, highs, lows, closes)[-1] < 0,
-        talib.CDLBEARISHABANDONEDBABY(opens, highs, lows, closes)[-1] > 0
     ]
     return any(patterns)
 
+# === Trading Logic ===
 def check_buy_signal(client, symbol):
     if symbol in positions:
         return False
@@ -405,25 +417,15 @@ def check_buy_signal(client, symbol):
         return False
     if not (MIN_PRICE <= current['price'] <= MAX_PRICE) or current['volume_24h'] < VOLUME_THRESHOLD:
         return False
-    if metrics['max_dd'] < -10 or metrics['roc_5d'] <= 0 or metrics['rsi'] <= 50 or metrics['mfi'] > 70:
+    if metrics['rsi'] <= 50 or metrics['mfi'] > 70 or metrics['macd'] <= metrics['signal'] or metrics['hist'] <= 0:
         return False
-    if metrics['macd'] <= metrics['signal'] or metrics['hist'] <= 0:
+    if get_momentum_status(client, symbol) != 'bullish':
         return False
-    momentum = get_momentum_status(client, symbol)
-    if momentum != 'bullish':
-        return False
-    if current['price'] > metrics['fifteen_low'] * 1.001:
-        return False
-    if not get_order_book_pressure(client, symbol):
+    if current['price'] > metrics['bb_lower'] * 1.005 or metrics['stoch_k'] > 30 or metrics['ema'] <= metrics['sma']:
         return False
     if not is_bullish_candlestick_pattern(metrics):
         return False
-    if current['price'] > metrics['bb_lower'] * 1.005:
-        return False
-    if metrics['stoch_k'] <= metrics['stoch_d'] or metrics['stoch_k'] > 30:
-        return False
-    if metrics['ema'] <= metrics['sma']:
-        return False
+    logger.debug(f"BUY SIGNAL: {symbol}")
     return True
 
 def execute_buy(client, symbol):
@@ -450,35 +452,18 @@ def execute_buy(client, symbol):
     while time.time() - start < ORDER_TIMEOUT:
         order_status = client.get_order(symbol=symbol, orderId=order['orderId'])
         if order_status['status'] == 'FILLED':
-            entry_time = datetime.now(CST_TZ)
             entry_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])
-            buy_fee = maker_fee
             positions[symbol] = {
                 'qty': float(order_status['executedQty']),
                 'entry_price': entry_price,
-                'entry_time': entry_time,
-                'buy_fee': buy_fee
+                'entry_time': datetime.now(CST_TZ),
+                'buy_fee': maker_fee
             }
-            send_whatsapp_alert(f"BUY filled {symbol} @ {entry_price:.6f} qty {order_status['executedQty']} fee {buy_fee*100:.2f}%")
+            send_whatsapp_alert(f"BUY {symbol} @ {entry_price:.6f}")
+            logger.info(f"BUY FILLED: {symbol} @ {entry_price}")
             return
         time.sleep(30)
     cancel_order(client, symbol, order['orderId'])
-    if check_buy_signal(client, symbol):
-        try:
-            mkt_order = place_market_buy(client, symbol, qty, current_price)
-            if mkt_order:
-                entry_time = datetime.now(CST_TZ)
-                entry_price = sum(float(f['price']) * float(f['qty']) for f in mkt_order['fills']) / sum(float(f['qty']) for f in mkt_order['fills'])
-                buy_fee = taker_fee
-                positions[symbol] = {
-                    'qty': sum(float(f['qty']) for f in mkt_order['fills']),
-                    'entry_price': entry_price,
-                    'entry_time': entry_time,
-                    'buy_fee': buy_fee
-                }
-                send_whatsapp_alert(f"BUY market {symbol} @ {entry_price:.6f} qty {mkt_order['executedQty']} fee {buy_fee*100:.2f}%")
-        except Exception as e:
-            logger.error(f"Market buy fallback failed: {e}")
 
 def check_sell_signal(client, symbol, position):
     current = fetch_current_data(client, symbol)
@@ -490,23 +475,10 @@ def check_sell_signal(client, symbol, position):
     profit_pct = (current_price - position['entry_price']) / position['entry_price'] - (buy_fee + taker_fee)
     if profit_pct < PROFIT_TARGET:
         return False, None, None
-    klines = client.get_klines(symbol=symbol, interval='1m', limit=2)
-    prev_close = float(klines[0][4])
-    delta = (current_price - prev_close) / prev_close
     metrics = get_historical_metrics(client, symbol)
-    if not metrics or any(v is None for v in [metrics['stoch_k'], metrics['stoch_d'], metrics['atr'], metrics['sma'], metrics['ema']]):
+    if not metrics:
         return False, None, None
-    if is_bearish_candlestick_pattern(metrics):
-        return True, 'market', taker_fee
-    if current_price >= metrics['bb_upper'] * 0.995:
-        return True, 'market', taker_fee
-    if metrics['stoch_k'] >= metrics['stoch_d'] and metrics['stoch_k'] > 70:
-        return True, 'market', taker_fee
-    if metrics['ema'] < metrics['sma'] or current_price > metrics['ema'] * 1.02:
-        return True, 'market', taker_fee
-    if current_price > position['entry_price'] + 2 * metrics['atr']:
-        return True, 'market', taker_fee
-    if delta > 0.005:
+    if is_bearish_candlestick_pattern(metrics) or current_price >= metrics['bb_upper'] * 0.995:
         return True, 'market', taker_fee
     return True, 'limit', maker_fee
 
@@ -519,87 +491,78 @@ def execute_sell(client, symbol, position):
     metrics = get_historical_metrics(client, symbol)
     if not metrics or metrics['atr'] is None:
         return
-    atr = metrics['atr']
     should_sell, order_type, sell_fee = check_sell_signal(client, symbol, position)
     if not should_sell:
         return
     if order_type == 'market':
         order = place_market_sell(client, symbol, qty)
         if order:
-            exit_time = datetime.now(CST_TZ)
             exit_price = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / sum(float(f['qty']) for f in order['fills'])
             profit = (exit_price - position['entry_price']) * qty - (sell_fee * exit_price * qty)
             del positions[symbol]
-            send_whatsapp_alert(f"SOLD market {symbol} @ {exit_price:.6f} profit {profit:.2f} USDT fee {sell_fee*100:.2f}%")
+            send_whatsapp_alert(f"SOLD {symbol} @ {exit_price:.6f} Profit: ${profit:.2f}")
+            logger.info(f"SOLD {symbol} @ {exit_price} Profit: ${profit:.2f}")
     else:
-        sell_price = position['entry_price'] * (1 + PROFIT_TARGET + position['buy_fee'] + sell_fee) + atr * 0.5
+        sell_price = position['entry_price'] * (1 + PROFIT_TARGET + position['buy_fee'] + sell_fee) + metrics['atr'] * 0.5
         order = place_limit_sell(client, symbol, sell_price, qty)
         if order:
             start = time.time()
             while time.time() - start < ORDER_TIMEOUT:
                 order_status = client.get_order(symbol=symbol, orderId=order['orderId'])
                 if order_status['status'] == 'FILLED':
-                    exit_time = datetime.now(CST_TZ)
                     exit_price = float(order_status['cummulativeQuoteQty']) / float(order_status['executedQty'])
                     profit = (exit_price - position['entry_price']) * float(order_status['executedQty']) - (sell_fee * exit_price * float(order_status['executedQty']))
                     del positions[symbol]
-                    send_whatsapp_alert(f"SOLD limit {symbol} @ {exit_price:.6f} profit {profit:.2f} USDT fee {sell_fee*100:.2f}%")
+                    send_whatsapp_alert(f"SOLD LIMIT {symbol} @ {exit_price:.6f} Profit: ${profit:.2f}")
                     return
                 time.sleep(30)
             cancel_order(client, symbol, order['orderId'])
-            if check_sell_signal(client, symbol, position)[0]:
-                execute_sell(client, symbol, position)
 
 def get_all_usdt_symbols(client):
     try:
         info = client.get_exchange_info()
         return [s['symbol'] for s in info['symbols'] if s['symbol'].endswith('USDT') and s['status'] == 'TRADING']
     except Exception as e:
-        logger.error(f"Failed to get symbols: {e}")
+        logger.error(f"Symbols fetch failed: {e}")
         return []
 
 def place_limit_buy(client, symbol, price, qty, current_price):
     adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price, current_price)
     if error:
         logger.error(f"BUY validation failed {symbol}: {error}")
-        send_whatsapp_alert(f"BUY validation failed {symbol}: {error}")
         return None
     try:
         order = client.order_limit_buy(symbol=symbol, quantity=adjusted['quantity'], price=adjusted['price'])
-        logger.info(f"Limit BUY {symbol} @ {adjusted['price']} qty {adjusted['quantity']}")
-        send_whatsapp_alert(f"BUY limit {symbol} @ {adjusted['price']:.6f} qty {adjusted['quantity']}")
+        logger.info(f"Placed BUY LIMIT {symbol} @ {adjusted['price']} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
-        logger.error(f"BUY order failed {symbol}: {e}")
-        send_whatsapp_alert(f"BUY failed {symbol}: {e.message}")
+        logger.error(f"BUY failed {symbol}: {e}")
         return None
 
 def place_market_buy(client, symbol, qty, current_price):
     adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_MARKET, qty, current_price=current_price)
     if error:
-        logger.error(f"MARKET BUY validation failed {symbol}: {error}")
+        logger.error(f"MARKET BUY failed {symbol}: {error}")
         return None
     try:
         order = client.order_market_buy(symbol=symbol, quantity=adjusted['quantity'])
-        logger.info(f"Market BUY {symbol} qty {adjusted['quantity']}")
-        send_whatsapp_alert(f"BUY market {symbol} qty {adjusted['quantity']}")
+        logger.info(f"Placed MARKET BUY {symbol} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
-        logger.error(f"Market BUY failed {symbol}: {e}")
+        logger.error(f"MARKET BUY failed {symbol}: {e}")
         return None
 
 def place_market_sell(client, symbol, qty):
     adjusted, error = validate_and_adjust_order(client, symbol, 'SELL', ORDER_TYPE_MARKET, qty)
     if error:
-        logger.error(f"MARKET SELL validation failed {symbol}: {error}")
+        logger.error(f"MARKET SELL failed {symbol}: {error}")
         return None
     try:
         order = client.order_market_sell(symbol=symbol, quantity=adjusted['quantity'])
-        logger.info(f"Market SELL {symbol} qty {adjusted['quantity']}")
-        send_whatsapp_alert(f"SELL market {symbol} qty {adjusted['quantity']}")
+        logger.info(f"Placed MARKET SELL {symbol} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
-        logger.error(f"Market SELL failed {symbol}: {e}")
+        logger.error(f"MARKET SELL failed {symbol}: {e}")
         return None
 
 def place_limit_sell(client, symbol, price, qty):
@@ -609,29 +572,26 @@ def place_limit_sell(client, symbol, price, qty):
         return None
     try:
         order = client.order_limit_sell(symbol=symbol, quantity=adjusted['quantity'], price=adjusted['price'])
-        logger.info(f"Limit SELL {symbol} @ {adjusted['price']} qty {adjusted['quantity']}")
-        send_whatsapp_alert(f"SELL limit {symbol} @ {adjusted['price']:.6f} qty {adjusted['quantity']}")
+        logger.info(f"Placed SELL LIMIT {symbol} @ {adjusted['price']} qty {adjusted['quantity']}")
         return order
     except BinanceOrderException as e:
-        logger.error(f"SELL order failed {symbol}: {e}")
+        logger.error(f"SELL failed {symbol}: {e}")
         return None
 
 def cancel_order(client, symbol, order_id):
     try:
         client.cancel_order(symbol=symbol, orderId=order_id)
         logger.info(f"Canceled order {order_id} for {symbol}")
-        send_whatsapp_alert(f"Canceled order {symbol}")
     except Exception as e:
         logger.error(f"Cancel failed {symbol}: {e}")
 
-# === MAIN EXECUTION ===
+# === MAIN LOOP ===
 if __name__ == "__main__":
     logger.info("Starting Crypto Trading Bot on Binance.US")
     if not API_KEY or not API_SECRET:
         logger.error("API keys not set.")
         exit(1)
 
-    # Initialize Binance.US Client with Ping Check
     client = Client(API_KEY, API_SECRET, tld='us')
 
     try:
@@ -639,7 +599,7 @@ if __name__ == "__main__":
             print("API connection successful. Binance.US is reachable.")
             time.sleep(1)
         else:
-            logger.error("Ping failed: Binance.US unreachable.")
+            logger.error("Ping failed.")
             exit(1)
     except Exception as e:
         logger.error(f"API ping failed: {e}")
@@ -650,9 +610,11 @@ if __name__ == "__main__":
 
     try:
         while True:
+            print_status_dashboard(client)
+
             balance = get_balance(client)
             if balance < MIN_BALANCE + 10:
-                send_whatsapp_alert(f"Low USDT: {balance:.2f}")
+                send_whatsapp_alert(f"Low USDT: ${balance:.2f}")
 
             for symbol in symbols:
                 if check_buy_signal(client, symbol):
