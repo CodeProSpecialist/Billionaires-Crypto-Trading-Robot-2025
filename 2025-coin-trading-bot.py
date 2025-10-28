@@ -45,6 +45,9 @@ RISK_PER_TRADE = 0.10
 MIN_BALANCE = 2.0
 ORDER_TIMEOUT = 300
 
+# === DEBUG SETTINGS ===
+DEBUG_SHOW_API_COIN_DATA_FETCHING = False  # Set to True only for debugging
+
 # API Keys
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
@@ -70,20 +73,58 @@ positions = {}
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-def format_time_central(ts_ms):
-    if not ts_ms:
-        return "N/A"
-    dt_utc = datetime.utcfromtimestamp(ts_ms / 1000).replace(tzinfo=pytz.UTC)
-    dt_central = dt_utc.astimezone(CST_TZ)
-    return dt_central.strftime("%Y-%m-%d %H:%M:%S %Z")
+# === 1. Get All Non-Zero Balances (Every Coin You Own) ===
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+def get_all_nonzero_balances(client):
+    try:
+        account = client.get_account()
+        balances = {}
+        for b in account['balances']:
+            asset = b['asset']
+            free  = float(b['free'])
+            if free > 0:
+                balances[asset] = free
+        return balances
+    except Exception as e:
+        logger.error(f"get_all_nonzero_balances error: {e}")
+        return {}
 
-# === COIN SCANNER WITH LIVE INDICATORS ===
+# === 2. Calculate Total Portfolio Value in USDT ===
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+def calculate_total_portfolio_value(client):
+    balances = get_all_nonzero_balances(client)
+    total_usdt = 0.0
+    asset_values = {}
+
+    for asset, qty in balances.items():
+        if asset == 'USDT':
+            total_usdt += qty
+            asset_values[asset] = qty
+            continue
+
+        symbol = asset + 'USDT'
+        try:
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            price = float(ticker['price'])
+            value_usdt = qty * price
+            total_usdt += value_usdt
+            asset_values[asset] = value_usdt
+        except Exception:
+            logger.debug(f"No USDT pair for {asset}, skipping valuation")
+            asset_values[asset] = 0.0
+
+    return total_usdt, asset_values
+
+# === COIN SCANNER (LOGGING ONLY, NO CONSOLE PRINT) ===
 def print_coin_scanner(client, symbols):
-    print("\n" + "-" * 120)
-    print(f" LIVE COIN SCANNER - {now_cst()} - SCANNING {len(symbols)} PAIRS")
-    print("-" * 120)
-    print(f"{'SYMBOL':<10} {'PRICE':>12} {'RSI':>6} {'MACD':>8} {'BB_POS':>6} {'VOL_24H':>12} {'BUY?'}")
-    print("-" * 120)
+    if not DEBUG_SHOW_API_COIN_DATA_FETCHING:
+        return
+
+    logger.debug("\n" + "-" * 120)
+    logger.debug(f" LIVE COIN SCANNER - {now_cst()} - SCANNING {len(symbols)} PAIRS")
+    logger.debug("-" * 120)
+    logger.debug(f"{'SYMBOL':<10} {'PRICE':>12} {'RSI':>6} {'MACD':>8} {'BB_POS':>6} {'VOL_24H':>12} {'BUY?'}")
+    logger.debug("-" * 120)
 
     for symbol in symbols:
         try:
@@ -107,31 +148,46 @@ def print_coin_scanner(client, symbols):
             macd_str = f"{macd:+.4f}"
             bb_str = f"{bb_pos:5.1f}%"
 
-            print(f"{symbol:<10} {price:>12.6f} {rsi:>5.1f} {macd_str:>8} {bb_str:>6} {volume:>12,.0f} {buy_signal}")
+            logger.debug(f"{symbol:<10} {price:>12.6f} {rsi:>5.1f} {macd_str:>8} {bb_str:>6} {volume:>12,.0f} {buy_signal}")
 
         except Exception as e:
             logger.debug(f"Scanner skip {symbol}: {e}")
             continue
 
-    print("-" * 120 + "\n")
+    logger.debug("-" * 120 + "\n")
 
-# === PROFESSIONAL DASHBOARD ===
+# === PROFESSIONAL DASHBOARD (ALWAYS SHOWN) ===
 def print_status_dashboard(client):
     try:
-        balance = get_balance(client, 'USDT')
-        total_value = balance
-        total_profit_usdt = 0.0
+        # 1. Free USDT
+        usdt_free = get_balance(client, 'USDT')
+
+        # 2. Total portfolio value
+        total_portfolio_usdt, asset_usdt_values = calculate_total_portfolio_value(client)
+
+        # 3. Unrealized P&L (only tracked positions)
+        total_unrealized = 0.0
 
         print("\n" + "="*100)
         print(f" PROFESSIONAL TRADING DASHBOARD - {now_cst()} ")
         print("="*100)
-        print(f"Account Balance (USDT):        ${balance:,.6f}")
-        print(f"Available Cash (USDT):         ${balance:,.6f}")
-        print(f"Active Positions:              {len(positions)}")
+        print(f"Available Cash (USDT):         ${usdt_free:,.6f}")
+        print(f"Total Portfolio Value:         ${total_portfolio_usdt:,.6f}")
+        print(f"Active Tracked Positions:      {len(positions)}")
         print("-" * 100)
 
+        # Show all owned coins
+        owned_coins = get_all_nonzero_balances(client)
+        if owned_coins:
+            print(f"{'ASSET':<8} {'QTY':>12} {'≈ USDT':>12}")
+            print("-" * 40)
+            for asset, qty in owned_coins.items():
+                usdt_val = asset_usdt_values.get(asset, 0.0)
+                print(f"{asset:<8} {qty:>12.8f} {usdt_val:>12.2f}")
+            print("-" * 40)
+
         if not positions:
-            print(" No open positions.")
+            print(" No tracked positions (bot hasn't opened any yet).")
             print("="*100 + "\n")
             return
 
@@ -139,47 +195,38 @@ def print_status_dashboard(client):
         print("-" * 100)
 
         for symbol, pos in positions.items():
-            current_data = fetch_current_data(client, symbol)
-            if not current_data:
-                logger.warning(f"Skipping {symbol}: no price data")
-                continue
-
-            current_price = current_data['price']
-            qty = pos['qty']
+            qty         = pos['qty']
             entry_price = pos['entry_price']
-            entry_time = pos['entry_time']
-            buy_fee = pos['buy_fee']
+            entry_time  = pos['entry_time']
+            buy_fee     = pos['buy_fee']
 
-            # Fetch RSI and fees
+            current_data = fetch_current_data(client, symbol)
+            current_price = current_data['price'] if current_data else entry_price
+
             metrics = get_historical_metrics(client, symbol)
-            rsi = metrics['rsi'] if metrics and metrics['rsi'] is not None else -1
+            rsi = metrics['rsi'] if metrics and metrics['rsi'] is not None else None
+
             maker_fee, taker_fee = get_trade_fees(client, symbol)
             total_fees = buy_fee + taker_fee
 
-            # Profit calculations
             gross_profit = (current_price - entry_price) * qty
-            fee_cost = total_fees * current_price * qty
-            net_profit_usdt = gross_profit - fee_cost
-            profit_pct = ((current_price - entry_price) / entry_price - total_fees) * 100
+            fee_cost     = total_fees * current_price * qty
+            net_profit   = gross_profit - fee_cost
+            profit_pct   = ((current_price - entry_price) / entry_price - total_fees) * 100
+            total_unrealized += net_profit
 
-            # Target sell price
-            target_sell_price = entry_price * (1 + PROFIT_TARGET + buy_fee + taker_fee)
+            target_sell = entry_price * (1 + PROFIT_TARGET + buy_fee + taker_fee)
 
-            # Position age
             age = datetime.now(CST_TZ) - entry_time
             age_str = str(age).split('.')[0]
 
-            total_value += current_price * qty
-            total_profit_usdt += net_profit_usdt
-
-            rsi_display = f"{rsi:5.1f}" if rsi >= 0 else " N/A "
+            rsi_disp = f"{rsi:5.1f}" if rsi is not None else " N/A "
 
             print(f"{symbol:<10} {qty:>10.6f} {entry_price:>12.6f} {current_price:>12.6f} "
-                  f"{rsi_display} {profit_pct:>7.2f}% {net_profit_usdt:>10.2f} {target_sell_price:>12.6f} {age_str:>12}")
+                  f"{rsi_disp} {profit_pct:>7.2f}% {net_profit:>10.2f} {target_sell:>12.6f} {age_str:>12}")
 
         print("-" * 100)
-        print(f"Total Portfolio Value:         ${total_value:,.6f}")
-        print(f"Total Unrealized P&L:          ${total_profit_usdt:,.2f}")
+        print(f"Tracked Unrealized P&L:        ${total_unrealized:,.2f}")
         print(f"Bot Running... Next update in {LOOP_INTERVAL} seconds.\n")
         print("="*100 + "\n")
 
@@ -399,17 +446,6 @@ def fetch_current_data(client, symbol):
     except Exception as e:
         logger.error(f"Current data failed {symbol}: {e}")
         return None
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-def get_order_book_pressure(client, symbol):
-    try:
-        book = client.get_order_book(symbol=symbol, limit=10)
-        bid_qty = sum(float(b[1]) for b in book['bids'])
-        ask_qty = sum(float(a[1]) for a in book['asks'])
-        return bid_qty > ask_qty
-    except Exception as e:
-        logger.error(f"Order book failed {symbol}: {e}")
-        return False
 
 def is_bullish_candlestick_pattern(metrics):
     if not metrics or len(metrics['opens']) < 3:
@@ -649,17 +685,17 @@ if __name__ == "__main__":
             if balance < MIN_BALANCE + 10:
                 send_whatsapp_alert(f"Low USDT: ${balance:.2f}")
 
-            # === 1. SCAN ALL COINS WITH LIVE INDICATORS ===
+            # === 1. SCAN COINS (ONLY LOGS IF DEBUG=True) ===
             print_coin_scanner(client, symbols)
 
-            # === 2. CHECK SIGNALS & TRADE ===
+            # === 2. TRADE LOGIC ===
             for symbol in symbols:
                 if check_buy_signal(client, symbol):
                     execute_buy(client, symbol)
                 if symbol in positions:
                     execute_sell(client, symbol, positions[symbol])
 
-            # === 3. PRINT DASHBOARD (LAST THING BEFORE SLEEP) ===
+            # === 3. ALWAYS SHOW DASHBOARD (LAST BEFORE SLEEP) ===
             print_status_dashboard(client)
 
             # === 4. SLEEP ===
