@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Binance.US Trading Bot with SQLAlchemy Persistence
-- Tracks trades, pending orders, active positions
-- Graceful Ctrl+C shutdown
-- Restores state on restart
-- Auto-removes filled pending orders
+Binance.US Trading Bot – FULL VERSION
+- Imports ALL owned assets (any pair) on startup
+- Tracks & sells every coin at profit
+- Full original strategy: RSI, MACD, MFI, BB, Stochastic, Candlesticks, Momentum
+- SQLAlchemy persistence + graceful shutdown
+- WhatsApp alerts + dashboard
 """
 
 import os
@@ -23,9 +24,9 @@ from datetime import datetime, timedelta
 import pytz
 import requests
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Dict, Any
 
-# === SQLALCHEMY IMPORTS ===
+# === SQLALCHEMY ===
 from sqlalchemy import (
     create_engine, Column, Integer, String, Numeric, DateTime, ForeignKey, func
 )
@@ -53,7 +54,7 @@ RISK_PER_TRADE = 0.10
 MIN_BALANCE = 2.0
 ORDER_TIMEOUT = 300
 
-# === DEBUG SETTINGS ===
+# === DEBUG ===
 DEBUG_SHOW_API_COIN_DATA_FETCHING = False
 
 # API Keys
@@ -74,18 +75,18 @@ logger = logging.getLogger(__name__)
 # Timezone
 CST_TZ = pytz.timezone('America/Chicago')
 
-# === DATABASE SETUP ===
-DB_URL = "sqlite:///binance_trades.db"  # Change to postgresql://... for prod
+# === DATABASE ===
+DB_URL = "sqlite:///binance_trades.db"
 engine = create_engine(DB_URL, echo=False, future=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
-# === SQLALCHEMY MODELS ===
+# === MODELS ===
 class Trade(Base):
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(20), nullable=False, index=True)
-    side = Column(String(4), nullable=False)  # 'buy'/'sell'
+    side = Column(String(4), nullable=False)
     price = Column(Numeric(20, 8), nullable=False)
     quantity = Column(Numeric(20, 8), nullable=False)
     executed_at = Column(DateTime, nullable=False, default=func.now())
@@ -113,10 +114,9 @@ class Position(Base):
     buy_fee_rate = Column(Numeric(10, 6), nullable=False, default=0.001)
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
-# Create tables
 Base.metadata.create_all(engine)
 
-# === DB MANAGER (Graceful Shutdown) ===
+# === DB MANAGER ===
 class DBManager:
     def __init__(self):
         self.session = None
@@ -148,11 +148,51 @@ class BinanceTradingBot:
         self.client = Client(API_KEY, API_SECRET, tld='us')
         self.load_state_from_db()
 
+    # === IMPORT ALL OWNED ASSETS ON STARTUP ===
     def load_state_from_db(self):
+        """Restore DB + import every owned coin (any pair) as a tracked Position."""
         with DBManager() as sess:
-            positions = sess.query(Position).all()
-            pending = sess.query(PendingOrder).all()
-            logger.info(f"Restored {len(positions)} positions and {len(pending)} pending orders from DB")
+            db_positions = {p.symbol: p for p in sess.query(Position).all()}
+            logger.info(f"DB contains {len(db_positions)} tracked positions")
+
+            try:
+                account = self.client.get_account()
+            except Exception as e:
+                logger.error(f"Failed to fetch account: {e}")
+                return
+
+            imported = 0
+            for bal in account['balances']:
+                asset = bal['asset']
+                free = Decimal(bal['free'])
+                if free <= 0 or asset == 'USDT':
+                    continue
+
+                symbol = asset + 'USDT'
+                if symbol in db_positions:
+                    continue
+
+                price_usdt = get_price_usdt(self.client, asset)
+                if price_usdt <= 0:
+                    logger.warning(f"Skipping {asset} – no USDT price")
+                    continue
+
+                maker_fee, _ = get_trade_fees(self.client, symbol)
+
+                pos = Position(
+                    symbol=symbol,
+                    quantity=free,
+                    avg_entry_price=price_usdt,
+                    buy_fee_rate=maker_fee
+                )
+                sess.add(pos)
+                imported += 1
+
+            if imported:
+                logger.info(f"Imported {imported} new owned assets as tracked positions")
+                sess.commit()
+            else:
+                logger.info("No new assets to import")
 
     # === DB HELPERS ===
     def get_position(self, sess, symbol: str) -> Optional[Position]:
@@ -257,7 +297,7 @@ class BinanceTradingBot:
                 except Exception as e:
                     logger.debug(f"Order check failed {pending.binance_order_id}: {e}")
 
-    # === DASHBOARD (Uses DB) ===
+    # === DASHBOARD ===
     def print_status_dashboard(self):
         with DBManager() as sess:
             positions = sess.query(Position).all()
@@ -278,12 +318,12 @@ class BinanceTradingBot:
                 total_unrealized = 0
                 for pos in positions:
                     current = fetch_current_data(self.client, pos.symbol)
-                    cur_price = current['price'] if current else float(pos.avg_entry_price)
-                    gross_pnl = (cur_price - pos.avg_entry_price) * float(pos.quantity)
-                    fee_cost = gross_pnl * (pos.buy_fee_rate + 0.001)
+                    cur_price = Decimal(str(current['price'])) if current else pos.avg_entry_price
+                    gross_pnl = (cur_price - pos.avg_entry_price) * pos.quantity
+                    fee_cost = gross_pnl * (pos.buy_fee_rate + Decimal('0.001'))
                     net_pnl = gross_pnl - fee_cost
-                    pnl_pct = (net_pnl / (pos.avg_entry_price * float(pos.quantity))) * 100
-                    total_unrealized += net_pnl
+                    pnl_pct = float(net_pnl / (pos.avg_entry_price * pos.quantity) * 100)
+                    total_unrealized += float(net_pnl)
                     print(f"{pos.symbol:<10} {pos.quantity:>12.6f} {pos.avg_entry_price:>12.6f} {cur_price:>12.6f} {pnl_pct:>7.2f}% {net_pnl:>10.2f}")
                 print("-" * 100)
                 print(f"Total Unrealized P&L:          ${total_unrealized:,.2f}")
@@ -300,11 +340,13 @@ class BinanceTradingBot:
             while True:
                 self.check_and_process_filled_orders()
 
+                # Buy new signals
                 for symbol in symbols:
                     if not any(p.symbol == symbol for p in self.get_all_positions()):
                         if check_buy_signal(self.client, symbol):
                             execute_buy(self.client, symbol, self)
 
+                # Sell all positions
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
                         if check_sell_signal(self.client, pos.symbol, pos):
@@ -324,64 +366,34 @@ class BinanceTradingBot:
         with DBManager() as sess:
             return sess.query(Position).all()
 
-# === MODIFIED EXECUTE BUY/SELL ===
-def execute_buy(client, symbol, bot):
-    balance = get_balance(client)
-    if balance <= MIN_BALANCE:
-        send_whatsapp_alert("Low balance, skipping buy")
-        return
-    current = fetch_current_data(client, symbol)
-    if not current: return
-    current_price = current['price']
-    metrics = get_historical_metrics(client, symbol)
-    if not metrics or metrics['atr'] is None: return
-    atr = metrics['atr']
-    maker_fee, _ = get_trade_fees(client, symbol)
-    alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
-    qty = alloc / current_price
-    buy_price = current_price * (1 - 0.001 - atr / current_price * 0.5)
-    adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, buy_price, current_price)
-    if error or not adjusted: return
-    bot.place_limit_buy_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
-
-def execute_sell(client, symbol, position, bot):
-    current = fetch_current_data(client, symbol)
-    if not current: return
-    should_sell, order_type, sell_fee = check_sell_signal(client, symbol, position)
-    if not should_sell: return
-    qty = position.quantity
-    if order_type == 'market':
-        order = place_market_sell(client, symbol, qty)
-        if order:
-            exit_price = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / sum(float(f['qty']) for f in order['fills'])
-            profit = (exit_price - position.avg_entry_price) * float(qty) - (sell_fee * exit_price * float(qty))
-            with DBManager() as sess:
-                bot.record_trade(sess, symbol, 'sell', exit_price, qty, str(order['orderId']))
-                sess.query(Position).filter_by(symbol=symbol).delete()
-            send_whatsapp_alert(f"SOLD {symbol} @ {exit_price:.6f} Profit: ${profit:.2f}")
-    else:
-        metrics = get_historical_metrics(client, symbol)
-        if not metrics or metrics['atr'] is None: return
-        sell_price = position.avg_entry_price * (1 + PROFIT_TARGET + position.buy_fee_rate + sell_fee) + metrics['atr'] * 0.5
-        bot.place_limit_sell_with_tracking(symbol, sell_price, qty)
-
-# === ALL ORIGINAL HELPERS (unchanged) ===
+# === FULL ORIGINAL HELPERS & STRATEGY ===
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+def get_price_usdt(client, asset: str) -> Decimal:
+    if asset == 'USDT': return Decimal('1')
+    symbol = asset + 'USDT'
+    try:
+        return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+    except Exception:
+        for bridge in ('BTC', 'ETH'):
+            try:
+                p1 = Decimal(client.get_symbol_ticker(symbol=asset + bridge)['price'])
+                p2 = Decimal(client.get_symbol_ticker(symbol=bridge + 'USDT')['price'])
+                return p1 * p2
+            except Exception:
+                continue
+    logger.warning(f"No USDT price for {asset}")
+    return Decimal('0')
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_all_nonzero_balances(client):
     try:
         account = client.get_account()
-        balances = {}
-        for b in account['balances']:
-            asset = b['asset']
-            free  = float(b['free'])
-            if free > 0:
-                balances[asset] = free
-        return balances
+        return {b['asset']: float(b['free']) for b in account['balances'] if float(b['free']) > 0}
     except Exception as e:
-        logger.error(f"get_all_nonzero_balances error: {e}")
+        logger.error(f"Balance error: {e}")
         return {}
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -394,21 +406,14 @@ def calculate_total_portfolio_value(client):
             total_usdt += qty
             asset_values[asset] = qty
             continue
-        symbol = asset + 'USDT'
-        try:
-            ticker = client.get_symbol_ticker(symbol=symbol)
-            price = float(ticker['price'])
-            value_usdt = qty * price
-            total_usdt += value_usdt
-            asset_values[asset] = value_usdt
-        except Exception:
-            logger.debug(f"No USDT pair for {asset}, skipping valuation")
-            asset_values[asset] = 0.0
+        price = float(get_price_usdt(client, asset))
+        value_usdt = qty * price
+        total_usdt += value_usdt
+        asset_values[asset] = value_usdt
     return total_usdt, asset_values
 
 def print_coin_scanner(client, symbols):
-    if not DEBUG_SHOW_API_COIN_DATA_FETCHING:
-        return
+    if not DEBUG_SHOW_API_COIN_DATA_FETCHING: return
     logger.debug("\n" + "-" * 120)
     logger.debug(f" LIVE COIN SCANNER - {now_cst()} - SCANNING {len(symbols)} PAIRS")
     logger.debug("-" * 120)
@@ -522,12 +527,16 @@ def get_momentum_status(client, symbol):
         highs = np.array([float(k[2]) for k in klines])
         lows = np.array([float(k[3]) for k in klines])
         closes = np.array([float(k[4]) for k in klines])
-        bullish_score = sum([np.any(talib.CDLHAMMER(opens, highs, lows, closes) > 0),
-                             np.any(talib.CDLENGULFING(opens, highs, lows, closes) > 0),
-                             np.any(talib.CDLMORNINGSTAR(opens, highs, lows, closes) > 0)])
-        bearish_score = sum([np.any(talib.CDLSHOOTINGSTAR(opens, highs, lows, closes) > 0),
-                             np.any(talib.CDLENGULFING(opens, highs, lows, closes) < 0),
-                             np.any(talib.CDLEVENINGSTAR(opens, highs, lows, closes) > 0)])
+        bullish_score = sum([
+            np.any(talib.CDLHAMMER(opens, highs, lows, closes) > 0),
+            np.any(talib.CDLENGULFING(opens, highs, lows, closes) > 0),
+            np.any(talib.CDLMORNINGSTAR(opens, highs, lows, closes) > 0)
+        ])
+        bearish_score = sum([
+            np.any(talib.CDLSHOOTINGSTAR(opens, highs, lows, closes) > 0),
+            np.any(talib.CDLENGULFING(opens, highs, lows, closes) < 0),
+            np.any(talib.CDLEVENINGSTAR(opens, highs, lows, closes) > 0)
+        ])
         return "bullish" if bullish_score > bearish_score else "bearish" if bearish_score > bullish_score else "sideways"
     except Exception as e:
         logger.error(f"Momentum failed {symbol}: {e}")
@@ -547,30 +556,28 @@ def get_trade_fees(client, symbol):
     try:
         fee_info = client.get_trade_fee(symbol=symbol)
         return float(fee_info[0]['makerCommission']), float(fee_info[0]['takerCommission'])
-    except Exception as e:
-        logger.debug(f"Using default fees for {symbol}")
+    except Exception:
         return 0.001, 0.001
 
 def send_whatsapp_alert(message: str):
+    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE: return
     try:
-        if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE: return
         url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
         resp = requests.get(url, timeout=30)
         if resp.status_code == 200:
-            logger.info(f"WhatsApp alert: {message[:50]}...")
+            logger.info(f"WhatsApp: {message[:50]}...")
     except Exception as e:
         logger.error(f"Alert failed: {e}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_balance(client, asset='USDT'):
     try:
-        account = client.get_account()
-        for bal in account['balances']:
+        for bal in client.get_account()['balances']:
             if bal['asset'] == asset:
                 return float(bal['free'])
         return 0.0
     except Exception as e:
-        logger.error(f"Balance fetch error: {e}")
+        logger.error(f"Balance error: {e}")
         return 0.0
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -677,16 +684,61 @@ def check_buy_signal(client, symbol):
 def check_sell_signal(client, symbol, position):
     current = fetch_current_data(client, symbol)
     if not current: return False, None, None
-    current_price = current['price']
+    current_price = Decimal(str(current['price']))
     maker_fee, taker_fee = get_trade_fees(client, symbol)
     buy_fee = position.buy_fee_rate
-    profit_pct = (current_price - position.avg_entry_price) / position.avg_entry_price - (buy_fee + taker_fee)
+    profit_pct = float((current_price - position.avg_entry_price) / position.avg_entry_price - (buy_fee + taker_fee))
     if profit_pct < PROFIT_TARGET: return False, None, None
     metrics = get_historical_metrics(client, symbol)
     if not metrics: return False, None, None
-    if is_bearish_candlestick_pattern(metrics) or current_price >= metrics['bb_upper'] * 0.995:
+    if is_bearish_candlestick_pattern(metrics) or current_price >= Decimal(str(metrics['bb_upper'])) * Decimal('0.995'):
         return True, 'market', taker_fee
     return True, 'limit', maker_fee
+
+def execute_buy(client, symbol, bot):
+    balance = get_balance(client)
+    if balance <= MIN_BALANCE:
+        send_whatsapp_alert("Low balance, skipping buy")
+        return
+    current = fetch_current_data(client, symbol)
+    if not current: return
+    current_price = current['price']
+    metrics = get_historical_metrics(client, symbol)
+    if not metrics or metrics['atr'] is None: return
+    atr = metrics['atr']
+    maker_fee, _ = get_trade_fees(client, symbol)
+    alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
+    qty = alloc / current_price
+    buy_price = current_price * (1 - 0.001 - atr / current_price * 0.5)
+    adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, buy_price, current_price)
+    if error or not adjusted: return
+    bot.place_limit_buy_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
+
+def execute_sell(client, symbol, position, bot):
+    current = fetch_current_data(client, symbol)
+    if not current: return
+    should_sell, order_type, sell_fee = check_sell_signal(client, symbol, position)
+    if not should_sell: return
+    qty = position.quantity
+    metrics = get_historical_metrics(client, symbol)
+
+    if order_type == 'market':
+        order = place_market_sell(client, symbol, qty)
+        if order:
+            fills = order.get('fills', [])
+            total_qty = sum(Decimal(f['qty']) for f in fills)
+            total_val = sum(Decimal(f['price']) * Decimal(f['qty']) for f in fills)
+            exit_price = total_val / total_qty if total_qty > 0 else position.avg_entry_price
+            profit = (exit_price - position.avg_entry_price) * qty - (sell_fee * exit_price * qty)
+            with DBManager() as sess:
+                bot.record_trade(sess, symbol, 'sell', exit_price, qty, str(order['orderId']))
+                sess.delete(position)
+            send_whatsapp_alert(f"SOLD {symbol} @ {exit_price:.6f} Profit ${profit:,.2f}")
+    else:
+        if not metrics or metrics['atr'] is None: return
+        atr = Decimal(str(metrics['atr']))
+        sell_price = position.avg_entry_price * (1 + PROFIT_TARGET + position.buy_fee_rate + sell_fee) + atr * 0.5
+        bot.place_limit_sell_with_tracking(symbol, float(sell_price), float(qty))
 
 def get_all_usdt_symbols(client):
     try:
@@ -706,13 +758,6 @@ def place_market_sell(client, symbol, qty):
     except BinanceOrderException as e:
         logger.error(f"MARKET SELL failed {symbol}: {e}")
         return None
-
-def cancel_order(client, symbol, order_id):
-    try:
-        client.cancel_order(symbol=symbol, orderId=order_id)
-        logger.info(f"Canceled order {order_id} for {symbol}")
-    except Exception as e:
-        logger.error(f"Cancel failed {symbol}: {e}")
 
 # === MAIN ===
 if __name__ == "__main__":
