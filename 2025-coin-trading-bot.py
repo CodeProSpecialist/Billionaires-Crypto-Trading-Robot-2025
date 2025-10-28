@@ -773,7 +773,7 @@ def calculate_total_portfolio_value(client):
         logger.error(f"Portfolio calc error: {e}")
         return 0.0, {}
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1 trackers, min=4, max=20))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def fetch_current_data(client, symbol):
     try:
         ticker = client.get_ticker(symbol=symbol)
