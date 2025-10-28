@@ -38,7 +38,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # === CONFIGURATION ===
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
-MAX_PRICE = 1000000.00
+MAX_PRICE = 1000.00
 MIN_PRICE = 1.00
 LOOP_INTERVAL = 60
 LOG_FILE = "crypto_trading_bot.log"
@@ -718,19 +718,42 @@ def is_bearish_candlestick_pattern(metrics):
     return any(patterns)
 
 def check_buy_signal(client, symbol):
+    # --- 1. Check if already holding ---
     with DBManager() as sess:
         if sess.query(Position).filter_by(symbol=symbol).first():
             return False
-    metrics = get_historical_metrics(client, symbol)
-    if not metrics or any(v is None for v in [metrics['rsi'], metrics['mfi'], metrics['bb_lower'], metrics['stoch_k'], metrics['stoch_d'], metrics['atr'], metrics['sma'], metrics['ema']]):
+
+    # --- 2. Get current ticker & 24h low ---
+    try:
+        ticker = client.get_ticker(symbol=symbol)
+        current_price = float(ticker['lastPrice'])
+        low_24h = float(ticker['lowPrice'])
+    except Exception as e:
+        logger.error(f"Ticker failed for {symbol}: {e}")
         return False
-    current = fetch_current_data(client, symbol)
-    if not current: return False
-    if not (MIN_PRICE <= current['price'] <= MAX_PRICE) or current['volume_24h'] < VOLUME_THRESHOLD: return False
-    if metrics['rsi'] <= 50 or metrics['mfi'] > 70 or metrics['macd'] <= metrics['signal'] or metrics['hist'] <= 0: return False
-    if get_momentum_status(client, symbol) != 'bullish': return False
-    if current['price'] > metrics['bb_lower'] * 1.005 or metrics['stoch_k'] > 30 or metrics['ema'] <= metrics['sma']: return False
-    if not is_bullish_candlestick_pattern(metrics): return False
+
+    # --- 3. Must be AT the 24h low (within 0.05%) ---
+    if current_price > low_24h * 1.0005:
+        return False
+
+    # --- 4. Must be bullish last 3 days (daily candles) ---
+    try:
+        klines = client.get_klines(symbol=symbol, interval='1d', limit=4)  # Last 3 full days + today
+        if len(klines) < 4:
+            return False
+        closes = [float(k[4]) for k in klines[-4:-1]]  # Last 3 closed days
+        if not all(closes[i] > closes[i-1] for i in range(1, len(closes))):
+            return False  # Not strictly increasing
+    except Exception as e:
+        logger.error(f"Daily klines failed for {symbol}: {e}")
+        return False
+
+    # --- 5. Basic filters: price range & volume ---
+    if not (MIN_PRICE <= current_price <= MAX_PRICE):
+        return False
+    if float(ticker['quoteVolume']) < VOLUME_THRESHOLD:
+        return False
+
     return True
 
 def execute_buy(client, symbol, bot):
