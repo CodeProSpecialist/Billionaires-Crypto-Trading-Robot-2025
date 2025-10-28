@@ -839,7 +839,7 @@ def validate_and_adjust_order(client, symbol, side, order_type, quantity, price=
         logger.error(f"validate_and_adjust_order error [{symbol}]: {e}")
         return None, "Filter error"
 
-@retry(stop=stop_after_attempt(3), wait_exponential(multiplier=1, min=4, max=20))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_trade_fees(client, symbol):
     try:
         fee = client.get_trade_fee(symbol=symbol)
