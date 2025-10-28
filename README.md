@@ -9,6 +9,10 @@ Newest Python code updates were
 on October 28, 2025. 
 *****
 
+( Note: delete the file named 
+binance_trades.db when restarting the program if there might be any configuration changes. 
+This also fixes any program startup errors. )
+
 Unleash the power of automated crypto trading with the Billionaires Crypto Trading Robot 2025, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using advanced mean-reversion with comprehensive momentum, oscillator, and trend filters. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
 ### Legal Disclaimers
