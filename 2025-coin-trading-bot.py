@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Binance.US Trading Bot – FINAL 100% COMPLETE + DEBUG + ERROR HANDLING
-- Fetches /USDT pairs ONCE at startup
-- Filters by price + 24h volume
-- Full order book analysis + % buys/sells
-- Bullish/Bearish/Sideways + RSI, BB, MACD
-- Professional dashboard with P&L, fees, age
-- DEBUG logging + robust error handling
-- Decimal-safe math throughout
+Binance.US Trading Bot – 100% COMPLETE + FIXED + ENHANCED
+- Decimal-safe math
+- Order book + RSI price following (lowest buy, highest sell)
+- Auto-import owned coins at startup
+- Full dashboard with total unrealized P&L
+- Robust DB, logging, alerts
 """
 
 import os
@@ -68,11 +66,16 @@ ORDER_BOOK_LIMIT = 20
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
+# === CONSTANTS (Decimal-safe) ===
+HUNDRED = Decimal('100')
+FIFTY = Decimal('50')
+POINT_TWO = Decimal('0.2')
+ZERO = Decimal('0')
+
 # === LOGGING (DEBUG LEVEL) ===
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Prevent duplicate handlers
 if not logger.handlers:
     file_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=7)
     file_handler.setLevel(logging.DEBUG)
@@ -189,7 +192,7 @@ def to_decimal(value) -> Decimal:
         return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
     except (InvalidOperation, TypeError, ValueError) as e:
         logger.debug(f"to_decimal failed: {value} -> {e}")
-        return Decimal('0')
+        return ZERO
 
 # === FETCH & VALIDATE SYMBOLS ONCE ===
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -240,7 +243,7 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
         logger.error(f"Failed to fetch symbols: {e}")
         return {}
 
-# === ORDER BOOK ANALYSIS FUNCTION ===
+# === ORDER BOOK ANALYSIS FUNCTION (Decimal-safe) ===
 def get_order_book_analysis(client, symbol: str) -> dict:
     global order_book_cache
     now = time.time()
@@ -263,31 +266,37 @@ def get_order_book_analysis(client, symbol: str) -> dict:
         total_bid_vol = sum(bid_vols)
         total_ask_vol = sum(ask_vols)
         total = total_bid_vol + total_ask_vol
-        pct_bid = (total_bid_vol / total * 100) if total > 0 else 50
-        pct_ask = 100 - pct_bid
 
-        large_bid_count = sum(1 for v in bid_vols if v > total_bid_vol * 0.2)
-        large_ask_count = sum(1 for v in ask_vols if v > total_ask_vol * 0.2)
+        if total > 0:
+            pct_bid = (total_bid_vol / total) * HUNDRED
+            pct_ask = HUNDRED - pct_bid
+        else:
+            pct_bid = FIFTY
+            pct_ask = FIFTY
+
+        large_bid_count = sum(1 for v in bid_vols if total_bid_vol > 0 and v > total_bid_vol * POINT_TWO)
+        large_ask_count = sum(1 for v in ask_vols if total_ask_vol > 0 and v > total_ask_vol * POINT_TWO)
 
         result = {
             'bids': list(zip(bid_prices, bid_vols)),
             'asks': list(zip(ask_prices, ask_vols)),
-            'pct_bid': pct_bid,
-            'pct_ask': pct_ask,
+            'pct_bid': float(pct_bid),
+            'pct_ask': float(pct_ask),
             'large_bid_count': large_bid_count,
             'large_ask_count': large_ask_count,
-            'best_bid': bid_prices[0] if bid_prices else Decimal('0'),
-            'best_ask': ask_prices[0] if ask_prices else Decimal('0'),
+            'best_bid': bid_prices[0] if bid_prices else ZERO,
+            'best_ask': ask_prices[0] if ask_prices else ZERO,
             'ts': now
         }
         order_book_cache[symbol] = result
-        logger.debug(f"Order book cached for {symbol}: {pct_bid:.1f}% buy")
+        logger.debug(f"Order book cached for {symbol}: {result['pct_bid']:.1f}% buy")
         return result
+
     except Exception as e:
         logger.error(f"Order book fetch failed for {symbol}: {e}")
         return {
-            'bids': [], 'asks': [], 'pct_bid': 50, 'pct_ask': 50,
-            'best_bid': Decimal('0'), 'best_ask': Decimal('0'),
+            'bids': [], 'asks': [], 'pct_bid': 50.0, 'pct_ask': 50.0,
+            'best_bid': ZERO, 'best_ask': ZERO,
             'large_bid_count': 0, 'large_ask_count': 0
         }
 
@@ -328,19 +337,22 @@ def get_historical_metrics(client, symbol) -> dict:
 
 # === PROFESSIONAL DASHBOARD ===
 def print_status_dashboard(client):
-    global positions
     try:
         logger.debug("Rendering dashboard...")
         usdt_free = get_balance(client, 'USDT')
         total_portfolio_usdt, asset_usdt_values = calculate_total_portfolio_value(client)
-        total_unrealized = 0.0
+
+        with DBManager() as sess:
+            db_positions = sess.query(Position).all()
+
+        total_unrealized = Decimal('0')
 
         print("\n" + "="*100)
         print(f" PROFESSIONAL TRADING DASHBOARD - {now_cst()} ")
         print("="*100)
         print(f"Available Cash (USDT):         ${usdt_free:,.6f}")
         print(f"Total Portfolio Value:         ${total_portfolio_usdt:,.6f}")
-        print(f"Active Tracked Positions:      {len(positions)}")
+        print(f"Active Tracked Positions:      {len(db_positions)}")
         print("-" * 100)
 
         owned_coins = get_all_nonzero_balances(client)
@@ -352,47 +364,46 @@ def print_status_dashboard(client):
                 print(f"{asset:<8} {qty:>12.8f} {usdt_val:>12.2f}")
             print("-" * 40)
 
-        if not positions:
-            print(" No tracked positions (bot hasn't opened any yet).")
+        if not db_positions:
+            print(" No tracked positions.")
             print("="*100 + "\n")
             return
 
         print(f"{'SYMBOL':<10} {'QTY':>10} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT $':>10} {'SELL PRICE':>12} {'AGE':>12}")
         print("-" * 100)
 
-        for symbol, pos in positions.items():
-            qty = pos['qty']
-            entry_price = pos['entry_price']
-            entry_time = pos['entry_time']
-            buy_fee = pos['buy_fee']
+        for pos in db_positions:
+            symbol = pos.symbol
+            qty = float(pos.quantity)
+            entry_price = float(pos.avg_entry_price)
+            buy_fee = float(pos.buy_fee_rate)
 
-            current_data = fetch_current_data(client, symbol)
-            current_price = current_data['price'] if current_data else entry_price
+            cur_data = fetch_current_data(client, symbol)
+            cur_price = cur_data['price'] if cur_data else entry_price
 
             metrics = get_historical_metrics(client, symbol)
-            rsi = metrics['rsi'] if metrics and metrics['rsi'] is not None else None
+            rsi = metrics.get('rsi')
+            rsi_disp = f"{rsi:5.1f}" if rsi is not None else " N/A "
 
             maker_fee, taker_fee = get_trade_fees(client, symbol)
             total_fees = buy_fee + taker_fee
 
-            gross_profit = (current_price - entry_price) * qty
-            fee_cost = total_fees * current_price * qty
-            net_profit = gross_profit - fee_cost
-            profit_pct = ((current_price - entry_price) / entry_price - total_fees) * 100
-            total_unrealized += net_profit
+            gross = (cur_price - entry_price) * qty
+            fee_cost = total_fees * cur_price * qty
+            net_profit = gross - fee_cost
+            profit_pct = ((cur_price - entry_price) / entry_price - total_fees) * 100
+
+            total_unrealized += Decimal(str(net_profit))
 
             target_sell = entry_price * (1 + PROFIT_TARGET + buy_fee + taker_fee)
-
-            age = datetime.now(CST_TZ) - entry_time
+            age = datetime.now(CST_TZ) - pos.updated_at.replace(tzinfo=CST_TZ)
             age_str = str(age).split('.')[0]
 
-            rsi_disp = f"{rsi:5.1f}" if rsi is not None else " N/A "
-
-            print(f"{symbol:<10} {qty:>10.6f} {entry_price:>12.6f} {current_price:>12.6f} "
+            print(f"{symbol:<10} {qty:>10.6f} {entry_price:>12.6f} {cur_price:>12.6f} "
                   f"{rsi_disp} {profit_pct:>7.2f}% {net_profit:>10.2f} {target_sell:>12.6f} {age_str:>12}")
 
         print("-" * 100)
-        print(f"Tracked Unrealized P&L:        ${total_unrealized:,.2f}")
+        print(f"{'TOTAL UNREALIZED P&L':<30} ${float(total_unrealized):>12,.2f}")
         print(f"Bot Running... Next update in {LOOP_INTERVAL} seconds.\n")
         print("="*100 + "\n")
 
@@ -425,6 +436,45 @@ def print_all_coins_analysis(client):
     except Exception as e:
         logger.error(f"Failed to print coin analysis: {e}", exc_info=True)
 
+# === IMPORT OWNED ASSETS AT STARTUP ===
+def import_owned_assets_to_db(client, sess):
+    try:
+        account = client.get_account()
+        logger.info("Importing owned assets from Binance account...")
+        imported = 0
+        for bal in account['balances']:
+            asset = bal['asset']
+            qty_str = bal['free']
+            qty = safe_float(qty_str)
+            if qty <= 0 or asset == 'USDT':
+                continue
+
+            price_usdt = get_price_usdt(client, asset)
+            if price_usdt <= 0:
+                logger.warning(f"Could not get price for {asset}, skipping.")
+                continue
+
+            symbol = f"{asset}USDT"
+            existing = sess.query(Position).filter_by(symbol=symbol).one_or_none()
+            if existing:
+                logger.debug(f"Position already exists for {symbol}, skipping import.")
+                continue
+
+            maker_fee, _ = get_trade_fees(client, symbol)
+            pos = Position(
+                symbol=symbol,
+                quantity=Decimal(str(qty)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN),
+                avg_entry_price=price_usdt,
+                buy_fee_rate=maker_fee
+            )
+            sess.add(pos)
+            imported += 1
+            logger.info(f"Imported {asset}: {qty:.8f} @ {price_usdt} → {symbol}")
+
+        logger.info(f"Imported {imported} owned assets into Position table.")
+    except Exception as e:
+        logger.error(f"Failed to import owned assets: {e}", exc_info=True)
+
 # === BOT CLASS ===
 class BinanceTradingBot:
     def __init__(self):
@@ -432,6 +482,10 @@ class BinanceTradingBot:
             self.client = Client(API_KEY, API_SECRET, tld='us')
             logger.info("Binance.US client initialized.")
             self.load_state_from_db()
+
+            with DBManager() as sess:
+                import_owned_assets_to_db(self.client, sess)
+
         except Exception as e:
             logger.critical(f"Failed to initialize bot: {e}")
             sys.exit(1)
@@ -544,31 +598,37 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Failed to process filled orders: {e}")
 
-# === STRATEGY: BUY ===
+# === STRATEGY: BUY (follow lowest price + RSI) ===
 def check_buy_signal(client, symbol):
     try:
+        final_price = follow_price_with_rsi(client, symbol, side='buy')
+        if final_price <= 0:
+            logger.debug(f"{symbol} follow_price_with_rsi returned 0")
+            return False, None
+
+        klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 5)
+        if len(klines) < RSI_PERIOD + 1:
+            logger.debug(f"{symbol} not enough klines for RSI")
+            return False, None
+
+        closes = np.array([safe_float(k[4]) for k in klines[-RSI_PERIOD-1:]])
+        if not np.all(np.isfinite(closes)):
+            logger.debug(f"{symbol} invalid close prices")
+            return False, None
+
+        rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
+        if not np.isfinite(rsi) or rsi > RSI_OVERSOLD:
+            logger.debug(f"{symbol} RSI {rsi:.1f} > {RSI_OVERSOLD} – not oversold")
+            return False, None
+
         ob = get_order_book_analysis(client, symbol)
         if ob['pct_bid'] < ORDERBOOK_IMBALANCE_THRESHOLD * 100:
             logger.debug(f"{symbol} buy pressure low: {ob['pct_bid']:.1f}%")
             return False, None
 
-        final_price = follow_price_with_rsi(client, symbol, 'buy')
-        if final_price <= 0:
-            logger.debug(f"{symbol} follow_price_with_rsi failed")
-            return False, None
-
-        klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 1)
-        closes = np.array([safe_float(k[4]) for k in klines])
-        if len(closes) < RSI_PERIOD or not np.all(np.isfinite(closes)):
-            logger.debug(f"{symbol} insufficient klines")
-            return False, None
-        final_rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-        if not np.isfinite(final_rsi) or final_rsi > RSI_OVERSOLD:
-            logger.debug(f"{symbol} RSI {final_rsi:.1f} > {RSI_OVERSOLD}")
-            return False, None
-
-        logger.info(f"BUY SIGNAL: {symbol} @ {final_price}")
+        logger.info(f"BUY SIGNAL: {symbol} @ {final_price} (RSI={rsi:.1f})")
         return True, final_price
+
     except Exception as e:
         logger.error(f"check_buy_signal error [{symbol}]: {e}")
         return False, None
@@ -604,7 +664,7 @@ def execute_buy(client, symbol, bot):
     except Exception as e:
         logger.error(f"execute_buy failed [{symbol}]: {e}", exc_info=True)
 
-# === STRATEGY: SELL ===
+# === STRATEGY: SELL (follow highest price + RSI) ===
 def check_sell_signal(client, symbol, position):
     try:
         cur = fetch_current_data(client, symbol)
@@ -615,20 +675,29 @@ def check_sell_signal(client, symbol, position):
         if profit_pct < PROFIT_TARGET:
             return False, None
 
-        final_price = follow_price_with_rsi(client, symbol, 'sell')
+        final_price = follow_price_with_rsi(client, symbol, side='sell')
         if final_price <= 0:
+            logger.debug(f"{symbol} follow_price_with_rsi returned 0")
             return False, None
 
-        klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 1)
-        closes = np.array([safe_float(k[4]) for k in klines])
-        if len(closes) < RSI_PERIOD or not np.all(np.isfinite(closes)):
-            return False, None
-        final_rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-        if not np.isfinite(final_rsi) or final_rsi < RSI_OVERBOUGHT:
+        klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 5)
+        if len(klines) < RSI_PERIOD + 1:
+            logger.debug(f"{symbol} not enough klines for RSI")
             return False, None
 
-        logger.info(f"SELL SIGNAL: {symbol} @ {final_price}")
+        closes = np.array([safe_float(k[4]) for k in klines[-RSI_PERIOD-1:]])
+        if not np.all(np.isfinite(closes)):
+            logger.debug(f"{symbol} invalid close prices")
+            return False, None
+
+        rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
+        if not np.isfinite(rsi) or rsi < RSI_OVERBOUGHT:
+            logger.debug(f"{symbol} RSI {rsi:.1f} < {RSI_OVERBOUGHT} – not overbought")
+            return False, None
+
+        logger.info(f"SELL SIGNAL: {symbol} @ {final_price} (RSI={rsi:.1f})")
         return True, final_price
+
     except Exception as e:
         logger.error(f"check_sell_signal error [{symbol}]: {e}")
         return False, None
@@ -668,7 +737,7 @@ def get_price_usdt(client, asset: str) -> Decimal:
                 return p1 * p2
             except:
                 continue
-    return Decimal('0')
+    return ZERO
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_balance(client, asset='USDT') -> float:
@@ -704,7 +773,7 @@ def calculate_total_portfolio_value(client):
         logger.error(f"Portfolio calc error: {e}")
         return 0.0, {}
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1 trackers, min=4, max=20))
 def fetch_current_data(client, symbol):
     try:
         ticker = client.get_ticker(symbol=symbol)
@@ -770,7 +839,8 @@ def validate_and_adjust_order(client, symbol, side, order_type, quantity, price=
         logger.error(f"validate_and_adjust_order error [{symbol}]: {e}")
         return None, "Filter error"
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+@retry(stop=stop_after_attempt(3), wait=#
+exponential(multiplier=1, min=4, max=20))
 def get_trade_fees(client, symbol):
     try:
         fee = client.get_trade_fee(symbol=symbol)
@@ -794,7 +864,7 @@ def _best_price(depth: dict, side: str) -> Decimal:
         return Decimal(str(depth['bids'][0][0]))
     if side == 'sell' and depth.get('asks'):
         return Decimal(str(depth['asks'][0][0]))
-    return Decimal('0')
+    return ZERO
 
 def follow_price_with_rsi(client, symbol: str, side: str) -> Decimal:
     history = deque(maxlen=DEPTH_HISTORY)
@@ -851,7 +921,7 @@ def follow_price_with_rsi(client, symbol: str, side: str) -> Decimal:
         return _best_price(depth, side)
     except Exception as e:
         logger.error(f"Final price fetch failed: {e}")
-        return Decimal('0')
+        return ZERO
 
 # === MAIN ===
 def main():
@@ -862,7 +932,6 @@ def main():
     client = Client(API_KEY, API_SECRET, tld='us')
     bot = BinanceTradingBot()
 
-    # Fetch symbols once
     if not fetch_and_validate_usdt_pairs(client):
         logger.critical("No valid symbols found. Exiting.")
         sys.exit(1)
