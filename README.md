@@ -9,16 +9,16 @@ Newest Python code updates were
 on October 28, 2025. 
 *****
 
-Unleash the power of automated crypto trading with the Billionaires Crypto Trading Robot 2025, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using smart mean-reversion and momentum strategies. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
+Unleash the power of automated crypto trading with the Billionaires Crypto Trading Robot 2025, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using advanced mean-reversion with comprehensive momentum, oscillator, and trend filters. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
 ### Legal Disclaimers
 
-**Important Notice: This information is provided as of October 27, 2025, and cryptocurrency markets, regulations, and technologies evolve rapidly. Always verify the latest information and consult professionals before using this bot.**
+**Important Notice: This information is provided as of October 28, 2025, and cryptocurrency markets, regulations, and technologies evolve rapidly. Always verify the latest information and consult professionals before using this bot.**
 
 - **No Affiliation or Endorsement**: This trading bot is not affiliated with, endorsed by, or sponsored by Binance.US or CallMeBot. All interactions with these platforms are at the user's sole discretion and risk, subject to their respective terms of service.
 - **Not Financial, Investment, or Legal Advice**: This bot and its description are for informational and educational purposes only. They do not constitute financial, investment, tax, legal, or professional advice. The author is not a financial advisor, broker, or registered investment advisor. All trading decisions are your sole responsibility. Seek independent advice from qualified professionals to assess suitability for your circumstances.
 - **High Risk of Loss**: Cryptocurrency trading involves substantial risks, including the potential for **complete or partial loss of your investment**. Prices are highly volatile, subject to rapid and unpredictable changes due to market sentiment, regulatory news, technological issues, or external factors. Past performance does not guarantee future results. You could lose more than your initial investment.
-- **No Guarantee of Profits**: **Profits are not guaranteed**. There is no assurance that this bot will generate profits or avoid losses. Trading strategies, including mean-reversion and momentum filters, may fail in certain market conditions (e.g., high volatility, low liquidity, or black swan events). The 0.8% profit target is a goal, not a guarantee, and losses may occur due to fees, slippage, or unfavorable price movements.
+- **No Guarantee of Profits**: **Profits are not guaranteed**. There is no assurance that this bot will generate profits or avoid losses. Trading strategies, including mean-reversion with momentum, oscillator, and trend filters, may fail in certain market conditions (e.g., high volatility, low liquidity, or black swan events). The 0.8% profit target is a goal, not a guarantee, and losses may occur due to fees, slippage, or unfavorable price movements.
 - **Legal and Regulatory Compliance**: Cryptocurrency trading is subject to U.S. laws, including oversight by the SEC (for securities-like assets) and CFTC (for commodities). As of October 2025, the CLARITY Act and FIT21 provide clearer jurisdiction, but users must ensure compliance with AML/KYC requirements under the Bank Secrecy Act (BSA), sanctions screening, and state licensing (e.g., New York's BitLicense). Do not use this bot if prohibited in your jurisdiction. On October 17, 2025, the NFA eliminated certain disclosure guidance for digital assets but still requires disclosing material risks. Users are responsible for tax reporting (e.g., IRS Form 1099-DA for gains/losses) and any violations could result in penalties.
 - **No Liability**: The author disclaims all liability for any direct, indirect, consequential, or special losses arising from using this bot, including trading losses, data inaccuracies, third-party service failures (e.g., Binance.US API, CallMeBot), or security breaches. You are responsible for securing API keys and accounts. The bot interacts with third-party services; any downtime, errors, or changes in their terms are beyond control.
 - **Software Risks and Warranty Disclaimer**: The bot is provided "as is" without warranties of merchantability, fitness for purpose, or non-infringement. It may contain bugs, and users assume risks from technical failures, incorrect configurations, or unauthorized access. Test thoroughly in a simulation environment before live trading.
@@ -31,102 +31,104 @@ Billionaires Crypto Trading Robot for Binance.US
 
 ### How the Crypto Trading Bot Works: Buying, Selling, Fee Compensation, and Profit Mechanism
 
-The Billionaires Crypto Trading Robot is a Python-based automated system designed for Binance.US, focusing on USDT-paired cryptocurrencies priced between $1–$25 with specific bullish signals. It uses a mean-reversion strategy with momentum filters, leveraging 15 days of historical price data stored in an SQLAlchemy database (SQLite by default). The bot runs in a loop every 60 seconds, checking signals, managing orders, and sending CallMeBot WhatsApp alerts for key events.
+The Billionaires Crypto Trading Robot is a Python-based automated system designed for Binance.US, focusing on USDT-paired cryptocurrencies priced between $1–$1000 with specific bullish signals. It uses a mean-reversion strategy enhanced with comprehensive indicators including RSI, MACD, MFI, Bollinger Bands, Stochastic Oscillator, ATR, SMA, EMA, and candlestick patterns, leveraging 60 days of historical price data (1-hour klines) stored in an SQLAlchemy database (SQLite by default). The bot runs in a loop every 60 seconds, checking signals, managing orders, processing filled orders, and sending CallMeBot WhatsApp alerts for key events. It also prints a professional dashboard to the console for real-time status monitoring.
 
-It prioritizes **limit orders** for buys (to get maker fees) and mixes **market/limit sells** based on price velocity (fast rises use market sells for quick exits). All trades aim for a **net profit of at least 0.8% after fees**, with risk controls like allocating only 10% of balance per trade and maintaining a $2 minimum USDT buffer. **Profits are not guaranteed, and you risk losing all or part of your investment.**
+On startup, it imports all owned nonzero-balance assets (any pair convertible to USDT) as tracked positions, using current market prices as entry points for profit calculations. It prioritizes **limit orders** for buys (to get maker fees) with a 300-second timeout and adaptive sells (market for urgent exits based on bearish signals, limit otherwise). All trades aim for a **net profit of at least 0.8% after fees**, with risk controls like allocating only 10% of balance per trade and maintaining a $2 minimum USDT buffer. **Profits are not guaranteed, and you risk losing all or part of your investment.**
 
 Below, I'll break down the buying, selling, fee compensation, and profit mechanisms step by step, referencing the code's logic.
 
 #### 1. **How the Bot Buys**
-The bot buys only when a coin meets strict criteria for low risk and bullish potential, ensuring it enters near a 15-day low with upward momentum. This is checked in the `check_buy_signal` function during the main loop.
+The bot buys only when a coin meets strict criteria for low risk and bullish potential, ensuring it enters near the lower Bollinger Band with oversold conditions and upward trend signals. This is checked in the `check_buy_signal` function during the main loop for symbols without existing positions.
 
 - **Signal Detection**:
-  - Queries the database for 15 days of hourly candle data (stored via `store_historical_data` using Binance.US historical klines).
+  - Queries the database and fetches 60 days of 1-hour kline data via Binance.US API.
   - Computes metrics like:
-    - 15-day low price (to buy near dips).
-    - RSI (Relative Strength Index) > 50 (indicating strength in uptrends).
-    - 5-day ROC (Rate of Change) > 0 (positive momentum).
-    - Max drawdown < -10% (avoids coins that lose value quickly).
-    - Average volume > $100,000 (ensures liquidity).
-    - Current price between $1–$25.
-    - Bullish candlestick patterns (e.g., hammer, engulfing) via TA-Lib in `get_momentum_status`.
-  - If the current price is ≤ 0.1% above the 15-day low and all filters pass, it triggers a buy (e.g., "bullish" momentum required).
+    - RSI (14-period) > 50 (indicating strength).
+    - MFI (Money Flow Index, 14-period) ≤ 70 (avoids overbought).
+    - MACD (12,26,9) > signal line and histogram > 0 (bullish momentum).
+    - Stochastic Oscillator (5,3,3) K% ≤ 30 (oversold).
+    - EMA (21-period) > SMA (50-period) (uptrend confirmation).
+    - Current price ≤ lower Bollinger Band (20-period, 2-dev) * 1.005 (near oversold band).
+    - Bullish candlestick patterns (e.g., hammer, inverted hammer, engulfing, morning star, three white soldiers) via TA-Lib in `is_bullish_candlestick_pattern`.
+    - Bullish momentum status via TA-Lib patterns in `get_momentum_status`.
+    - 24-hour quote volume > $15,000 (ensures liquidity).
+    - Current price between $1–$1000.
+  - If all filters pass, it triggers a buy.
 
-- **Order Placement (`execute_buy`)**:
+- **Order Placement (`execute_buy` and `place_limit_buy_with_tracking`)**:
   - Checks USDT balance (> $2 buffer); allocates 10% max per trade.
-  - Places a **limit buy** at 0.1% below current price (slippage buffer) to qualify as a maker order (lower fees).
-  - Monitors for 5 minutes (300s timeout). If filled:
-    - Records actual entry price (from order status) and buy fee (dynamic via `get_trade_fees`).
-    - Stores position in DB (symbol, qty, entry_price, entry_time, buy_fee).
-    - Sends alert: "BUY filled [symbol] @ [price] qty [qty] fee [fee]%".
-  - If not filled: Cancels and falls back to **market buy** (if signal still valid), using taker fee.
-  - No buy if position already open or balance low.
+  - Calculates buy price as current price * (1 - 0.001 - 0.5 * ATR / current price), where ATR is 14-period for volatility buffer.
+  - Places a **limit buy** to qualify as a maker order (lower fees), adjusted for symbol filters (lot size, price tick, min notional).
+  - Tracks the order in the database as a PendingOrder and monitors for fills in `check_and_process_filled_orders`.
+  - On fill (polled in main loop): Records actual entry price, quantity, and buy fee rate (dynamic via `get_trade_fees`).
+  - Stores or updates position in DB (symbol, qty, avg_entry_price, buy_fee_rate).
+  - Sends alert: e.g., "BUY filled [symbol] @ [price] qty [qty]".
+  - No buy if position already open, balance low, or signal invalid.
 
-This ensures buys happen only on high-confidence dips, with data backfilled on startup/pruned daily.
+This ensures buys happen only on high-confidence oversold entries in uptrends, with data fetched on demand and persistence for restarts.
 
 #### 2. **How the Bot Sells**
-Selling occurs when a held position reaches the profit target after fees, checked in `check_sell_signal` for open positions (loaded from DB).
+Selling occurs when a held position (including imported assets) reaches the profit target after fees, checked in `check_sell_signal` for all open positions (loaded from DB).
 
 - **Signal Detection**:
   - Fetches current price and dynamic fees (maker/taker via API).
-  - Calculates net profit percentage: `(current_price - entry_price) / entry_price - (buy_fee + estimated_sell_fee)`.
-    - `buy_fee` is the actual fee from the buy (stored in position).
-    - `estimated_sell_fee` assumes worst-case taker fee (0.6% in Tier I) for conservatism.
+  - Calculates net profit percentage: `(current_price - avg_entry_price) / avg_entry_price - (buy_fee_rate + sell_fee)`.
+    - `buy_fee_rate` is the stored rate from the buy (or default 0.1%).
+    - `sell_fee` assumes taker for market sells (urgent) or maker for limit.
   - If net profit < 0.8% (`PROFIT_TARGET`), no sell.
-  - Checks price velocity (1-min delta > 0.5%): Fast rise → market sell (taker fee); slow → limit sell (maker fee).
+  - Determines sell type: Market if bearish candlestick patterns (e.g., shooting star, hanging man, engulfing) or current price ≥ upper Bollinger Band * 0.995; otherwise limit.
 
-- **Order Placement (`execute_sell`)**:
-  - For **market sell** (fast exit): Immediate sell of full qty; uses taker fee.
-  - For **limit sell** (slow exit): Sets price at `entry_price * (1 + PROFIT_TARGET + buy_fee + sell_fee)` to lock in net profit.
-  - On fill: Records exit price/profit, logs trade to DB, deletes position, sends alert: "SOLD [symbol] @ [exit_price] profit [profit] USDT fee [sell_fee]%".
-  - No polling/timeout for sells (assumes quick fills); market sells are instant.
+- **Order Placement (`execute_sell`, `place_market_sell`, `place_limit_sell_with_tracking`)**:
+  - For **market sell** (urgent exit): Immediate sell of full qty; uses taker fee.
+  - For **limit sell** (controlled exit): Sets price at `avg_entry_price * (1 + PROFIT_TARGET + buy_fee_rate + sell_fee)` + 0.5 * ATR to lock in net profit with volatility buffer.
+  - Adjusts for symbol filters (lot size, price tick, min notional).
+  - Tracks limit sells as PendingOrder; processes fills in main loop.
+  - On fill: Records exit price/profit, logs trade to DB, deletes position, sends alert: "SOLD [symbol] @ [exit_price] Profit $[profit]".
+  - Market sells are instant; limit sells are polled via order status.
 
-This adaptive approach captures profits quickly in volatile upswings while optimizing for better prices in gradual rises.
+This adaptive approach captures profits while responding to bearish signals for quick exits in volatile conditions.
 
 #### 3. **How the Bot Compensates for Fees**
-Fees are dynamically handled to ensure trades are profitable **net of costs**, based on your Binance.US tier (queried via API). The bot assumes Tier I/VIP 1 (0.4% maker, 0.6% taker) as fallback but fetches real-time values.
+Fees are dynamically handled to ensure trades are profitable **net of costs**, based on your Binance.US tier (queried via API). The bot fetches real-time maker/taker rates (defaults to 0.1% if API fails).
 
 - **Fee Fetching**:
-  - `get_trade_fees` queries `client.get_trade_fee(symbol)` for maker/taker rates (e.g., 0.004 maker, 0.006 taker in Tier I).
-  - If API fails, defaults to Tier I (0.4% maker, 0.6% taker).
+  - `get_trade_fees` queries `client.get_trade_fee(symbol)` for maker/taker rates (e.g., 0.001 maker, 0.001 taker in lower tiers).
 
 - **Compensation in Buy**:
-  - Limit buys use maker fee (lower); market fallback uses taker.
-  - Actual buy fee stored in position for precise later calculations.
+  - Limit buys use maker fee (lower); stored as `buy_fee_rate` in position for precise calculations.
 
 - **Compensation in Sell**:
-  - Profit calc subtracts **buy_fee + sell_fee** (sell_fee estimated as taker for market, maker for limit).
-  - Sell price for limits is inflated by fees + profit target, ensuring net gain.
-  - Example (Tier I, limit buy + market sell):
-    - Buy: 0.4% fee → Effective entry = entry_price * (1 + 0.004).
-    - Sell: Requires current_price >= effective entry * (1 + 0.008 + 0.006) to net 0.8% after 0.6% taker fee.
-  - Total round-trip compensation: 0.8%–1.2% buffered into targets, preventing breakeven/loss trades.
+  - Profit calc subtracts **buy_fee_rate + sell_fee** (sell_fee as taker for market, maker for limit).
+  - Sell price for limits is inflated by fees + profit target + ATR buffer, ensuring net gain.
+  - Example (assuming 0.1% maker/taker):
+    - Buy: 0.1% fee → Effective entry = avg_entry_price * (1 + 0.001).
+    - Sell: Requires current_price >= effective entry * (1 + 0.008 + 0.001) to net 0.8% after sell fee.
+  - Total round-trip compensation: Buffered into targets, preventing breakeven/loss trades.
 
-If on Tier 0 (free maker, 0.01% taker), fees drop to near-zero, allowing more frequent trades without changing code (dynamic fetch handles it).
+Lower-tier fees (e.g., Tier 0 with near-zero rates) allow more frequent trades without code changes (dynamic fetch handles it).
 
 #### 4. **How the Bot Profits**
-The bot profits by buying low (near 15-day lows with bullish filters) and selling at a fixed 0.8% net gain after fees, compounding over multiple trades. **Profits are not guaranteed, and you risk losing all or part of your investment.**
+The bot profits by buying oversold (near lower BB with oscillators confirming) in uptrends and selling at a fixed 0.8% net gain after fees, compounding over multiple trades. **Profits are not guaranteed, and you risk losing all or part of your investment.**
 
 - **Strategy Overview**:
-  - **Mean-Reversion + Momentum**: Buys on dips (≤0.1% above 15d low) but only if RSI >50, ROC >0, low drawdown, high volume, and bullish patterns. Avoids "falling knives" (quick losers).
-  - **Profit Target**: Strict 0.8% net after fees; no holding beyond signals.
-  - **Risk Management**: 10% allocation/trade, $2 buffer, no overlapping positions per coin.
-  - **Expected Win Rate**: Backtesting (implied in design) aims for 60%+ wins via filters; small gains (0.8%) but frequent (2–5 signals/week/coin).
+  - **Mean-Reversion + Comprehensive Filters**: Buys near lower BB (≤1.005x) but only if RSI >50, MFI ≤70, MACD bullish, Stochastic oversold (K% ≤30), EMA > SMA, bullish patterns/momentum. Avoids weak trends.
+  - **Profit Target**: Strict 0.8% net after fees; holds until target or bearish signals trigger market sell.
+  - **Risk Management**: 10% allocation/trade, $2 buffer, no overlapping positions per coin, ATR buffers for slippage/volatility.
+  - **Expected Win Rate**: Design aims for high-confidence entries; small gains (0.8%) but selective (filters minimize losses). Losses can exceed gains in adverse markets, potentially depleting your balance.
 
 - **Profit Calculation Example**:
   - Balance: $100 USDT.
-  - Buy SOLUSDT at $20 (limit, 0.4% fee): Alloc $9.8 (10% - buffer), qty=0.49 SOL, fee=$0.0392, effective cost=$9.8392.
+  - Buy SOLUSDT at $20 (limit, 0.1% fee): Alloc $9.8 (10% - buffer), qty=0.49 SOL, fee=$0.0098, effective cost=$9.8098.
   - Price rises to $20.30 (1.5% up).
-  - Net profit check: (20.30 - 20) / 20 - (0.004 + 0.006) = 0.015 - 0.01 = 0.005 < 0.008 → No sell.
-  - Price hits $20.36: 0.018 - 0.01 = 0.008 → Sell (market, 0.6% fee).
-  - Sell proceeds: $9.9564 - $0.0597 fee = $9.8967.
-  - Profit: $9.8967 - $9.8392 = **$0.0575** (~0.58% net, but scaled to 0.8% target after exact fees).
-  - **Risk Note**: If SOLUSDT drops (e.g., to $19), no sell occurs unless stop-loss added (not in current code), risking loss.
+  - Net profit check: (20.30 - 20) / 20 - (0.001 + 0.001) = 0.015 - 0.002 = 0.013 > 0.008 → Sell if signals allow.
+  - Sell (limit, 0.1% fee): Target price ~$20.36 (adjusted for fees/ATR), proceeds: $9.9564 - $0.00996 fee = $9.94644.
+  - Profit: $9.94644 - $9.8098 = **$0.13664** (~1.39% gross, 0.8% net after fees).
+  - **Risk Note**: If SOLUSDT drops, no sell unless profit target hit; no built-in stop-loss, risking loss.
 
 - **Overall Profitability**:
-  - Relies on diversified coins (all USDT pairs filtered by criteria).
-  - Compounds: 10 trades/month at 0.8% net = ~8% monthly (pre-compound), minus losses (filtered to minimize). Losses can exceed gains in adverse markets, potentially depleting your balance.
-  - Enhancements: 15d history for opportunities, alerts for monitoring, graceful shutdown/restart with DB persistence.
+  - Relies on all USDT pairs filtered by criteria, including imported assets.
+  - Compounds: Selective trades at 0.8% net; minus losses (filters aim to minimize). 
+  - Enhancements: 60d history for robust indicators, alerts/dashboard for monitoring, DB persistence for graceful shutdown/restart, pending order tracking for reliable fills.
 
 ### Installation in Ubuntu 24.04 Linux (Anaconda Python Environment Preferred)
 
@@ -245,8 +247,10 @@ conda activate trading_bot
 python3 2025-coin-trading-bot.py
 ```
 
-**Note**: Ensure the bot script is saved as `2025-coin-trading-bot.py`. Monitor logs in `crypto_trading_bot.log` for issues. This setup is for educational use; live trading carries significant risks, including the potential to **lose all or part of your investment**, as outlined in the disclaimers. 
+**Note**: Ensure the bot script is saved as `2025-coin-trading-bot.py`. Monitor logs in `crypto_trading_bot.log` for issues and the console dashboard for status. This setup is for educational use; live trading carries significant risks, including the potential to **lose all or part of your investment**, as outlined in the disclaimers. 
 
 To set up CallMeBot for WhatsApp, visit https://www.callmebot.com/ and follow the instructions to get your API key and configure the service. Then, use `curl` or Python to send messages via the API.
+
+This setup is for educational use; live trading carries significant risks, including the potential to **lose all or part of your investment**, as outlined in the disclaimers. 
 
 The bot is not affiliated with or endorsed by Binance.US or CallMeBot. Always test in a simulation environment (e.g., Binance.US testnet) before deploying with real funds.
