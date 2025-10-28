@@ -681,20 +681,6 @@ def check_buy_signal(client, symbol):
     if not is_bullish_candlestick_pattern(metrics): return False
     return True
 
-def check_sell_signal(client, symbol, position):
-    current = fetch_current_data(client, symbol)
-    if not current: return False, None, None
-    current_price = Decimal(str(current['price']))
-    maker_fee, taker_fee = get_trade_fees(client, symbol)
-    buy_fee = position.buy_fee_rate
-    profit_pct = float((current_price - position.avg_entry_price) / position.avg_entry_price - (buy_fee + taker_fee))
-    if profit_pct < PROFIT_TARGET: return False, None, None
-    metrics = get_historical_metrics(client, symbol)
-    if not metrics: return False, None, None
-    if is_bearish_candlestick_pattern(metrics) or current_price >= Decimal(str(metrics['bb_upper'])) * Decimal('0.995'):
-        return True, 'market', taker_fee
-    return True, 'limit', maker_fee
-
 def execute_buy(client, symbol, bot):
     balance = get_balance(client)
     if balance <= MIN_BALANCE:
@@ -714,6 +700,30 @@ def execute_buy(client, symbol, bot):
     if error or not adjusted: return
     bot.place_limit_buy_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
 
+def check_sell_signal(client, symbol, position):
+    current = fetch_current_data(client, symbol)
+    if not current: return False, None, None
+    current_price = Decimal(str(current['price']))
+    maker_fee, taker_fee = get_trade_fees(client, symbol)
+    buy_fee = position.buy_fee_rate
+
+    profit_pct = float(
+        (current_price - position.avg_entry_price) / position.avg_entry_price
+        - (buy_fee + Decimal(str(taker_fee)))
+    )
+    if profit_pct < PROFIT_TARGET:
+        return False, None, None
+
+    metrics = get_historical_metrics(client, symbol)
+    if not metrics: return False, None, None
+
+    if (is_bearish_candlestick_pattern(metrics) or
+        current_price >= Decimal(str(metrics['bb_upper'])) * Decimal('0.995')):
+        return True, 'market', taker_fee
+
+    return True, 'limit', maker_fee
+
+
 def execute_sell(client, symbol, position, bot):
     current = fetch_current_data(client, symbol)
     if not current: return
@@ -729,16 +739,26 @@ def execute_sell(client, symbol, position, bot):
             total_qty = sum(Decimal(f['qty']) for f in fills)
             total_val = sum(Decimal(f['price']) * Decimal(f['qty']) for f in fills)
             exit_price = total_val / total_qty if total_qty > 0 else position.avg_entry_price
-            profit = (exit_price - position.avg_entry_price) * qty - (sell_fee * exit_price * qty)
+            profit = (exit_price - position.avg_entry_price) * qty - (Decimal(str(sell_fee)) * exit_price * qty)
             with DBManager() as sess:
                 bot.record_trade(sess, symbol, 'sell', exit_price, qty, str(order['orderId']))
                 sess.delete(position)
             send_whatsapp_alert(f"SOLD {symbol} @ {exit_price:.6f} Profit ${profit:,.2f}")
+            logger.info(f"MARKET SOLD {symbol} qty {qty} @ {exit_price}")
     else:
         if not metrics or metrics['atr'] is None: return
         atr = Decimal(str(metrics['atr']))
-        sell_price = position.avg_entry_price * (1 + PROFIT_TARGET + position.buy_fee_rate + sell_fee) + atr * 0.5
+        sell_price = (
+            position.avg_entry_price * (
+                Decimal('1') +
+                Decimal(str(PROFIT_TARGET)) +
+                position.buy_fee_rate +
+                Decimal(str(sell_fee))
+            ) + atr * Decimal('0.5')
+        )
         bot.place_limit_sell_with_tracking(symbol, float(sell_price), float(qty))
+        logger.info(f"Placed LIMIT SELL {symbol} @ {sell_price} qty {qty}")
+
 
 def get_all_usdt_symbols(client):
     try:
