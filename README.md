@@ -240,7 +240,7 @@ export CALLMEBOT_PHONE="your_phone_number_here"  # E.g., +1234567890
 Run Program: 
 
 ```bash
-conda activate trading_bot
+conda activate 
 python3 2025-coin-trading-bot.py
 ```
 
