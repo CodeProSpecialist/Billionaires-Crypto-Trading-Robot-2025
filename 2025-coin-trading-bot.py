@@ -182,9 +182,15 @@ def to_decimal(value) -> Decimal:
         logger.debug(f"to_decimal failed: {value} -> {e}")
         return ZERO
 
-# === FETCH & VALIDATE SYMBOLS ===============================================
+# === FETCH & VALIDATE SYMBOLS – ONLY CHANGE =================================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
+    """
+    Fetches all /USDT pairs and **STRICTLY filters** by:
+    - MIN_PRICE <= price <= MAX_PRICE
+    - 24h volume >= MIN_24H_VOLUME_USDT
+    - Only TRADING status
+    """
     global valid_symbols_dict
     try:
         logger.info("Fetching exchange info and validating /USDT pairs...")
@@ -193,7 +199,7 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
             s['symbol'] for s in info['symbols']
             if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
         ]
-        logger.info(f"Found {len(raw_symbols)} /USDT pairs. Validating...")
+        logger.info(f"Found {len(raw_symbols)} /USDT pairs. Applying strict filters...")
 
         valid = {}
         for symbol in raw_symbols:
@@ -204,11 +210,18 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
                 low_24h = safe_float(ticker.get('lowPrice'))
                 high_24h = safe_float(ticker.get('highPrice'))
 
-                if not (MIN_PRICE <= price <= MAX_PRICE):
+                # === STRICT FILTERS USING CONFIG ===
+                if price < MIN_PRICE:
+                    logger.debug(f"{symbol} price {price} < MIN_PRICE {MIN_PRICE}")
+                    continue
+                if price > MAX_PRICE:
+                    logger.debug(f"{symbol} price {price} > MAX_PRICE {MAX_PRICE}")
                     continue
                 if volume < MIN_24H_VOLUME_USDT:
+                    logger.debug(f"{symbol} volume {volume:,.0f} < MIN_24H_VOLUME_USDT {MIN_24H_VOLUME_USDT}")
                     continue
                 if not all(is_valid_float(x) for x in [price, low_24h, high_24h]):
+                    logger.debug(f"{symbol} invalid ticker data")
                     continue
 
                 valid[symbol] = {
@@ -217,12 +230,15 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
                     'low_24h': low_24h,
                     'high_24h': high_24h
                 }
+                logger.debug(f"{symbol} PASSED: price={price}, vol={volume:,.0f}")
+
             except Exception as e:
                 logger.debug(f"Validation failed for {symbol}: {e}")
 
-        logger.info(f"Valid trading symbols: {len(valid)}")
+        logger.info(f"FINAL VALID SYMBOLS AFTER FILTERING: {len(valid)}")
         valid_symbols_dict = valid
         return valid
+
     except Exception as e:
         logger.error(f"Failed to fetch symbols: {e}")
         return {}
@@ -529,32 +545,24 @@ class BinanceTradingBot:
 # === BUY SIGNAL =============================================================
 def check_buy_signal(client, symbol):
     try:
-        # 1. Follow price to lowest stable bid
         final_price = follow_price_with_rsi(client, symbol, side='buy')
         if final_price <= 0:
-            logger.debug(f"{symbol} follow_price_with_rsi returned 0")
             return False, None
 
-        # 2. Metrics
         metrics = get_historical_metrics(client, symbol)
         rsi = metrics.get('rsi')
         trend = metrics.get('trend')
         low_24h = metrics.get('low_24h')
 
         if rsi is None or rsi > RSI_OVERSOLD:
-            logger.debug(f"{symbol} RSI {rsi} not oversold")
             return False, None
         if trend != 'bullish':
-            logger.debug(f"{symbol} trend {trend} – need bullish")
             return False, None
         if low_24h and final_price > Decimal(str(low_24h)) * Decimal('1.01'):
-            logger.debug(f"{symbol} price above 24h low +1%")
             return False, None
 
-        # 3. Sell pressure (ask side dominates)
         ob = get_order_book_analysis(client, symbol)
         if ob['pct_ask'] < ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100:
-            logger.debug(f"{symbol} sell pressure low: {ob['pct_ask']:.1f}%")
             return False, None
 
         logger.info(f"BUY SIGNAL: {symbol} @ {final_price} | RSI={rsi:.1f} | Trend={trend.upper()}")
@@ -572,7 +580,6 @@ def execute_buy(client, symbol, bot):
 
         balance = get_balance(client)
         if balance <= MIN_BALANCE:
-            logger.debug(f"Insufficient balance: {balance} < {MIN_BALANCE}")
             return
 
         balance_d = Decimal(str(balance))
@@ -587,7 +594,6 @@ def execute_buy(client, symbol, bot):
 
         adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, final_price)
         if error or not adjusted:
-            logger.warning(f"Order validation failed [{symbol}]: {error}")
             return
 
         bot.place_limit_buy_with_tracking(symbol, str(adjusted['price']), float(adjusted['quantity']))
@@ -604,25 +610,19 @@ def check_sell_signal(client, symbol, position):
         cur_price = Decimal(str(cur_data['price']))
         entry_price = Decimal(str(position.avg_entry_price))
 
-        # Profit *excluding* fees
         profit_excl_fees = (cur_price - entry_price) / entry_price
         if profit_excl_fees < Decimal(str(PROFIT_TARGET_EXCL_FEES)):
-            logger.debug(f"{symbol} profit {float(profit_excl_fees*100):.3f}% < {PROFIT_TARGET_EXCL_FEES*100:.1f}%")
             return False, None
 
-        # Follow price to highest stable ask
         final_price = follow_price_with_rsi(client, symbol, side='sell')
         if final_price <= 0:
             return False, None
 
-        # RSI overbought
         metrics = get_historical_metrics(client, symbol)
         rsi = metrics.get('rsi')
         if rsi is None or rsi < RSI_OVERBOUGHT:
-            logger.debug(f"{symbol} RSI {rsi} not overbought")
             return False, None
 
-        # Buy-pressure spike → drop
         history = buy_pressure_history.get(symbol, deque(maxlen=5))
         ob = get_order_book_analysis(client, symbol)
         history.append(ob['pct_bid'])
@@ -651,7 +651,6 @@ def execute_sell(client, symbol, position, bot):
         qty = position.quantity
         adjusted, error = validate_and_adjust_order(client, symbol, 'SELL', ORDER_TYPE_LIMIT, qty, final_price)
         if error or not adjusted:
-            logger.warning(f"Sell validation failed [{symbol}]: {error}")
             return
 
         bot.place_limit_sell_with_tracking(symbol, str(adjusted['price']), float(adjusted['quantity']))
@@ -829,7 +828,6 @@ def follow_price_with_rsi(client, symbol: str, side: str) -> Decimal:
             flat = abs(delta_pct) < MIN_MOVE_PCT
 
             if moved_against or flat:
-                logger.debug(f"Price following complete for {symbol} {side}: {price}")
                 return price
 
         except Exception as e:
@@ -862,7 +860,6 @@ def main():
         try:
             bot.check_and_process_filled_orders()
 
-            # BUY LOOP
             for symbol in list(valid_symbols_dict.keys()):
                 try:
                     with DBManager() as sess:
@@ -872,7 +869,6 @@ def main():
                 except Exception as e:
                     logger.warning(f"Buy loop error [{symbol}]: {e}")
 
-            # SELL LOOP
             with DBManager() as sess:
                 for pos in sess.query(Position).all():
                     try:
