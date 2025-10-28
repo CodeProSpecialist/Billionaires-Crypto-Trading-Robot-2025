@@ -35,8 +35,6 @@ VOLUME_THRESHOLD = 15000
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_DEV = 2
-STOCH_K_PERIOD = 14
-STOCH_D_PERIOD = 3
 ATR_PERIOD = 14
 SMA_PERIOD = 50
 EMA_PERIOD = 21
@@ -78,6 +76,44 @@ def format_time_central(ts_ms):
     dt_utc = datetime.utcfromtimestamp(ts_ms / 1000).replace(tzinfo=pytz.UTC)
     dt_central = dt_utc.astimezone(CST_TZ)
     return dt_central.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# === COIN SCANNER WITH LIVE INDICATORS ===
+def print_coin_scanner(client, symbols):
+    print("\n" + "-" * 120)
+    print(f" LIVE COIN SCANNER - {now_cst()} - SCANNING {len(symbols)} PAIRS")
+    print("-" * 120)
+    print(f"{'SYMBOL':<10} {'PRICE':>12} {'RSI':>6} {'MACD':>8} {'BB_POS':>6} {'VOL_24H':>12} {'BUY?'}")
+    print("-" * 120)
+
+    for symbol in symbols:
+        try:
+            current = fetch_current_data(client, symbol)
+            if not current:
+                continue
+            price = current['price']
+            volume = current['volume_24h']
+            if price < MIN_PRICE or price > MAX_PRICE or volume < VOLUME_THRESHOLD:
+                continue
+
+            metrics = get_historical_metrics(client, symbol)
+            if not metrics or any(v is None for v in [metrics['rsi'], metrics['macd'], metrics['bb_upper'], metrics['bb_lower']]):
+                continue
+
+            rsi = metrics['rsi']
+            macd = metrics['macd'] - metrics['signal']
+            bb_pos = (price - metrics['bb_lower']) / (metrics['bb_upper'] - metrics['bb_lower']) * 100 if metrics['bb_upper'] != metrics['bb_lower'] else 50
+            buy_signal = "YES" if check_buy_signal(client, symbol) else ""
+
+            macd_str = f"{macd:+.4f}"
+            bb_str = f"{bb_pos:5.1f}%"
+
+            print(f"{symbol:<10} {price:>12.6f} {rsi:>5.1f} {macd_str:>8} {bb_str:>6} {volume:>12,.0f} {buy_signal}")
+
+        except Exception as e:
+            logger.debug(f"Scanner skip {symbol}: {e}")
+            continue
+
+    print("-" * 120 + "\n")
 
 # === PROFESSIONAL DASHBOARD ===
 def print_status_dashboard(client):
@@ -126,7 +162,7 @@ def print_status_dashboard(client):
             net_profit_usdt = gross_profit - fee_cost
             profit_pct = ((current_price - entry_price) / entry_price - total_fees) * 100
 
-            # Target sell price to achieve PROFIT_TARGET
+            # Target sell price
             target_sell_price = entry_price * (1 + PROFIT_TARGET + buy_fee + taker_fee)
 
             # Position age
@@ -425,7 +461,6 @@ def check_buy_signal(client, symbol):
         return False
     if not is_bullish_candlestick_pattern(metrics):
         return False
-    logger.debug(f"BUY SIGNAL: {symbol}")
     return True
 
 def execute_buy(client, symbol):
@@ -610,19 +645,26 @@ if __name__ == "__main__":
 
     try:
         while True:
-            print_status_dashboard(client)
-
             balance = get_balance(client)
             if balance < MIN_BALANCE + 10:
                 send_whatsapp_alert(f"Low USDT: ${balance:.2f}")
 
+            # === 1. SCAN ALL COINS WITH LIVE INDICATORS ===
+            print_coin_scanner(client, symbols)
+
+            # === 2. CHECK SIGNALS & TRADE ===
             for symbol in symbols:
                 if check_buy_signal(client, symbol):
                     execute_buy(client, symbol)
                 if symbol in positions:
                     execute_sell(client, symbol, positions[symbol])
 
+            # === 3. PRINT DASHBOARD (LAST THING BEFORE SLEEP) ===
+            print_status_dashboard(client)
+
+            # === 4. SLEEP ===
             time.sleep(LOOP_INTERVAL)
+
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     except Exception as e:
