@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Binance.US Trading Bot – FINAL VERSION
-- Buy: More sell pressure + near 24h low + price bottoms (order book + RSI)
-- Sell: Profit target + price tops (order book + RSI)
-- Full logging, dashboard, DB, alerts
+Binance.US Trading Bot – FINAL VERSION (fault-tolerant)
+- Main loop restarts on any crash
+- Buy/sell skip invalid symbols instead of crashing
 """
 
 import os
@@ -163,43 +162,54 @@ def follow_price_with_rsi(client, symbol: str, side: str) -> Decimal:
     rsi_confirm_count = 0
 
     for i in range(MAX_ITER):
-        depth = client.get_order_book(symbol=symbol, limit=5)
-        price = _best_price(depth, side)
-        history.append(price)
-
-        # RSI
         try:
-            klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 5)
-            closes = np.array([float(k[4]) for k in klines])
-            rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-        except:
-            rsi = None
+            depth = client.get_order_book(symbol=symbol, limit=5)
+            price = _best_price(depth, side)
+            history.append(price)
 
-        print(f"  [{side.upper()}] {symbol} @ {price:.6f} | RSI={rsi:.1f} | win={len(history)}")
+            # RSI
+            try:
+                klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 5)
+                closes = np.array([float(k[4]) for k in klines])
+                rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
+            except Exception:
+                rsi = None
 
-        if len(history) < DEPTH_HISTORY:
-            time.sleep(DEPTH_WAIT)
-            continue
+            print(f"  [{side.upper()}] {symbol} @ {price:.6f} | RSI={rsi:.1f if rsi else 'N/A'} | win={len(history)}")
 
-        delta_pct = float((history[-1] - history[0]) / history[0])
-        moved_against = direction * delta_pct < -MIN_MOVE_PCT
-        flat = abs(delta_pct) < MIN_MOVE_PCT
+            if len(history) < DEPTH_HISTORY:
+                time.sleep(DEPTH_WAIT)
+                continue
 
-        rsi_ok = (side == 'buy' and rsi <= RSI_OVERSOLD) or (side == 'sell' and rsi >= RSI_OVERBOUGHT)
-        if rsi_ok:
-            rsi_confirm_count += 1
-        else:
-            rsi_confirm_count = 0
+            delta_pct = float((history[-1] - history[0]) / history[0])
+            moved_against = direction * delta_pct < -MIN_MOVE_PCT
+            flat = abs(delta_pct) < MIN_MOVE_PCT
 
-        if moved_against:
-            print(f"  Reversal → using {price}")
-            return price
-        if flat and rsi_confirm_count >= RSI_CONFIRM_WINDOW:
-            print(f"  Flat + RSI confirm ({rsi_confirm_count}/{RSI_CONFIRM_WINDOW}) → using {price}")
-            return price
+            rsi_ok = (side == 'buy' and rsi is not None and rsi <= RSI_OVERSOLD) or \
+                     (side == 'sell' and rsi is not None and rsi >= RSI_OVERBOUGHT)
+            if rsi_ok:
+                rsi_confirm_count += 1
+            else:
+                rsi_confirm_count = 0
+
+            if moved_against:
+                print(f"  Reversal → using {price}")
+                return price
+            if flat and rsi_confirm_count >= RSI_CONFIRM_WINDOW:
+                print(f"  Flat + RSI confirm ({rsi_confirm_count}/{RSI_CONFIRM_WINDOW}) → using {price}")
+                return price
+
+        except Exception as e:
+            logger.debug(f"follow_price_with_rsi [{symbol}] error: {e}")
 
         time.sleep(DEPTH_WAIT)
 
+    # fallback to last known price
+    try:
+        depth = client.get_order_book(symbol=symbol, limit=5)
+        price = _best_price(depth, side)
+    except Exception:
+        price = Decimal('0')
     print(f"  Timeout → using {price}")
     return price
 
@@ -314,87 +324,103 @@ class BinanceTradingBot:
                     logger.debug(f"Order check failed: {e}")
 
     def print_status_dashboard(self):
-        with DBManager() as sess:
-            positions = sess.query(Position).all()
-            usdt_free = get_balance(self.client, 'USDT')
-            total_portfolio, _ = calculate_total_portfolio_value(self.client)
-            print("\n" + "="*100)
-            print(f" DASHBOARD - {now_cst()} ")
-            print("="*100)
-            print(f"USDT: ${usdt_free:,.6f} | Portfolio: ${total_portfolio:,.6f} | Positions: {len(positions)}")
-            if positions:
-                print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'P&L %':>8}")
-                for pos in positions:
-                    cur = fetch_current_data(self.client, pos.symbol)
-                    cur_price = Decimal(str(cur['price'])) if cur else pos.avg_entry_price
-                    pnl_pct = float((cur_price - pos.avg_entry_price) / pos.avg_entry_price * 100)
-                    print(f"{pos.symbol:<10} {pos.quantity:>12.6f} {pos.avg_entry_price:>12.6f} {cur_price:>12.6f} {pnl_pct:>7.2f}%")
-            print("="*100 + "\n")
+        try:
+            with DBManager() as sess:
+                positions = sess.query(Position).all()
+                usdt_free = get_balance(self.client, 'USDT')
+                total_portfolio, _ = calculate_total_portfolio_value(self.client)
+                print("\n" + "="*100)
+                print(f" DASHBOARD - {now_cst()} ")
+                print("="*100)
+                print(f"USDT: ${usdt_free:,.6f} | Portfolio: ${total_portfolio:,.6f} | Positions: {len(positions)}")
+                if positions:
+                    print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'P&L %':>8}")
+                    for pos in positions:
+                        cur = fetch_current_data(self.client, pos.symbol)
+                        cur_price = Decimal(str(cur['price'])) if cur else pos.avg_entry_price
+                        pnl_pct = float((cur_price - pos.avg_entry_price) / pos.avg_entry_price * 100)
+                        print(f"{pos.symbol:<10} {pos.quantity:>12.6f} {pos.avg_entry_price:>12.6f} {cur_price:>12.6f} {pnl_pct:>7.2f}%")
+                print("="*100 + "\n")
+        except Exception as e:
+            logger.error(f"Dashboard error: {e}")
 
+    # --------------------------------------------------------------------- #
+    # MAIN LOOP – now fault-tolerant
+    # --------------------------------------------------------------------- #
     def run(self):
         logger.info("Bot starting...")
         symbols = get_all_usdt_symbols(self.client)
 
-        try:
-            while True:
+        while True:
+            try:
                 self.check_and_process_filled_orders()
 
-                # BUY LOOP
+                # BUY LOOP – each symbol runs in its own try/except
                 for symbol in symbols:
-                    with DBManager() as sess:
-                        if sess.query(Position).filter_by(symbol=symbol).first():
-                            continue
-                    execute_buy(self.client, symbol, self)
+                    try:
+                        with DBManager() as sess:
+                            if sess.query(Position).filter_by(symbol=symbol).first():
+                                continue
+                        execute_buy(self.client, symbol, self)
+                    except Exception as e:
+                        logger.warning(f"Buy loop error for {symbol}: {e}")
 
-                # SELL LOOP
+                # SELL LOOP – each position runs in its own try/except
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
-                        execute_sell(self.client, pos.symbol, pos, self)
+                        try:
+                            execute_sell(self.client, pos.symbol, pos, self)
+                        except Exception as e:
+                            logger.warning(f"Sell loop error for {pos.symbol}: {e}")
 
                 self.print_status_dashboard()
                 time.sleep(LOOP_INTERVAL)
 
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            logger.error(f"Bot crashed: {e}")
-        finally:
-            logger.info("Bot stopped.")
+            except KeyboardInterrupt:
+                logger.info("Bot stopped by user.")
+                break
+            except Exception as loop_e:
+                logger.error(f"Main loop crashed: {loop_e}")
+                logger.info("Restarting loop in 5 seconds...")
+                time.sleep(5)   # short pause before restart
+                continue
 
-# === STRATEGY: BUY ===
+# === STRATEGY: BUY (skip on any error) ===
 def check_buy_signal(client, symbol):
     try:
         ticker = client.get_ticker(symbol=symbol)
-        current_price = float(ticker['lastPrice'])
-        low_24h = float(ticker['lowPrice'])
-        volume_24h = float(ticker['quoteVolume'])
+        current_price = float(ticker.get('lastPrice') or 0)
+        low_24h = float(ticker.get('lowPrice') or 0)
+        volume_24h = float(ticker.get('quoteVolume') or 0)
     except Exception as e:
-        print(f"[{symbol}] NOT BUYING – ticker failed")
+        logger.debug(f"[{symbol}] ticker fetch failed: {e}")
         return False, None
 
     # Indicators
     metrics = get_historical_metrics(client, symbol)
-    rsi = metrics['rsi'] if metrics else None
+    rsi = metrics['rsi'] if metrics and metrics['rsi'] is not None else None
     macd = (metrics['macd'] - metrics['signal']) if metrics and metrics['macd'] is not None else None
     bb_pos = (
         (current_price - metrics['bb_lower']) / (metrics['bb_upper'] - metrics['bb_lower']) * 100
-        if metrics and metrics['bb_upper'] != metrics['bb_lower'] else None
+        if metrics and metrics['bb_upper'] is not None and metrics['bb_lower'] is not None and metrics['bb_upper'] != metrics['bb_lower']
+        else None
     )
 
     # Order book
     try:
         depth = client.get_order_book(symbol=symbol, limit=10)
-        total_bid = sum(float(b[1]) for b in depth['bids'])
-        total_ask = sum(float(a[1]) for a in depth['asks'])
+        total_bid = sum(float(b[1]) for b in depth.get('bids', []))
+        total_ask = sum(float(a[1]) for a in depth.get('asks', []))
         total = total_bid + total_ask
         pct_bid = total_bid / total * 100 if total > 0 else 0
         pct_ask = total_ask / total * 100 if total > 0 else 0
         ob_summary = f"OB: bids {pct_bid:5.1f}% | asks {pct_ask:5.1f}%"
-    except:
+    except Exception as e:
+        logger.debug(f"[{symbol}] orderbook fetch failed: {e}")
         ob_summary = "OB: failed"
         pct_ask = 0
 
-    print(f"[{symbol}] price={current_price:,.6f} | 24h-low={low_24h:,.6f} | RSI={rsi:5.1f} | MACD={macd:+.4f} | BB%={bb_pos:5.1f}% | {ob_summary}")
+    print(f"[{symbol}] price={current_price:,.6f} | 24h-low={low_24h:,.6f} | RSI={rsi:5.1f if rsi else 'N/A'} | MACD={macd:+.4f if macd else 'N/A'} | BB%={bb_pos:5.1f if bb_pos else 'N/A'}% | {ob_summary}")
 
     # 1. Near 24h low
     if current_price > low_24h * (1 + BUY_PRICE_TOLERANCE_PCT / 100):
@@ -410,8 +436,10 @@ def check_buy_signal(client, symbol):
     print(f"→ Following price down...")
     try:
         final_price = follow_price_with_rsi(client, symbol, 'buy')
+        if final_price <= 0:
+            raise ValueError("Invalid final price")
     except Exception as e:
-        print(f"→ NOT BUYING – follow failed")
+        print(f"→ NOT BUYING – follow failed: {e}")
         return False, None
 
     # Final RSI
@@ -422,82 +450,97 @@ def check_buy_signal(client, symbol):
         if final_rsi > RSI_OVERSOLD:
             print(f"→ NOT BUYING – RSI {final_rsi:.1f} > {RSI_OVERSOLD}")
             return False, None
-    except:
+    except Exception as e:
+        logger.debug(f"[{symbol}] final RSI failed: {e}")
         final_rsi = None
 
-    print(f"→ BUYING @ {final_price:.6f} (RSI={final_rsi:.1f})")
+    print(f"→ BUYING @ {final_price:.6f} (RSI={final_rsi:.1f if final_rsi else 'N/A'})")
     return True, final_price
 
 def execute_buy(client, symbol, bot):
-    should_buy, final_price = check_buy_signal(client, symbol)
-    if not should_buy:
-        return
-    balance = get_balance(client)
-    if balance <= MIN_BALANCE:
-        print(f"→ NOT BUYING – low balance")
-        return
-    alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
-    qty = alloc / final_price
-    adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, final_price)
-    if error or not adjusted:
-        print(f"→ NOT BUYING – validation failed")
-        return
-    bot.place_limit_buy_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
-    print(f"→ BUY ORDER @ {adjusted['price']:.6f}")
-    send_whatsapp_alert(f"BUY {symbol} @ {adjusted['price']:.6f}")
-
-# === STRATEGY: SELL ===
-def check_sell_signal(client, symbol, position):
-    cur = fetch_current_data(client, symbol)
-    if not cur:
-        print(f"[{symbol}] SELL – no data")
-        return False, None
-    cur_price = Decimal(str(cur['price']))
-    metrics = get_historical_metrics(client, symbol)
-    rsi = metrics['rsi'] if metrics else None
-    macd = (metrics['macd'] - metrics['signal']) if metrics and metrics['macd'] is not None else None
-    bb_pos = (
-        (cur_price - metrics['bb_lower']) / (metrics['bb_upper'] - metrics['bb_lower']) * 100
-        if metrics and metrics['bb_upper'] != metrics['bb_lower'] else None
-    )
-    print(f"[{symbol}] price={float(cur_price):,.6f} | entry={position.avg_entry_price:,.6f} | RSI={rsi:5.1f} | MACD={macd:+.4f} | BB%={bb_pos:5.1f}%")
-
-    profit_pct = float((cur_price - position.avg_entry_price) / position.avg_entry_price - 0.002)
-    if profit_pct < PROFIT_TARGET:
-        print(f"→ NOT SELLING – profit {profit_pct*100:.2f}% < target")
-        return False, None
-
-    print(f"→ Following price up...")
     try:
-        final_price = follow_price_with_rsi(client, symbol, 'sell')
+        should_buy, final_price = check_buy_signal(client, symbol)
+        if not should_buy:
+            return
+        balance = get_balance(client)
+        if balance <= MIN_BALANCE:
+            print(f"→ NOT BUYING – low balance")
+            return
+        alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
+        qty = alloc / final_price
+        adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, final_price)
+        if error or not adjusted:
+            print(f"→ NOT BUYING – validation failed: {error}")
+            return
+        bot.place_limit_buy_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
+        print(f"→ BUY ORDER @ {adjusted['price']:.6f}")
+        send_whatsapp_alert(f"BUY {symbol} @ {adjusted['price']:.6f}")
     except Exception as e:
-        print(f"→ NOT SELLING – follow failed")
-        return False, None
+        logger.warning(f"execute_buy [{symbol}] crashed: {e}")
 
+# === STRATEGY: SELL (skip on any error) ===
+def check_sell_signal(client, symbol, position):
     try:
-        klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 1)
-        closes = np.array([float(k[4]) for k in klines])
-        final_rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-        if final_rsi < RSI_OVERBOUGHT:
-            print(f"→ NOT SELLING – RSI {final_rsi:.1f} < {RSI_OVERBOUGHT}")
+        cur = fetch_current_data(client, symbol)
+        if not cur:
+            print(f"[{symbol}] SELL – no data")
             return False, None
-    except:
-        final_rsi = None
+        cur_price = Decimal(str(cur['price']))
+        metrics = get_historical_metrics(client, symbol)
+        rsi = metrics['rsi'] if metrics and metrics['rsi'] is not None else None
+        macd = (metrics['macd'] - metrics['signal']) if metrics and metrics['macd'] is not None else None
+        bb_pos = (
+            (cur_price - metrics['bb_lower']) / (metrics['bb_upper'] - metrics['bb_lower']) * 100
+            if metrics and metrics['bb_upper'] is not None and metrics['bb_lower'] is not None and metrics['bb_upper'] != metrics['bb_lower']
+            else None
+        )
+        print(f"[{symbol}] price={float(cur_price):,.6f} | entry={position.avg_entry_price:,.6f} | RSI={rsi:5.1f if rsi else 'N/A'} | MACD={macd:+.4f if macd else 'N/A'} | BB%={bb_pos:5.1f if bb_pos else 'N/A'}%")
 
-    print(f"→ SELLING @ {final_price:.6f} (RSI={final_rsi:.1f})")
-    return True, final_price
+        profit_pct = float((cur_price - position.avg_entry_price) / position.avg_entry_price - 0.002)
+        if profit_pct < PROFIT_TARGET:
+            print(f"→ NOT SELLING – profit {profit_pct*100:.2f}% < target")
+            return False, None
+
+        print(f"→ Following price up...")
+        try:
+            final_price = follow_price_with_rsi(client, symbol, 'sell')
+            if final_price <= 0:
+                raise ValueError("Invalid final price")
+        except Exception as e:
+            print(f"→ NOT SELLING – follow failed: {e}")
+            return False, None
+
+        try:
+            klines = client.get_klines(symbol=symbol, interval='1m', limit=RSI_PERIOD + 1)
+            closes = np.array([float(k[4]) for k in klines])
+            final_rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
+            if final_rsi < RSI_OVERBOUGHT:
+                print(f"→ NOT SELLING – RSI {final_rsi:.1f} < {RSI_OVERBOUGHT}")
+                return False, None
+        except Exception as e:
+            logger.debug(f"[{symbol}] final RSI failed: {e}")
+            final_rsi = None
+
+        print(f"→ SELLING @ {final_price:.6f} (RSI={final_rsi:.1f if final_rsi else 'N/A'})")
+        return True, final_price
+    except Exception as e:
+        logger.warning(f"check_sell_signal [{symbol}] error: {e}")
+        return False, None
 
 def execute_sell(client, symbol, position, bot):
-    should_sell, final_price = check_sell_signal(client, symbol, position)
-    if not should_sell:
-        return
-    adjusted, error = validate_and_adjust_order(client, symbol, 'SELL', ORDER_TYPE_LIMIT, position.quantity, final_price)
-    if error or not adjusted:
-        print(f"→ NOT SELLING – validation failed")
-        return
-    bot.place_limit_sell_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
-    print(f"→ SELL ORDER @ {adjusted['price']:.6f}")
-    send_whatsapp_alert(f"SELL {symbol} @ {adjusted['price']:.6f}")
+    try:
+        should_sell, final_price = check_sell_signal(client, symbol, position)
+        if not should_sell:
+            return
+        adjusted, error = validate_and_adjust_order(client, symbol, 'SELL', ORDER_TYPE_LIMIT, position.quantity, final_price)
+        if error or not adjusted:
+            print(f"→ NOT SELLING – validation failed: {error}")
+            return
+        bot.place_limit_sell_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
+        print(f"→ SELL ORDER @ {adjusted['price']:.6f}")
+        send_whatsapp_alert(f"SELL {symbol} @ {adjusted['price']:.6f}")
+    except Exception as e:
+        logger.warning(f"execute_sell [{symbol}] crashed: {e}")
 
 # === HELPERS (unchanged) ===
 def now_cst():
@@ -658,6 +701,6 @@ def get_all_usdt_symbols(client):
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         logger.error("API keys missing")
-        exit(1)
+        sys.exit(1)
     bot = BinanceTradingBot()
     bot.run()
