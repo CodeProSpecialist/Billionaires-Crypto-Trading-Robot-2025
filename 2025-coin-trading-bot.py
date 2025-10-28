@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Binance.US Trading Bot – FULL VERSION
+Binance.US Trading Bot – FULL VERSION (Order-Book First Strategy)
 - Imports ALL owned assets (any pair) on startup
-- Tracks & sells every coin at profit
+- Primary: Follow order book to bottom/top before buying/selling
+- Secondary: ATR + Bollinger Bands as soft filters (never override book)
 - Full original strategy: RSI, MACD, MFI, BB, Stochastic, Candlesticks, Momentum
 - SQLAlchemy persistence + graceful shutdown
 - WhatsApp alerts + dashboard
@@ -25,6 +26,7 @@ import pytz
 import requests
 from decimal import Decimal
 from typing import Optional, Dict, Any
+from collections import deque  # <-- NEW: for order-book tracking
 
 # === SQLALCHEMY ===
 from sqlalchemy import (
@@ -141,6 +143,56 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+# ----------------------------------------------------------------------
+#  ORDER-BOOK FOLLOW-THE-PRICE ENGINE
+# ----------------------------------------------------------------------
+DEPTH_HISTORY = 6          # ~6 seconds of data
+DEPTH_WAIT    = 1.0        # seconds between pulls
+MIN_MOVE_PCT  = 0.0003     # 0.03% → consider "still moving"
+MAX_ITER      = 45         # safety net (~45 s)
+
+def _best_price(depth: dict, side: str) -> Decimal:
+    """Best bid for BUY, best ask for SELL."""
+    if side == 'buy' and depth.get('bids'):
+        return Decimal(depth['bids'][0][0])
+    if side == 'sell' and depth.get('asks'):
+        return Decimal(depth['asks'][0][0])
+    raise ValueError("Empty depth")
+
+def follow_price_to_extreme(client, symbol: str, side: str) -> Decimal:
+    """
+    Pull depth repeatedly.
+    Returns the price once it stops moving *in the expected direction*.
+    """
+    history = deque(maxlen=DEPTH_HISTORY)
+    direction = 1 if side == 'buy' else -1   # buy: look for lower, sell: higher
+
+    for i in range(MAX_ITER):
+        depth = client.get_order_book(symbol=symbol, limit=5)
+        price = _best_price(depth, side)
+        history.append(price)
+
+        if len(history) < DEPTH_HISTORY:
+            time.sleep(DEPTH_WAIT)
+            continue
+
+        # % change over the whole window
+        delta_pct = float((history[-1] - history[0]) / history[0])
+        moved_against = direction * delta_pct < -MIN_MOVE_PCT
+        flat = abs(delta_pct) < MIN_MOVE_PCT
+
+        if moved_against:
+            logger.info(f"{side.upper()} reversal → {symbol} @ {price}")
+            return price
+        if flat:
+            logger.info(f"{side.upper()} flat → {symbol} @ {price}")
+            return price
+
+        time.sleep(DEPTH_WAIT)
+
+    logger.warning(f"{side.upper()} timeout → using last price {price}")
+    return price
 
 # === BOT CLASS ===
 class BinanceTradingBot:
@@ -682,23 +734,45 @@ def check_buy_signal(client, symbol):
     return True
 
 def execute_buy(client, symbol, bot):
+    if not check_buy_signal(client, symbol):
+        return
+
     balance = get_balance(client)
     if balance <= MIN_BALANCE:
         send_whatsapp_alert("Low balance, skipping buy")
         return
-    current = fetch_current_data(client, symbol)
-    if not current: return
-    current_price = current['price']
+
+    try:
+        book_price = follow_price_to_extreme(client, symbol, side='buy')
+    except Exception as e:
+        logger.error(f"Depth follow failed (buy {symbol}): {e}")
+        return
+
     metrics = get_historical_metrics(client, symbol)
-    if not metrics or metrics['atr'] is None: return
-    atr = metrics['atr']
-    maker_fee, _ = get_trade_fees(client, symbol)
+    if not metrics or metrics['atr'] is None or metrics['bb_lower'] is None:
+        logger.warning(f"Missing metrics for {symbol}, using raw book price")
+        buy_price = book_price
+    else:
+        bb_lower = Decimal(str(metrics['bb_lower']))
+        atr = Decimal(str(metrics['atr']))
+        if book_price > bb_lower + atr * Decimal('1.5'):
+            logger.info(f"{symbol} book price too far above BB lower, skipping")
+            return
+        buy_price = book_price * (Decimal('1') - Decimal('0.0001'))
+
     alloc = min((balance - MIN_BALANCE) * RISK_PER_TRADE, balance - MIN_BALANCE)
-    qty = alloc / current_price
-    buy_price = current_price * (1 - 0.001 - atr / current_price * 0.5)
-    adjusted, error = validate_and_adjust_order(client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, buy_price, current_price)
-    if error or not adjusted: return
+    qty = alloc / buy_price
+
+    adjusted, error = validate_and_adjust_order(
+        client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, buy_price, float(book_price)
+    )
+    if error or not adjusted:
+        logger.warning(f"Buy validation failed {symbol}: {error}")
+        return
+
     bot.place_limit_buy_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
+    logger.info(f"BUY {symbol} @ {adjusted['price']} qty {adjusted['quantity']} (book-guided)")
+    send_whatsapp_alert(f"BUY {symbol} @ {adjusted['price']:.6f}")
 
 def check_sell_signal(client, symbol, position):
     current = fetch_current_data(client, symbol)
@@ -723,42 +797,60 @@ def check_sell_signal(client, symbol, position):
 
     return True, 'limit', maker_fee
 
-
 def execute_sell(client, symbol, position, bot):
     current = fetch_current_data(client, symbol)
-    if not current: return
-    should_sell, order_type, sell_fee = check_sell_signal(client, symbol, position)
-    if not should_sell: return
-    qty = position.quantity
+    if not current:
+        return
+    cur_price = Decimal(str(current['price']))
+    maker_fee, taker_fee = get_trade_fees(client, symbol)
+    profit_pct = float(
+        (cur_price - position.avg_entry_price) / position.avg_entry_price
+        - (position.buy_fee_rate + Decimal(str(taker_fee)))
+    )
+    if profit_pct < PROFIT_TARGET:
+        return
+
+    try:
+        book_price = follow_price_to_extreme(client, symbol, side='sell')
+    except Exception as e:
+        logger.error(f"Depth follow failed (sell {symbol}): {e}")
+        return
+
     metrics = get_historical_metrics(client, symbol)
+    if metrics and metrics['bb_upper'] is not None:
+        bb_upper = Decimal(str(metrics['bb_upper']))
+        atr = Decimal(str(metrics['atr'])) if metrics['atr'] else Decimal('0')
+        if book_price < bb_upper - atr * Decimal('1.5'):
+            logger.info(f"{symbol} book price too far below BB upper, checking for market sell")
+            if (is_bearish_candlestick_pattern(metrics) or
+                cur_price >= bb_upper * Decimal('0.995')):
+                order = place_market_sell(client, symbol, position.quantity)
+                if order:
+                    fills = order.get('fills', [])
+                    total_qty = sum(Decimal(f['qty']) for f in fills)
+                    total_val = sum(Decimal(f['price']) * Decimal(f['qty']) for f in fills)
+                    exit_price = total_val / total_qty if total_qty > 0 else position.avg_entry_price
+                    profit = (exit_price - position.avg_entry_price) * position.quantity
+                    with DBManager() as sess:
+                        bot.record_trade(sess, symbol, 'sell', exit_price, position.quantity, str(order['orderId']))
+                        sess.delete(position)
+                    send_whatsapp_alert(f"MARKET SOLD {symbol} @ {exit_price:.6f} Profit ${profit:,.2f}")
+                return
+            else:
+                return
 
-    if order_type == 'market':
-        order = place_market_sell(client, symbol, qty)
-        if order:
-            fills = order.get('fills', [])
-            total_qty = sum(Decimal(f['qty']) for f in fills)
-            total_val = sum(Decimal(f['price']) * Decimal(f['qty']) for f in fills)
-            exit_price = total_val / total_qty if total_qty > 0 else position.avg_entry_price
-            profit = (exit_price - position.avg_entry_price) * qty - (Decimal(str(sell_fee)) * exit_price * qty)
-            with DBManager() as sess:
-                bot.record_trade(sess, symbol, 'sell', exit_price, qty, str(order['orderId']))
-                sess.delete(position)
-            send_whatsapp_alert(f"SOLD {symbol} @ {exit_price:.6f} Profit ${profit:,.2f}")
-            logger.info(f"MARKET SOLD {symbol} qty {qty} @ {exit_price}")
-    else:
-        if not metrics or metrics['atr'] is None: return
-        atr = Decimal(str(metrics['atr']))
-        sell_price = (
-            position.avg_entry_price * (
-                Decimal('1') +
-                Decimal(str(PROFIT_TARGET)) +
-                position.buy_fee_rate +
-                Decimal(str(sell_fee))
-            ) + atr * Decimal('0.5')
-        )
-        bot.place_limit_sell_with_tracking(symbol, float(sell_price), float(qty))
-        logger.info(f"Placed LIMIT SELL {symbol} @ {sell_price} qty {qty}")
+    sell_price = book_price * (Decimal('1') + Decimal('0.0001'))
 
+    adjusted, error = validate_and_adjust_order(
+        client, symbol, 'SELL', ORDER_TYPE_LIMIT, position.quantity, sell_price, float(cur_price)
+    )
+    if error or not adjusted:
+        logger.warning(f"Sell validation failed {symbol}: {error}")
+        return
+
+    bot.place_limit_sell_with_tracking(symbol, adjusted['price'], adjusted['quantity'])
+    logger.info(f"SELL {symbol} @ {adjusted['price']} qty {adjusted['quantity']} (book-guided)")
+    send_whatsapp_alert(f"SELL {symbol} @ {adjusted['price']:.6f}")
 
 def get_all_usdt_symbols(client):
     try:
