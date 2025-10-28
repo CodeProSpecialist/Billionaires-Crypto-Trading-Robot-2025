@@ -1,5 +1,5 @@
 # 🚀 Billionaires Crypto Trading Robot 2025: Binance.US Edition 🚀
-**Skyrocketing Wealth Creation with Precision Automation – But Losses Can Hit Hard!**  
+**Skyrocketing Wealth Creation with Precision Automation**  
 
 *****
 Update to the newest version 
