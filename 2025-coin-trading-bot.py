@@ -32,9 +32,9 @@ from sqlalchemy.exc import SQLAlchemyError
 # === CONFIGURATION ===========================================================
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
-MAX_PRICE = 1000.00
-MIN_PRICE = 0.01
-MIN_24H_VOLUME_USDT = 100000
+MAX_PRICE = 2000.00
+MIN_PRICE = 0.000001
+MIN_24H_VOLUME_USDT = 10000
 LOOP_INTERVAL = 15
 LOG_FILE = "crypto_trading_bot.log"
 RSI_PERIOD = 14
