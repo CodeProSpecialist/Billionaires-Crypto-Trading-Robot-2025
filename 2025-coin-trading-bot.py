@@ -573,6 +573,10 @@ def print_professional_dashboard(client):
             print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'Active Positions':<20} {len(positions)}{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            print(" ")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN THE LOCAL DATABASE':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
 
             with DBManager() as sess:
                 db_positions = sess.query(Position).all()
@@ -628,7 +632,22 @@ def print_professional_dashboard(client):
                 print(f"{NAVY}{YELLOW} No positions in database.{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
 
-            # === 24/7 BUY WATCH LIST (ONLY FROM valid_symbols_dict) ===
+            # === COINS TO MONITOR FOR FUTURE LOW DIP BUY (24/7 MONITORING) ===
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            print(f"{NAVY}{BOLD}{YELLOW}{'COINS TO MONITOR FOR FUTURE LOW DIP BUY (24/7 MONITORING)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+            universe_coins = sorted(valid_symbols_dict.keys())
+            if universe_coins:
+                cols = 6  # 6 coins per row
+                for i in range(0, len(universe_coins), cols):
+                    row = universe_coins[i:i+cols]
+                    print(f"{NAVY}{YELLOW}" + "  ".join(f"{sym:<12}" for sym in row) + f"{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No coins in universe.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+            # === 24/7 BUY WATCH LIST (DIP OPPORTUNITIES) ===
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
             print(f"{NAVY}{BOLD}{YELLOW}{'24/7 BUY WATCH LIST (DIP OPPORTUNITIES)':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
