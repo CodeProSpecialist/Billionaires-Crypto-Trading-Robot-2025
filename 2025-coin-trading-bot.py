@@ -185,6 +185,10 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
             if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
         ]
 
+        # === EXCLUDE STABLECOIN PAIRS ===
+        EXCLUDED_PAIRS = {'USDCUSDT', 'USDTUSDT'}
+        raw_symbols = [s for s in raw_symbols if s not in EXCLUDED_PAIRS]
+
         valid = {}
         for symbol in raw_symbols:
             try:
@@ -203,10 +207,12 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
                     'low_24h': low_24h,
                     'high_24h': high_24h
                 }
-            except: continue
+            except Exception as e:
+                logger.debug(f"Failed to validate {symbol}: {e}")
+                continue
 
         valid_symbols_dict = valid
-        logger.info(f"Valid symbols: {len(valid)}")
+        logger.info(f"Valid symbols: {len(valid)} (excluded: USDCUSDT, USDTUSDT)")
         return valid
     except Exception as e:
         logger.error(f"Symbol fetch failed: {e}")
