@@ -504,7 +504,7 @@ def import_owned_assets_to_db(client, sess):
             asset = bal['asset']
             free_str = bal['free']
             qty = safe_float(free_str)
-            if qty <= 0 or asset == 'USDT':
+            if qty <= 0 or asset in {'USDT', 'USDC'}:  # <-- EXCLUDE USDC TOO
                 continue
 
             symbol = f"{asset}USDT"
