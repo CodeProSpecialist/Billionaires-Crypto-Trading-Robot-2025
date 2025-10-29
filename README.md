@@ -13,112 +13,181 @@ completed on October 29, 2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-# **Trading Bot – Per-Coin Thread Logic**  
-**1 Thread per USDT Pair | 24/7 Monitoring | 1-Second Polling**
+**Binance.US Trading Bot – Professional Version**  
+*1 thread per coin • 24/7 real-time monitoring • Navy blue + yellow + green/red P&L dashboard*
 
 ---
 
-### **Core Monitoring Cycle**  
-- **Fetch Real-Time Data**  
-  - Order book (top 5 bid/ask levels)  
-  - 1-minute candles (last 100)  
-  - 24-hour low price  
-- **Calculate Technical Indicators**  
-  - **RSI(14)**  
-  - **Bollinger Bands(20, 2σ)** → middle band  
-  - **MACD(12,26,9)** → signal line  
-  - **Trend Detection**:  
-    - *Bullish*: Price > BB middle **AND** MACD > signal  
-    - *Bearish*: Price < BB middle **AND** MACD < signal  
-    - *Sideways*: otherwise  
+### **Core Strategy Summary (Buy & Sell Logic)**
+
+- **BUY Signal** → **Strong Dip Entry**  
+  - **RSI ≤ 35** *(oversold)*  
+  - **Trend = Bullish** *(price above Bollinger middle + MACD > signal)*  
+  - **Price near 24h low** *(≤ 1.01 × 24h low)*  
+  - **≥60% sell pressure** *(order book ask volume ≥60% of top 5 levels)*
+
+- **SELL Signal** → **Take Profit + Momentum Reversal**  
+  - **≥0.8% NET profit** *(after maker + taker fees)*  
+  - **RSI ≥ 65** *(overbought)*  
+  - **Buy pressure spike → drop**:  
+    - Peak buy pressure ≥65%  
+    - Current buy pressure drops to ≤55%  
+    → *Confirms fading momentum after profit*
 
 ---
 
-### **BUY SIGNAL – All 4 Conditions Required**  
-**Only if NO position exists**  
+### **Architecture & Execution Model**
 
-- **RSI ≤ 35** → Oversold  
-- **Trend = Bullish** → Momentum confirmation  
-- **Current Price ≤ 1.01 × 24h Low** → Near bottom  
-- **Sell Pressure ≥ 60%** → Asks dominate top 5 levels  
+- **One dedicated thread per USDT pair**  
+  → Parallel, independent 24/7 monitoring  
+  → Polls every **1 second**
 
-**→ Place Limit Buy Order**  
-  - Size: **10% of available USDT**  
-  - Price: Best bid  
-  - Track in `pending_orders`  
-  - Send **WhatsApp Alert**: `BUY SYMBOL @ PRICE`  
+- **Real-time data sources**  
+  - 1-minute klines (last 100) → RSI, MACD, Bollinger Bands  
+  - Order book depth (top 5 bid/ask) → buy/sell pressure  
+  - 24h ticker stats → volume, low/high filtering
 
----
-
-### **SELL SIGNAL – Profit + Reversal**  
-**Only if position exists**  
-
-- **Step 1: Gross Profit ≥ 0.8%**  
-  - `(current_price - entry_price) / entry_price ≥ 0.008`  
-
-- **Step 2: RSI ≥ 65** → Overbought  
-
-- **Step 3: Buy Pressure Reversal (last 5 polls)**  
-  - Spike: **Buy % ≥ 65%** at some point  
-  - Drop: **Current Buy % ≤ 55%**  
-
-**→ Place Limit Sell Order**  
-  - Size: **Full position quantity**  
-  - Price: Best ask  
-  - Track in `pending_orders`  
-  - Send **WhatsApp Alert**: `SELL SYMBOL @ PRICE`  
+- **Symbol filtering (on startup & retry)**  
+  - Only **USDT pairs** in `TRADING` status  
+  - Price: **$0.01 – $1,000**  
+  - 24h volume: **≥ $100,000 USDT**  
+  → Ensures liquidity & tradeability
 
 ---
 
-### **Order Fill Handling (Main Loop)**  
-**Background Processing (Every 15 Seconds)**  
+### **Risk & Position Management**
 
-- **Check all pending orders**  
-  - Query Binance API for status  
-  - If `FILLED`:  
-    - Record trade in `trades` table  
-    - Update `positions` (weighted avg entry)  
-    - Remove from `pending_orders`  
-    - Delete position if `qty ≤ 0`  
-- **Update Live Dashboard**  
-  - P&L (net of fees)  
-  - RSI, signal hints, position age  
+- **Risk per trade**: **10% of available USDT**  
+  - `available = free USDT – $2.00 (buffer)`  
+  - Position size = `min(10% of available, full available)`
+
+- **Position tracking via SQLAlchemy + SQLite**  
+  - Tables: `trades`, `pending_orders`, `positions`  
+  - Tracks: entry price, quantity, fees, fill time, order IDs  
+  - Supports **partial fills** & **average cost recalculation**
+
+- **Fee-aware profit calculation**  
+  - Uses actual **maker/taker rates** per symbol  
+  - Net P&L = Gross – (maker + taker fees)
 
 ---
 
-### **Summary – Thread Lifecycle**  
-**One Thread Per Coin (Independent)**  
+### **Order Execution & Validation**
 
+- **Limit orders only** → precise entry/exit  
+- **Tick size & lot size compliance**  
+  - Auto-adjusts price & quantity to exchange rules  
+  - Rounds down to valid step/tick
+
+- **Order lifecycle tracking**  
+  1. Place limit order → save to `pending_orders`  
+  2. Poll Binance → detect `FILLED`  
+  3. Record fill → update `trades` + `positions`  
+  4. Delete pending order
+
+- **WhatsApp alerts via CallMeBot**  
+  - On every **BUY** and **SELL** execution  
+  - Format: `BUY BTCUSDT @ 62345.12`
+
+---
+
+### **Technical Indicators (TA-Lib)**
+
+| Indicator | Settings | Purpose |
+|--------|----------|-------|
+| **RSI** | 14-period | Oversold (≤35) / Overbought (≥65) |
+| **Bollinger Bands** | 20-period, 2σ | Middle band for trend context |
+| **MACD** | 12, 26, 9 | Confirm bullish/bearish momentum |
+
+---
+
+### **Order Book Pressure Logic**
+
+- Analyzes **top 5 bid/ask levels**  
+- **Sell Pressure** = % of ask volume → triggers buy on panic  
+- **Buy Pressure History** (deque, last 5 polls):  
+  - Detects **spike (≥65%) → drop (≤55%)** → sell signal
+
+---
+
+### **Professional Live Dashboard (Terminal UI)**
+
+- **Navy blue background** (`\033[48;5;17m`)  
+- **Bright yellow headers** (`\033[38;5;226m`)  
+- **Green/Red P&L** based on net profit  
+- Updates **every 15 seconds**
+
+#### Dashboard Fields:
+| Field | Description |
+|------|-------------|
+| Time (CST) | Current time in Chicago timezone |
+| Available USDT | Free balance (minus $2 buffer) |
+| Portfolio Value | Total value of all assets in USDT |
+| Active Threads | # of coin monitor threads |
+| Active Positions | # of open trades |
+| Per Position | Symbol, Qty, Entry, Current, RSI, **P&L%**, **Profit $**, Age, Signal |
+
+---
+
+### **Safety & Reliability Features**
+
+- **Graceful shutdown** on `Ctrl+C` → stops all threads  
+- **Retry logic** (`tenacity`) on API failures (3 attempts, exponential backoff)  
+- **Logging**  
+  - Rotating daily logs (`crypto_trading_bot.log`, 7-day retention)  
+  - Console + file, with function/line info  
+- **Error resilience**  
+  - All critical sections in `try/except`  
+  - DB transactions with rollback  
+  - Thread isolation → one coin crash ≠ bot crash
+
+---
+
+### **Database Persistence**
+
+- **SQLite** (`binance_trades.db`)  
+- Survives restarts:  
+  - Open positions reloaded  
+  - Pending orders rechecked  
+  - Trade history preserved
+
+---
+
+### **Setup Requirements**
+
+```bash
+# Environment Variables
+export BINANCE_API_KEY="..."
+export BINANCE_API_SECRET="..."
+export CALLMEBOT_API_KEY="..."   # optional
+export CALLMEBOT_PHONE="..."     # optional
 ```
-Start → [Loop Every 1s]
-        ├── Fetch Data
-        ├── Calc Indicators
-        ├── Check BUY (if no pos)
-        │     → Place Limit Buy
-        └── Check SELL (if pos)
-              → Place Limit Sell
-```
 
-- **Main Loop**: Processes fills + prints dashboard  
-- **DB Persistence**: Survives restarts  
-- **Risk Control**: 10% per trade, $2 min balance  
-
----
-
-### **Visual Flow (Text Summary)**  
-
-```
-┌─ NO POSITION? ──→ [BUY CONDITIONS?] ──→ YES → PLACE BUY
-│
-└─ POSITION? ──→ [PROFIT 0.8%?] ──→ YES → [RSI≥65 + REVERSAL?] ──→ YES → PLACE SELL
+```bash
+pip install python-binance sqlalchemy talib tenacity requests numpy
 ```
 
 ---
 
-┌────────────────────────────────────────────────────────────────────┐
-│ NOTE: All threads run INDEPENDENTLY → 24/7 monitoring per coin     │
-│ Main loop: Processes fills + prints dashboard every 15 seconds     │
-└────────────────────────────────────────────────────────────────────┘
+### **Summary: How It Works (Step-by-Step)**
+
+1. **Start** → Load API keys, init DB, fetch valid USDT pairs  
+2. **Spawn 1 thread per coin** → each runs forever  
+3. **Every 1 second**:  
+   - Pull klines → compute RSI, MACD, BB, trend  
+   - Pull order book → compute bid/ask pressure  
+   - Check 24h low & volume  
+4. **If BUY signal** → place limit buy @ best bid (adjusted)  
+5. **If SELL signal** → place limit sell @ next tick above ask  
+6. **Main loop (every 15s)**:  
+   - Check filled orders → update DB  
+   - Print **live dashboard** with P&L  
+7. **Repeat 24/7** → fully automated
+
+---
+
+**Professional. Fast. Precise. Fee-Aware. Visual.**  
+*Built for serious traders who want automation without compromise.*
 
 Unleash the power of automated crypto trading with the Billionaires Crypto Trading Robot 2025, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using advanced mean-reversion with comprehensive momentum, oscillator, and trend filters. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
@@ -137,106 +206,6 @@ Unleash the power of automated crypto trading with the Billionaires Crypto Tradi
 
 By using this bot, you acknowledge these risks and agree to indemnify the author against any claims.
 
-### How the Crypto Trading Bot Works: Buying, Selling, Fee Compensation, and Profit Mechanism
-
-The Billionaires Crypto Trading Robot is a Python-based automated system designed for Binance.US, focusing on USDT-paired cryptocurrencies priced between $1–$1000 with specific bullish signals. It uses a mean-reversion strategy enhanced with comprehensive indicators including RSI, MACD, MFI, Bollinger Bands, Stochastic Oscillator, ATR, SMA, EMA, and candlestick patterns, leveraging 60 days of historical price data (1-hour klines) stored in an SQLAlchemy database (SQLite by default). The bot runs in a loop every 60 seconds, checking signals, managing orders, processing filled orders, and sending CallMeBot WhatsApp alerts for key events. It also prints a professional dashboard to the console for real-time status monitoring.
-
-On startup, it imports all owned nonzero-balance assets (any pair convertible to USDT) as tracked positions, using current market prices as entry points for profit calculations. It prioritizes **limit orders** for buys (to get maker fees) with a 300-second timeout and adaptive sells (market for urgent exits based on bearish signals, limit otherwise). All trades aim for a **net profit of at least 0.8% after fees**, with risk controls like allocating only 10% of balance per trade and maintaining a $2 minimum USDT buffer. **Profits are not guaranteed, and you risk losing all or part of your investment.**
-
-Below, I'll break down the buying, selling, fee compensation, and profit mechanisms step by step, referencing the code's logic.
-
-#### 1. **How the Bot Buys**
-The bot buys only when a coin meets strict criteria for low risk and bullish potential, ensuring it enters near the lower Bollinger Band with oversold conditions and upward trend signals. This is checked in the `check_buy_signal` function during the main loop for symbols without existing positions.
-
-- **Signal Detection**:
-  - Queries the database and fetches 60 days of 1-hour kline data via Binance.US API.
-  - Computes metrics like:
-    - RSI (14-period) > 50 (indicating strength).
-    - MFI (Money Flow Index, 14-period) ≤ 70 (avoids overbought).
-    - MACD (12,26,9) > signal line and histogram > 0 (bullish momentum).
-    - Stochastic Oscillator (5,3,3) K% ≤ 30 (oversold).
-    - EMA (21-period) > SMA (50-period) (uptrend confirmation).
-    - Current price ≤ lower Bollinger Band (20-period, 2-dev) * 1.005 (near oversold band).
-    - Bullish candlestick patterns (e.g., hammer, inverted hammer, engulfing, morning star, three white soldiers) via TA-Lib in `is_bullish_candlestick_pattern`.
-    - Bullish momentum status via TA-Lib patterns in `get_momentum_status`.
-    - 24-hour quote volume > $15,000 (ensures liquidity).
-    - Current price between $1–$1000.
-  - If all filters pass, it triggers a buy.
-
-- **Order Placement (`execute_buy` and `place_limit_buy_with_tracking`)**:
-  - Checks USDT balance (> $2 buffer); allocates 10% max per trade.
-  - Calculates buy price as current price * (1 - 0.001 - 0.5 * ATR / current price), where ATR is 14-period for volatility buffer.
-  - Places a **limit buy** to qualify as a maker order (lower fees), adjusted for symbol filters (lot size, price tick, min notional).
-  - Tracks the order in the database as a PendingOrder and monitors for fills in `check_and_process_filled_orders`.
-  - On fill (polled in main loop): Records actual entry price, quantity, and buy fee rate (dynamic via `get_trade_fees`).
-  - Stores or updates position in DB (symbol, qty, avg_entry_price, buy_fee_rate).
-  - Sends alert: e.g., "BUY filled [symbol] @ [price] qty [qty]".
-  - No buy if position already open, balance low, or signal invalid.
-
-This ensures buys happen only on high-confidence oversold entries in uptrends, with data fetched on demand and persistence for restarts.
-
-#### 2. **How the Bot Sells**
-Selling occurs when a held position (including imported assets) reaches the profit target after fees, checked in `check_sell_signal` for all open positions (loaded from DB).
-
-- **Signal Detection**:
-  - Fetches current price and dynamic fees (maker/taker via API).
-  - Calculates net profit percentage: `(current_price - avg_entry_price) / avg_entry_price - (buy_fee_rate + sell_fee)`.
-    - `buy_fee_rate` is the stored rate from the buy (or default 0.1%).
-    - `sell_fee` assumes taker for market sells (urgent) or maker for limit.
-  - If net profit < 0.8% (`PROFIT_TARGET`), no sell.
-  - Determines sell type: Market if bearish candlestick patterns (e.g., shooting star, hanging man, engulfing) or current price ≥ upper Bollinger Band * 0.995; otherwise limit.
-
-- **Order Placement (`execute_sell`, `place_market_sell`, `place_limit_sell_with_tracking`)**:
-  - For **market sell** (urgent exit): Immediate sell of full qty; uses taker fee.
-  - For **limit sell** (controlled exit): Sets price at `avg_entry_price * (1 + PROFIT_TARGET + buy_fee_rate + sell_fee)` + 0.5 * ATR to lock in net profit with volatility buffer.
-  - Adjusts for symbol filters (lot size, price tick, min notional).
-  - Tracks limit sells as PendingOrder; processes fills in main loop.
-  - On fill: Records exit price/profit, logs trade to DB, deletes position, sends alert: "SOLD [symbol] @ [exit_price] Profit $[profit]".
-  - Market sells are instant; limit sells are polled via order status.
-
-This adaptive approach captures profits while responding to bearish signals for quick exits in volatile conditions.
-
-#### 3. **How the Bot Compensates for Fees**
-Fees are dynamically handled to ensure trades are profitable **net of costs**, based on your Binance.US tier (queried via API). The bot fetches real-time maker/taker rates (defaults to 0.1% if API fails).
-
-- **Fee Fetching**:
-  - `get_trade_fees` queries `client.get_trade_fee(symbol)` for maker/taker rates (e.g., 0.001 maker, 0.001 taker in lower tiers).
-
-- **Compensation in Buy**:
-  - Limit buys use maker fee (lower); stored as `buy_fee_rate` in position for precise calculations.
-
-- **Compensation in Sell**:
-  - Profit calc subtracts **buy_fee_rate + sell_fee** (sell_fee as taker for market, maker for limit).
-  - Sell price for limits is inflated by fees + profit target + ATR buffer, ensuring net gain.
-  - Example (assuming 0.1% maker/taker):
-    - Buy: 0.1% fee → Effective entry = avg_entry_price * (1 + 0.001).
-    - Sell: Requires current_price >= effective entry * (1 + 0.008 + 0.001) to net 0.8% after sell fee.
-  - Total round-trip compensation: Buffered into targets, preventing breakeven/loss trades.
-
-Lower-tier fees (e.g., Tier 0 with near-zero rates) allow more frequent trades without code changes (dynamic fetch handles it).
-
-#### 4. **How the Bot Profits**
-The bot profits by buying oversold (near lower BB with oscillators confirming) in uptrends and selling at a fixed 0.8% net gain after fees, compounding over multiple trades. **Profits are not guaranteed, and you risk losing all or part of your investment.**
-
-- **Strategy Overview**:
-  - **Mean-Reversion + Comprehensive Filters**: Buys near lower BB (≤1.005x) but only if RSI >50, MFI ≤70, MACD bullish, Stochastic oversold (K% ≤30), EMA > SMA, bullish patterns/momentum. Avoids weak trends.
-  - **Profit Target**: Strict 0.8% net after fees; holds until target or bearish signals trigger market sell.
-  - **Risk Management**: 10% allocation/trade, $2 buffer, no overlapping positions per coin, ATR buffers for slippage/volatility.
-  - **Expected Win Rate**: Design aims for high-confidence entries; small gains (0.8%) but selective (filters minimize losses). Losses can exceed gains in adverse markets, potentially depleting your balance.
-
-- **Profit Calculation Example**:
-  - Balance: $100 USDT.
-  - Buy SOLUSDT at $20 (limit, 0.1% fee): Alloc $9.8 (10% - buffer), qty=0.49 SOL, fee=$0.0098, effective cost=$9.8098.
-  - Price rises to $20.30 (1.5% up).
-  - Net profit check: (20.30 - 20) / 20 - (0.001 + 0.001) = 0.015 - 0.002 = 0.013 > 0.008 → Sell if signals allow.
-  - Sell (limit, 0.1% fee): Target price ~$20.36 (adjusted for fees/ATR), proceeds: $9.9564 - $0.00996 fee = $9.94644.
-  - Profit: $9.94644 - $9.8098 = **$0.13664** (~1.39% gross, 0.8% net after fees).
-  - **Risk Note**: If SOLUSDT drops, no sell unless profit target hit; no built-in stop-loss, risking loss.
-
-- **Overall Profitability**:
-  - Relies on all USDT pairs filtered by criteria, including imported assets.
-  - Compounds: Selective trades at 0.8% net; minus losses (filters aim to minimize). 
-  - Enhancements: 60d history for robust indicators, alerts/dashboard for monitoring, DB persistence for graceful shutdown/restart, pending order tracking for reliable fills.
 
 ### Installation in Ubuntu 24.04 Linux (Anaconda Python Environment Preferred)
 
@@ -341,12 +310,6 @@ export BINANCE_API_SECRET="your_binance_api_secret_here"
 export CALLMEBOT_API_KEY="your_callmebot_api_key_here"
 export CALLMEBOT_PHONE="your_phone_number_here"  # E.g., +1234567890
 ```
-
-- After editing, reload: `source ~/.bashrc`.
-- **Security Tip**: Store sensitive keys securely (e.g., use a .env file and `python-dotenv` if preferred, but the code uses `os.getenv` directly). Avoid committing `.bashrc` to version control. Alternatively, place keys in a secure file and source it in `.bashrc`:  
-  ```bash
-  source /path/to/secure_env.sh
-  ```
 
 Run Program: 
 
