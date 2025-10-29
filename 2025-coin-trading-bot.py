@@ -543,9 +543,13 @@ def print_professional_dashboard(client):
             RESET = "\033[0m"
             BOLD = "\033[1m"
 
-            print(f"{NAVY}{YELLOW}{'='*120}{RESET}")
+            # ──────────────────────────────────────────────────────────────
+            # Header – **no explicit yellow title colour any more**
+            print(f"{NAVY}{'='*120}{RESET}")
             print(f"{NAVY}{BOLD}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'='*120}{RESET}")
+            print(f"{NAVY}{'='*120}{RESET}")
+            # ──────────────────────────────────────────────────────────────
+
             print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
             print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
             print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
@@ -594,7 +598,7 @@ def print_professional_dashboard(client):
             else:
                 print(f"{NAVY}{YELLOW} No active positions.{RESET}")
 
-            print(f"{NAVY}{YELLOW}{'='*120}{RESET}\n")
+            print(f"{NAVY}{'='*120}{RESET}\n")
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
