@@ -512,15 +512,18 @@ def get_price_usdt(client, asset: str) -> Decimal:
 
 # === TERMINAL COLOR CONTROL =================================================
 def set_terminal_background_and_title():
-    """Set terminal background to navy blue and title to green."""
+    """Set terminal background to navy blue and title to BRIGHT YELLOW."""
     try:
-        # ANSI: Navy blue background (48;5;17m), Green bold title (38;5;82m;1m)
-        print("\033]0;CRYPTO BOT – LIVE\007", end='')           # Window title (green in most terminals)
-        print("\033[48;5;17m", end='')                         # Navy blue background
-        print("\033[2J", end='')                               # Clear screen (keeps background)
-        print("\033[H", end='')                                # Move cursor to top-left
+        # ANSI: Window title in BRIGHT YELLOW (38;5;226m)
+        print("\033]0;\033[38;5;226mCRYPTO BOT – LIVE\007", end='')
+
+        # Navy blue background for the whole screen
+        print("\033[48;5;17m", end='')
+
+        # Clear screen + move cursor (preserves background)
+        print("\033[2J\033[H", end='')
     except:
-        pass  # Fails silently on non-ANSI terminals (e.g. some IDEs)
+        pass  # Silent on non-ANSI terminals
 
 # === PROFESSIONAL DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED) ===============
 def print_professional_dashboard(client):
