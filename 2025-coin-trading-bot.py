@@ -577,6 +577,7 @@ def print_professional_dashboard(client):
             with DBManager() as sess:
                 db_positions = sess.query(Position).all()
 
+            # === P&L TABLE (Unrealized Profit/Loss) ===
             if db_positions:
                 print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'AGE':>12}{RESET}")
                 print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
@@ -607,33 +608,57 @@ def print_professional_dashboard(client):
                 pnl_color = GREEN if total_pnl > 0 else RED
                 print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}")
 
-                # === NEW SECTION: LIST OF ACTIVELY MANAGED POSITIONS ===
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-                print(f"{NAVY}{BOLD}{YELLOW}{'LIST OF ACTIVELY MANAGED POSITIONS':^120}{RESET}")
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-                if db_positions:
-                    print(f"{NAVY}{YELLOW}{'SYMBOL':<12} {'QTY':>12} {'STATUS':<50}{RESET}")
-                    print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-                    for pos in db_positions:
-                        symbol = pos.symbol
-                        qty = float(pos.quantity)
-                        rsi, trend, _ = get_rsi_and_trend(client, symbol)
-                        if rsi is not None and rsi <= RSI_OVERSOLD and trend == 'bullish':
-                            status = "24/7 watching for buy low opportunity"
-                        elif rsi is not None and rsi >= RSI_OVERBOUGHT:
-                            status = "24/7 watching to sell at top"
-                        else:
-                            status = "monitoring"
-                        print(f"{NAVY}{YELLOW}{symbol:<12} {qty:>12.6f} {status:<50}{RESET}")
-                else:
-                    print(f"{NAVY}{YELLOW} No positions in database.{RESET}")
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
             else:
                 print(f"{NAVY}{YELLOW} No active positions.{RESET}")
 
+            # === LIST OF ACTIVELY MANAGED POSITIONS (ALL: "24/7 watching to sell at top") ===
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            print(f"{NAVY}{BOLD}{YELLOW}{'LIST OF ACTIVELY MANAGED POSITIONS':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+            if db_positions:
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<12} {'QTY':>12} {'STATUS':<50}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+                for pos in db_positions:
+                    symbol = pos.symbol
+                    qty = float(pos.quantity)
+                    status = "24/7 watching to sell at top"
+                    print(f"{NAVY}{YELLOW}{symbol:<12} {qty:>12.6f} {status:<50}{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No positions in database.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+            # === 24/7 BUY WATCH LIST (DIP OPPORTUNITIES) ===
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            print(f"{NAVY}{BOLD}{YELLOW}{'24/7 BUY WATCH LIST (DIP OPPORTUNITIES)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+            buy_watch_coins = []
+            for symbol in active_threads.keys():
+                if symbol in valid_symbols_dict:
+                    rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
+                    ob = get_order_book_analysis(client, symbol)
+                    buy_price = ob['best_bid']
+                    if (rsi is not None and rsi <= RSI_OVERSOLD and
+                        trend == 'bullish' and
+                        low_24h and buy_price <= Decimal(str(low_24h)) * Decimal('1.01') and
+                        ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100):
+                        buy_watch_coins.append(symbol)
+
+            if buy_watch_coins:
+                print(f"{NAVY}{YELLOW}{'COIN':<12} {'RSI':>8} {'TREND':>10} {'PRICE':>12} {'24H LOW':>12}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+                for symbol in sorted(buy_watch_coins):
+                    rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
+                    ob = get_order_book_analysis(client, symbol)
+                    price = float(ob['best_bid'])
+                    print(f"{NAVY}{YELLOW}{symbol:<12} {rsi:>8.1f} {trend:>10} {price:>12.6f} {low_24h:>12.6f}{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No coins currently meet buy-dip criteria.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
             print(f"{NAVY}{'='*120}{RESET}\n")
+
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
