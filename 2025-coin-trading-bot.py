@@ -2,9 +2,9 @@
 """
 Binance.US Trading Bot – PROFESSIONAL VERSION
 1 THREAD PER COIN – 24/7 MONITORING
-PROFESSIONAL REAL-TIME DASHBOARD
+PROFESSIONAL REAL-TIME DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED P&L)
 BUY: Strong dip (RSI ≤ 35 + bullish + near 24h low + ≥60% sell pressure)
-SELL: 0.8% profit (excl fees) + RSI ≥ 65 + buy-pressure spike → drop
+SELL: ≥0.8% NET PROFIT (after maker+taker fees) + RSI ≥ 65 + buy-pressure spike → drop
 """
 
 import os
@@ -45,7 +45,7 @@ BB_DEV = 2
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-PROFIT_TARGET_EXCL_FEES = 0.008          # 0.8% net profit *excluding* fees
+PROFIT_TARGET_NET = Decimal('0.008')          # 0.8% NET after maker + taker fees
 RISK_PER_TRADE = 0.10
 MIN_BALANCE = 2.0
 
@@ -240,6 +240,18 @@ def get_order_book_analysis(client, symbol: str) -> dict:
     except:
         return {'pct_bid': 50.0, 'pct_ask': 50.0, 'best_bid': ZERO, 'best_ask': ZERO}
 
+# === TICK SIZE HELPER =======================================================
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+def get_tick_size(client, symbol):
+    try:
+        info = client.get_symbol_info(symbol)
+        for f in info['filters']:
+            if f['filterType'] == 'PRICE_FILTER':
+                return Decimal(f['tickSize'])
+        return Decimal('0.00000001')
+    except:
+        return Decimal('0.00000001')
+
 # === METRICS ================================================================
 def get_rsi_and_trend(client, symbol) -> Tuple[Optional[float], str, Optional[float]]:
     try:
@@ -276,16 +288,22 @@ class CoinMonitorThread(threading.Thread):
             try:
                 ob = get_order_book_analysis(self.client, self.symbol)
                 rsi, trend, low_24h = get_rsi_and_trend(self.client, self.symbol)
-                current_price = ob['best_bid'] if ob['best_bid'] > 0 else ob['best_ask']
+
+                buy_price = ob['best_bid']
+                sell_price = ob['best_ask']
+
+                if buy_price <= ZERO or sell_price <= ZERO:
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
                 # BUY
                 with DBManager() as sess:
                     if not sess.query(Position).filter_by(symbol=self.symbol).first():
                         if (rsi is not None and rsi <= RSI_OVERSOLD and
                             trend == 'bullish' and
-                            low_24h and current_price <= low_24h * 1.01 and
+                            low_24h and buy_price <= Decimal(str(low_24h)) * Decimal('1.01') and
                             ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100):
-                            self.place_buy_order(current_price)
+                            self.place_buy_order(buy_price)
                             time.sleep(3)
 
                 # SELL
@@ -293,16 +311,23 @@ class CoinMonitorThread(threading.Thread):
                     pos = sess.query(Position).filter_by(symbol=self.symbol).one_or_none()
                     if pos:
                         entry = Decimal(str(pos.avg_entry_price))
-                        profit_excl_fees = (current_price - entry) / entry
-                        if profit_excl_fees >= Decimal(str(PROFIT_TARGET_EXCL_FEES)):
+                        maker_fee, taker_fee = get_trade_fees(self.client, self.symbol)
+                        total_fee_rate = Decimal(str(maker_fee)) + Decimal(str(taker_fee))
+
+                        gross_return = (sell_price - entry) / entry
+                        net_return = gross_return - total_fee_rate
+
+                        if net_return >= PROFIT_TARGET_NET:
                             if rsi is not None and rsi >= RSI_OVERBOUGHT:
                                 history = buy_pressure_history.get(self.symbol, deque(maxlen=5))
                                 history.append(ob['pct_bid'])
                                 buy_pressure_history[self.symbol] = history
+
                                 if len(history) >= 3:
                                     peak = max(history)
-                                    if peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and history[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
-                                        self.place_sell_order(current_price, pos)
+                                    if (peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and
+                                        history[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100):
+                                        self.place_sell_order(sell_price, pos)
                                         time.sleep(3)
 
             except Exception as e:
@@ -331,13 +356,17 @@ class CoinMonitorThread(threading.Thread):
     def place_sell_order(self, price: Decimal, position):
         try:
             qty = position.quantity
+            tick_size = get_tick_size(self.client, self.symbol)
+            if tick_size > ZERO:
+                price = ((price // tick_size) + 1) * tick_size  # next tick above best ask
+
             adjusted, error = validate_and_adjust_order(self.client, self.symbol, 'SELL', ORDER_TYPE_LIMIT, qty, price)
             if not adjusted or error: return
 
             order = self.bot.place_limit_sell_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
             if order:
-                send_whatsapp_alert(f"SELL {self.symbol} @ {adjusted['price']:.6f}")
-                logger.info(f"SELL ORDER: {self.symbol} @ {adjusted['price']}")
+                send_whatsapp_alert(f"SELL {self.symbol} @ {adjusted['price']:.6f} (+0.8% net)")
+                logger.info(f"SELL ORDER: {self.symbol} @ {adjusted['price']} (net >=0.8%)")
         except Exception as e:
             logger.error(f"Sell failed: {e}")
 
@@ -436,14 +465,20 @@ def get_trade_fees(client, symbol):
 
 def validate_and_adjust_order(client, symbol, side, order_type, quantity, price):
     try:
-        filters = {}
-        info = client.get_exchange_info()
-        s = next(x for x in info['symbols'] if x['symbol'] == symbol)
-        for f in s['filters']:
-            if f['filterType'] in ['LOT_SIZE', 'PRICE_FILTER', 'MIN_NOTIONAL']:
-                filters[f['filterType']] = {k: safe_float(f.get(k)) for k in f if k != 'filterType'}
-        return {'quantity': float(quantity), 'price': float(price)}, None
-    except: return None, "Filter error"
+        info = client.get_symbol_info(symbol)
+        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
+
+        step_qty = Decimal(lot['stepSize'])
+        tick = Decimal(price_f['tickSize'])
+
+        qty = (quantity // step_qty) * step_qty
+        price = (price // tick) * tick
+
+        return {'quantity': float(qty), 'price': float(price)}, None
+    except Exception as e:
+        logger.error(f"Filter error {symbol}: {e}")
+        return None, "Filter error"
 
 def send_whatsapp_alert(message: str):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
@@ -475,7 +510,7 @@ def get_price_usdt(client, asset: str) -> Decimal:
     try: return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
     except: return ZERO
 
-# === PROFESSIONAL DASHBOARD =================================================
+# === PROFESSIONAL DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED) ===============
 def print_professional_dashboard(client):
     try:
         with dashboard_lock:
@@ -484,22 +519,30 @@ def print_professional_dashboard(client):
             usdt_free = get_balance(client, 'USDT')
             total_portfolio, asset_values = calculate_total_portfolio_value(client)
 
-            print(f"\n{'='*120}")
-            print(f"{'TRADING BOT – LIVE DASHBOARD ':^120}")
-            print(f"{'='*120}")
-            print(f"{'Time (CST)':<20} {now}")
-            print(f"{'Available USDT':<20} ${usdt_free:,.6f}")
-            print(f"{'Portfolio Value':<20} ${total_portfolio:,.6f}")
-            print(f"{'Active Threads':<20} {len(active_threads)}")
-            print(f"{'Active Positions':<20} {len(positions)}")
-            print("-" * 120)
+            # ANSI Colors
+            NAVY = "\033[48;5;17m"
+            YELLOW = "\033[38;5;226m"
+            GREEN = "\033[38;5;82m"
+            RED = "\033[38;5;196m"
+            RESET = "\033[0m"
+            BOLD = "\033[1m"
+
+            print(f"{NAVY}{YELLOW}{'='*120}{RESET}")
+            print(f"{NAVY}{BOLD}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'='*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Active Positions':<20} {len(positions)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
 
             with DBManager() as sess:
                 db_positions = sess.query(Position).all()
 
             if db_positions:
-                print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'AGE':>12}")
-                print("-" * 120)
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'AGE':>12}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
                 total_pnl = Decimal('0')
                 for pos in db_positions:
                     symbol = pos.symbol
@@ -526,14 +569,16 @@ def print_professional_dashboard(client):
                     elif rsi and rsi >= RSI_OVERBOUGHT:
                         signal = "SELL TOP"
 
-                    print(f"{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {pnl_pct:>7.2f}% {net_profit:>10.2f} {age_str:>12} {signal}")
+                    color = GREEN if net_profit > 0 else RED
+                    print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {age_str:>12} {signal}{RESET}")
 
-                print("-" * 120)
-                print(f"{'TOTAL UNREALIZED P&L':<50} ${float(total_pnl):>12,.2f}")
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+                pnl_color = GREEN if total_pnl > 0 else RED
+                print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}")
             else:
-                print(" No active positions.")
+                print(f"{NAVY}{YELLOW} No active positions.{RESET}")
 
-            print(f"\n{'='*120}\n")
+            print(f"{NAVY}{YELLOW}{'='*120}{RESET}\n")
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
