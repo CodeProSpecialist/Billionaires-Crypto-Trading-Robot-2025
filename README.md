@@ -14,95 +14,107 @@ on October 28, 2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-┌────────────────────────────────────────────────────────────────────┐
-│                   COIN MONITOR THREAD (per symbol)                 │
-│                        [POLL EVERY 1 SECOND]                       │
-└────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │   FETCH REAL-TIME DATA       │
-                    │  • Order Book (top 5)        │
-                    │  • 1m Candles (last 100)      │
-                    │  • 24h Low Price             │
-                    └──────────────────────────────┘
-                                   │
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │     CALCULATE INDICATORS     │
-                    │  • RSI(14)                   │
-                    │  • Bollinger Bands(20,2)     │
-                    │  • MACD(12,26,9)             │
-                    │  • Trend: Bullish/Bearish    │
-                    └──────────────────────────────┘
-                                   │
-                ┌──────────────────┴──────────────────┐
-                ▼                                   ▼
-     ┌─────────────────────┐             ┌─────────────────────┐
-     │   CHECK BUY SIGNAL   │             │  CHECK SELL SIGNAL  │
-     │   (All 4 Required)   │             │  (Profit + Reversal)│
-     └─────────────────────┘             └─────────────────────┘
-                │                                   │
-                ▼                                   ▼
-       ┌─────────────────┐                 ┌─────────────────┐
-       │ 1. RSI ≤ 35      │                 │ 1. Profit ≥ 0.8%│
-       │ 2. Trend = BULLISH│                 │    (gross, excl fees)│
-       │ 3. Price ≤ 1.01×  │                 └─────────────────┘
-       │    24h Low        │                          │
-       │ 4. Ask % ≥ 60%    │                          ▼
-       └─────────────────┘                 ┌────────────────────────┐
-                │                          │ 2. RSI ≥ 65 (Overbought)│
-                ▼                          └────────────────────────┘
-       ┌─────────────────┐                          │
-       │ NO POSITION?     │◄──────────────────────┘
-       └─────────────────┘                          ▼
-                │ YES                       ┌────────────────────────┐
-                ▼                          │ 3. Buy Pressure:       │
-       ┌─────────────────┐                 │    • Spike ≥ 65% (in last 5)│
-       │ PLACE LIMIT BUY │                 │    • Then Drop ≤ 55%       │
-       │ • 10% of USDT   │                 └────────────────────────┘
-       │ • @ Best Bid     │                          │
-       │ • Track in DB   │                          ▼
-       │ • WhatsApp Alert │                 ┌─────────────────┐
-       └─────────────────┘                 │  POSITION EXISTS?│
-                │                          └─────────────────┘
-                ▼                                 │ YES
-       ┌─────────────────┐                 ┌─────────────────┐
-       │   WAIT FOR FILL  │                 │ PLACE LIMIT SELL│
-       │ (Main loop polls)│                 │ • Full qty      │
-       └─────────────────┘                 │ • @ Best Ask    │
-                                            │ • Track in DB   │
-                                            │ • WhatsApp Alert│
-                                            └─────────────────┘
-                                                     │
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │   WAIT FOR FILL │
-                                            └─────────────────┘
-                                                     │
-                                                     ▼
-                                   ┌─────────────────────────┐
-                                   │   ORDER FILLED?         │
-                                   │   (checked in main loop)│
-                                   └─────────────────────────┘
-                                            │ YES
-                                            ▼
-                                   ┌─────────────────────────┐
-                                   │ UPDATE POSITION IN DB   │
-                                   │ • Avg Entry (weighted)  │
-                                   │ • Record Trade          │
-                                   │ • Remove if qty ≤ 0     │
-                                   └─────────────────────────┘
-                                            │
-                                            ▼
-                                   ┌─────────────────────────┐
-                                   │  UPDATE DASHBOARD P&L   │
-                                   └─────────────────────────┘
-                                            │
-                                            ▼
-                                   ┌─────────────────────────┐
-                                   │     LOOP BACK (1 sec)   │
-                                   └─────────────────────────┘
+# **Trading Bot – Per-Coin Thread Logic**  
+**1 Thread per USDT Pair | 24/7 Monitoring | 1-Second Polling**
+
+---
+
+### **Core Monitoring Cycle**  
+- **Fetch Real-Time Data**  
+  - Order book (top 5 bid/ask levels)  
+  - 1-minute candles (last 100)  
+  - 24-hour low price  
+- **Calculate Technical Indicators**  
+  - **RSI(14)**  
+  - **Bollinger Bands(20, 2σ)** → middle band  
+  - **MACD(12,26,9)** → signal line  
+  - **Trend Detection**:  
+    - *Bullish*: Price > BB middle **AND** MACD > signal  
+    - *Bearish*: Price < BB middle **AND** MACD < signal  
+    - *Sideways*: otherwise  
+
+---
+
+### **BUY SIGNAL – All 4 Conditions Required**  
+**Only if NO position exists**  
+
+- **RSI ≤ 35** → Oversold  
+- **Trend = Bullish** → Momentum confirmation  
+- **Current Price ≤ 1.01 × 24h Low** → Near bottom  
+- **Sell Pressure ≥ 60%** → Asks dominate top 5 levels  
+
+**→ Place Limit Buy Order**  
+  - Size: **10% of available USDT**  
+  - Price: Best bid  
+  - Track in `pending_orders`  
+  - Send **WhatsApp Alert**: `BUY SYMBOL @ PRICE`  
+
+---
+
+### **SELL SIGNAL – Profit + Reversal**  
+**Only if position exists**  
+
+- **Step 1: Gross Profit ≥ 0.8%**  
+  - `(current_price - entry_price) / entry_price ≥ 0.008`  
+
+- **Step 2: RSI ≥ 65** → Overbought  
+
+- **Step 3: Buy Pressure Reversal (last 5 polls)**  
+  - Spike: **Buy % ≥ 65%** at some point  
+  - Drop: **Current Buy % ≤ 55%**  
+
+**→ Place Limit Sell Order**  
+  - Size: **Full position quantity**  
+  - Price: Best ask  
+  - Track in `pending_orders`  
+  - Send **WhatsApp Alert**: `SELL SYMBOL @ PRICE`  
+
+---
+
+### **Order Fill Handling (Main Loop)**  
+**Background Processing (Every 15 Seconds)**  
+
+- **Check all pending orders**  
+  - Query Binance API for status  
+  - If `FILLED`:  
+    - Record trade in `trades` table  
+    - Update `positions` (weighted avg entry)  
+    - Remove from `pending_orders`  
+    - Delete position if `qty ≤ 0`  
+- **Update Live Dashboard**  
+  - P&L (net of fees)  
+  - RSI, signal hints, position age  
+
+---
+
+### **Summary – Thread Lifecycle**  
+**One Thread Per Coin (Independent)**  
+
+```
+Start → [Loop Every 1s]
+        ├── Fetch Data
+        ├── Calc Indicators
+        ├── Check BUY (if no pos)
+        │     → Place Limit Buy
+        └── Check SELL (if pos)
+              → Place Limit Sell
+```
+
+- **Main Loop**: Processes fills + prints dashboard  
+- **DB Persistence**: Survives restarts  
+- **Risk Control**: 10% per trade, $2 min balance  
+
+---
+
+### **Visual Flow (Text Summary)**  
+
+```
+┌─ NO POSITION? ──→ [BUY CONDITIONS?] ──→ YES → PLACE BUY
+│
+└─ POSITION? ──→ [PROFIT 0.8%?] ──→ YES → [RSI≥65 + REVERSAL?] ──→ YES → PLACE SELL
+```
+
+---
 
 ┌────────────────────────────────────────────────────────────────────┐
 │ NOTE: All threads run INDEPENDENTLY → 24/7 monitoring per coin     │
