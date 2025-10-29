@@ -510,10 +510,23 @@ def get_price_usdt(client, asset: str) -> Decimal:
     try: return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
     except: return ZERO
 
+# === TERMINAL COLOR CONTROL =================================================
+def set_terminal_background_and_title():
+    """Set terminal background to navy blue and title to green."""
+    try:
+        # ANSI: Navy blue background (48;5;17m), Green bold title (38;5;82m;1m)
+        print("\033]0;CRYPTO BOT – LIVE\007", end='')           # Window title (green in most terminals)
+        print("\033[48;5;17m", end='')                         # Navy blue background
+        print("\033[2J", end='')                               # Clear screen (keeps background)
+        print("\033[H", end='')                                # Move cursor to top-left
+    except:
+        pass  # Fails silently on non-ANSI terminals (e.g. some IDEs)
+
 # === PROFESSIONAL DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED) ===============
 def print_professional_dashboard(client):
     try:
         with dashboard_lock:
+            set_terminal_background_and_title()  # <-- NEW: FULL BLUE BG + GREEN TITLE 
             os.system('cls' if os.name == 'nt' else 'clear')
             now = now_cst()
             usdt_free = get_balance(client, 'USDT')
