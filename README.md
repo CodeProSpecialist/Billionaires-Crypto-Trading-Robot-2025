@@ -14,6 +14,101 @@ on October 28, 2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
+┌────────────────────────────────────────────────────────────────────┐
+│                   COIN MONITOR THREAD (per symbol)                 │
+│                        [POLL EVERY 1 SECOND]                       │
+└────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │   FETCH REAL-TIME DATA       │
+                    │  • Order Book (top 5)        │
+                    │  • 1m Candles (last 100)      │
+                    │  • 24h Low Price             │
+                    └──────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │     CALCULATE INDICATORS     │
+                    │  • RSI(14)                   │
+                    │  • Bollinger Bands(20,2)     │
+                    │  • MACD(12,26,9)             │
+                    │  • Trend: Bullish/Bearish    │
+                    └──────────────────────────────┘
+                                   │
+                ┌──────────────────┴──────────────────┐
+                ▼                                   ▼
+     ┌─────────────────────┐             ┌─────────────────────┐
+     │   CHECK BUY SIGNAL   │             │  CHECK SELL SIGNAL  │
+     │   (All 4 Required)   │             │  (Profit + Reversal)│
+     └─────────────────────┘             └─────────────────────┘
+                │                                   │
+                ▼                                   ▼
+       ┌─────────────────┐                 ┌─────────────────┐
+       │ 1. RSI ≤ 35      │                 │ 1. Profit ≥ 0.8%│
+       │ 2. Trend = BULLISH│                 │    (gross, excl fees)│
+       │ 3. Price ≤ 1.01×  │                 └─────────────────┘
+       │    24h Low        │                          │
+       │ 4. Ask % ≥ 60%    │                          ▼
+       └─────────────────┘                 ┌────────────────────────┐
+                │                          │ 2. RSI ≥ 65 (Overbought)│
+                ▼                          └────────────────────────┘
+       ┌─────────────────┐                          │
+       │ NO POSITION?     │◄──────────────────────┘
+       └─────────────────┘                          ▼
+                │ YES                       ┌────────────────────────┐
+                ▼                          │ 3. Buy Pressure:       │
+       ┌─────────────────┐                 │    • Spike ≥ 65% (in last 5)│
+       │ PLACE LIMIT BUY │                 │    • Then Drop ≤ 55%       │
+       │ • 10% of USDT   │                 └────────────────────────┘
+       │ • @ Best Bid     │                          │
+       │ • Track in DB   │                          ▼
+       │ • WhatsApp Alert │                 ┌─────────────────┐
+       └─────────────────┘                 │  POSITION EXISTS?│
+                │                          └─────────────────┘
+                ▼                                 │ YES
+       ┌─────────────────┐                 ┌─────────────────┐
+       │   WAIT FOR FILL  │                 │ PLACE LIMIT SELL│
+       │ (Main loop polls)│                 │ • Full qty      │
+       └─────────────────┘                 │ • @ Best Ask    │
+                                            │ • Track in DB   │
+                                            │ • WhatsApp Alert│
+                                            └─────────────────┘
+                                                     │
+                                                     ▼
+                                            ┌─────────────────┐
+                                            │   WAIT FOR FILL │
+                                            └─────────────────┘
+                                                     │
+                                                     ▼
+                                   ┌─────────────────────────┐
+                                   │   ORDER FILLED?         │
+                                   │   (checked in main loop)│
+                                   └─────────────────────────┘
+                                            │ YES
+                                            ▼
+                                   ┌─────────────────────────┐
+                                   │ UPDATE POSITION IN DB   │
+                                   │ • Avg Entry (weighted)  │
+                                   │ • Record Trade          │
+                                   │ • Remove if qty ≤ 0     │
+                                   └─────────────────────────┘
+                                            │
+                                            ▼
+                                   ┌─────────────────────────┐
+                                   │  UPDATE DASHBOARD P&L   │
+                                   └─────────────────────────┘
+                                            │
+                                            ▼
+                                   ┌─────────────────────────┐
+                                   │     LOOP BACK (1 sec)   │
+                                   └─────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│ NOTE: All threads run INDEPENDENTLY → 24/7 monitoring per coin     │
+│ Main loop: Processes fills + prints dashboard every 15 seconds     │
+└────────────────────────────────────────────────────────────────────┘
+
 Unleash the power of automated crypto trading with the Billionaires Crypto Trading Robot 2025, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using advanced mean-reversion with comprehensive momentum, oscillator, and trend filters. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
 ### Legal Disclaimers
