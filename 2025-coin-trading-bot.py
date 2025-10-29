@@ -611,7 +611,7 @@ def print_professional_dashboard(client):
             else:
                 print(f"{NAVY}{YELLOW} No active positions.{RESET}")
 
-            # === LIST OF ACTIVELY MANAGED POSITIONS (ALL: "24/7 watching to sell at top") ===
+            # === LIST OF ACTIVELY MANAGED POSITIONS ===
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
             print(f"{NAVY}{BOLD}{YELLOW}{'LIST OF ACTIVELY MANAGED POSITIONS':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
@@ -628,14 +628,14 @@ def print_professional_dashboard(client):
                 print(f"{NAVY}{YELLOW} No positions in database.{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
 
-            # === 24/7 BUY WATCH LIST (DIP OPPORTUNITIES) ===
+            # === 24/7 BUY WATCH LIST (ONLY FROM valid_symbols_dict) ===
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
             print(f"{NAVY}{BOLD}{YELLOW}{'24/7 BUY WATCH LIST (DIP OPPORTUNITIES)':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
 
             buy_watch_coins = []
-            for symbol in active_threads.keys():
-                if symbol in valid_symbols_dict:
+            for symbol in valid_symbols_dict.keys():  # ONLY VALIDATED COINS
+                try:
                     rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
                     ob = get_order_book_analysis(client, symbol)
                     buy_price = ob['best_bid']
@@ -644,6 +644,9 @@ def print_professional_dashboard(client):
                         low_24h and buy_price <= Decimal(str(low_24h)) * Decimal('1.01') and
                         ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100):
                         buy_watch_coins.append(symbol)
+                except Exception as e:
+                    logger.debug(f"Buy watch skip {symbol}: {e}")
+                    continue
 
             if buy_watch_coins:
                 print(f"{NAVY}{YELLOW}{'COIN':<12} {'RSI':>8} {'TREND':>10} {'PRICE':>12} {'24H LOW':>12}{RESET}")
