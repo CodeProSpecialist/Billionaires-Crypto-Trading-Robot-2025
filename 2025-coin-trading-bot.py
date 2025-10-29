@@ -515,7 +515,7 @@ def set_terminal_background_and_title():
     """Set terminal background to navy blue and title to BRIGHT YELLOW."""
     try:
         # ANSI: Window title in BRIGHT YELLOW (38;5;226m)
-        print("\033]0;\033[38;5;226mCRYPTO BOT – LIVE\007", end='')
+        print("TRADING BOT – LIVE")
 
         # Navy blue background for the whole screen
         print("\033[48;5;17m", end='')
@@ -546,7 +546,7 @@ def print_professional_dashboard(client):
             # ──────────────────────────────────────────────────────────────
             # Header – **no explicit yellow title colour any more**
             print(f"{NAVY}{'='*120}{RESET}")
-            print(f"{NAVY}{BOLD}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
             print(f"{NAVY}{'='*120}{RESET}")
             # ──────────────────────────────────────────────────────────────
 
