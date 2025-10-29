@@ -374,9 +374,12 @@ class CoinMonitorThread(threading.Thread):
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
-        self.load_state_from_db()
+        # 1. IMPORT OWNED POSITIONS FIRST
         with DBManager() as sess:
             import_owned_assets_to_db(self.client, sess)
+            sess.commit()
+        # 2. THEN LOAD STATE INTO GLOBAL `positions`
+        self.load_state_from_db()
 
     def load_state_from_db(self):
         global positions
@@ -488,20 +491,36 @@ def send_whatsapp_alert(message: str):
         except: pass
 
 def import_owned_assets_to_db(client, sess):
+    """Import every non-zero free balance from Binance into the DB."""
     try:
         account = client.get_account()
         for bal in account['balances']:
             asset = bal['asset']
-            qty = safe_float(bal['free'])
-            if qty <= 0 or asset == 'USDT': continue
-            price = get_price_usdt(client, asset)
-            if price <= 0: continue
+            free_str = bal['free']
+            qty = safe_float(free_str)
+            if qty <= 0 or asset == 'USDT':
+                continue
+
             symbol = f"{asset}USDT"
-            if sess.query(Position).filter_by(symbol=symbol).first(): continue
+            if sess.query(Position).filter_by(symbol=symbol).first():
+                continue
+
+            price = get_price_usdt(client, asset)
+            if price <= ZERO:
+                logger.warning(f"Could not get price for {asset}, skipping import")
+                continue
+
             maker_fee, _ = get_trade_fees(client, symbol)
-            pos = Position(symbol=symbol, quantity=Decimal(str(qty)), avg_entry_price=price, buy_fee_rate=maker_fee)
+            pos = Position(
+                symbol=symbol,
+                quantity=Decimal(str(qty)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN),
+                avg_entry_price=price,
+                buy_fee_rate=Decimal(str(maker_fee))
+            )
             sess.add(pos)
-    except: pass
+            logger.info(f"Imported existing position {symbol}: {qty} @ {price}")
+    except Exception as e:
+        logger.error(f"import_owned_assets_to_db failed: {e}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_price_usdt(client, asset: str) -> Decimal:
@@ -514,22 +533,17 @@ def get_price_usdt(client, asset: str) -> Decimal:
 def set_terminal_background_and_title():
     """Set terminal background to navy blue and title to BRIGHT YELLOW."""
     try:
-        # ANSI: Window title in BRIGHT YELLOW (38;5;226m)
         print("TRADING BOT – LIVE")
-
-        # Navy blue background for the whole screen
         print("\033[48;5;17m", end='')
-
-        # Clear screen + move cursor (preserves background)
         print("\033[2J\033[H", end='')
     except:
-        pass  # Silent on non-ANSI terminals
+        pass
 
 # === PROFESSIONAL DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED) ===============
 def print_professional_dashboard(client):
     try:
         with dashboard_lock:
-            set_terminal_background_and_title()  # <-- NEW: FULL BLUE BG + GREEN TITLE 
+            set_terminal_background_and_title()
             os.system('cls' if os.name == 'nt' else 'clear')
             now = now_cst()
             usdt_free = get_balance(client, 'USDT')
@@ -543,12 +557,9 @@ def print_professional_dashboard(client):
             RESET = "\033[0m"
             BOLD = "\033[1m"
 
-            # ──────────────────────────────────────────────────────────────
-            # Header – **no explicit yellow title colour any more**
             print(f"{NAVY}{'='*120}{RESET}")
             print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
             print(f"{NAVY}{'='*120}{RESET}")
-            # ──────────────────────────────────────────────────────────────
 
             print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
             print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
@@ -583,18 +594,36 @@ def print_professional_dashboard(client):
                     age = datetime.now(CST_TZ) - pos.updated_at.replace(tzinfo=CST_TZ)
                     age_str = str(age).split('.')[0]
 
-                    signal = ""
-                    if rsi and rsi <= RSI_OVERSOLD and trend == 'bullish':
-                        signal = "BUY DIP"
-                    elif rsi and rsi >= RSI_OVERBOUGHT:
-                        signal = "SELL TOP"
-
                     color = GREEN if net_profit > 0 else RED
-                    print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {age_str:>12} {signal}{RESET}")
+                    print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {age_str:>12}{RESET}")
 
                 print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
                 pnl_color = GREEN if total_pnl > 0 else RED
                 print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}")
+
+                # === NEW SECTION: LIST OF ACTIVELY MANAGED POSITIONS ===
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+                print(f"{NAVY}{BOLD}{YELLOW}{'LIST OF ACTIVELY MANAGED POSITIONS':^120}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+                if db_positions:
+                    print(f"{NAVY}{YELLOW}{'SYMBOL':<12} {'QTY':>12} {'STATUS':<50}{RESET}")
+                    print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+                    for pos in db_positions:
+                        symbol = pos.symbol
+                        qty = float(pos.quantity)
+                        rsi, trend, _ = get_rsi_and_trend(client, symbol)
+                        if rsi is not None and rsi <= RSI_OVERSOLD and trend == 'bullish':
+                            status = "24/7 watching for buy low opportunity"
+                        elif rsi is not None and rsi >= RSI_OVERBOUGHT:
+                            status = "24/7 watching to sell at top"
+                        else:
+                            status = "monitoring"
+                        print(f"{NAVY}{YELLOW}{symbol:<12} {qty:>12.6f} {status:<50}{RESET}")
+                else:
+                    print(f"{NAVY}{YELLOW} No positions in database.{RESET}")
+                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
             else:
                 print(f"{NAVY}{YELLOW} No active positions.{RESET}")
 
