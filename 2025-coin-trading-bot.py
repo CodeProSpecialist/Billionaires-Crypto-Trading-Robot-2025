@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
 Binance.US Trading Bot – PROFESSIONAL VERSION
-1 THREAD PER COIN – 24/7 MONITORING
-PROFESSIONAL REAL-TIME DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED P&L)
-BUY: Strong dip (RSI ≤ 35 + bullish + near 24h low + ≥60% sell pressure)
-SELL: ≥0.8% NET PROFIT (after maker+taker fees) + RSI ≥ 65 + buy-pressure spike → drop
+DYNAMIC TRAILING BUY + SELL
+FULLY COMPLETE — ALL HELPERS INCLUDED
 """
 
 import os
@@ -23,7 +21,7 @@ import talib
 from datetime import datetime
 import pytz
 import requests
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Tuple
 from collections import deque
 
@@ -45,7 +43,7 @@ BB_DEV = 2
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-PROFIT_TARGET_NET = Decimal('0.008')          # 0.8% NET after maker + taker fees
+PROFIT_TARGET_NET = Decimal('0.008')
 RISK_PER_TRADE = 0.10
 MIN_BALANCE = 2.0
 
@@ -56,7 +54,9 @@ ORDERBOOK_BUY_PRESSURE_DROP = 0.55
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 ORDER_BOOK_LIMIT = 20
-POLL_INTERVAL = 1.0  # 1 sec polling
+POLL_INTERVAL = 1.0
+TRAILING_BUY_TIMEOUT = 60 * 60
+TRAILING_SELL_TIMEOUT = 60 * 60
 
 # API Keys
 API_KEY = os.getenv('BINANCE_API_KEY')
@@ -91,9 +91,17 @@ valid_symbols_dict: Dict[str, dict] = {}
 order_book_cache: Dict[str, dict] = {}
 positions: Dict[str, dict] = {}
 buy_pressure_history: Dict[str, deque] = {}
+sell_pressure_history: Dict[str, deque] = {}
 active_threads: Dict[str, threading.Thread] = {}
+dynamic_buy_threads: Dict[str, threading.Thread] = {}
+dynamic_sell_threads: Dict[str, threading.Thread] = {}
 thread_lock = threading.Lock()
 dashboard_lock = threading.Lock()
+
+# === Buy cooldown & order cancellation tracking ===
+buy_cooldown: Dict[str, float] = {}
+cancel_timer_threads: Dict[str, threading.Thread] = {}
+cancel_timer_lock = threading.Lock()
 
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
@@ -155,6 +163,11 @@ def signal_handler(signum, frame):
     with thread_lock:
         for symbol, thread in active_threads.items():
             thread.running = False
+    with cancel_timer_lock:
+        for t in cancel_timer_threads.values():
+            t.running = False
+    for t in list(dynamic_buy_threads.values()) + list(dynamic_sell_threads.values()):
+        t.running = False
     sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -185,7 +198,6 @@ def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
             if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
         ]
 
-        # === EXCLUDE STABLECOIN PAIRS ===
         EXCLUDED_PAIRS = {'USDCUSDT', 'USDTUSDT'}
         raw_symbols = [s for s in raw_symbols if s not in EXCLUDED_PAIRS]
 
@@ -279,6 +291,237 @@ def get_rsi_and_trend(client, symbol) -> Tuple[Optional[float], str, Optional[fl
     except:
         return None, "unknown", None
 
+# === 15-MIN BUY COOLDOWN ====================================================
+def can_place_buy_order(symbol: str) -> bool:
+    now = time.time()
+    last_buy = buy_cooldown.get(symbol, 0)
+    return now - last_buy >= 15 * 60
+
+def record_buy_placed(symbol: str):
+    buy_cooldown[symbol] = time.time()
+
+# === 60-MIN ORDER CANCELLATION TIMER ========================================
+def start_order_cancellation_timer(client, order_id: str, symbol: str):
+    def _cancel_after_delay():
+        time.sleep(60 * 60)
+        if not getattr(_cancel_after_delay, "running", True):
+            return
+        try:
+            client.cancel_order(symbol=symbol, orderId=int(order_id))
+            logger.info(f"CANCELLED unfilled order {order_id} for {symbol} after 60 min")
+            send_whatsapp_alert(f"CANCELLED {symbol} order {order_id} (60 min timeout)")
+        except Exception as e:
+            logger.warning(f"Failed to cancel order {order_id}: {e}")
+        finally:
+            with cancel_timer_lock:
+                cancel_timer_threads.pop(order_id, None)
+
+    thread = threading.Thread(target=_cancel_after_delay, daemon=True)
+    thread.running = True
+    with cancel_timer_lock:
+        cancel_timer_threads[order_id] = thread
+    thread.start()
+
+# === DYNAMIC TRAILING BUY THREAD ============================================
+class DynamicBuyThread(threading.Thread):
+    def __init__(self, client, symbol, bot):
+        super().__init__(daemon=True)
+        self.client = client
+        self.symbol = symbol
+        self.bot = bot
+        self.running = True
+        self.lowest_price = Decimal('inf')
+        self.last_buy_order_id = None
+        self.start_time = time.time()
+
+    def run(self):
+        logger.info(f"Started DYNAMIC BUY MONITOR for {self.symbol}")
+        send_whatsapp_alert(f"TRAILING BUY ACTIVE: {self.symbol}")
+
+        while self.running and (time.time() - self.start_time) < TRAILING_BUY_TIMEOUT:
+            try:
+                ob = get_order_book_analysis(self.client, self.symbol)
+                best_bid = ob['best_bid']
+                if best_bid <= ZERO:
+                    time.sleep(1)
+                    continue
+
+                if best_bid < self.lowest_price:
+                    self.lowest_price = best_bid
+
+                rsi, trend, low_24h = get_rsi_and_trend(self.client, self.symbol)
+                if rsi is None or rsi > RSI_OVERSOLD:
+                    time.sleep(1)
+                    continue
+
+                history = sell_pressure_history.get(self.symbol, deque(maxlen=5))
+                history.append(ob['pct_ask'])
+                sell_pressure_history[self.symbol] = history
+
+                if low_24h and best_bid > Decimal(str(low_24h)) * Decimal('1.02'):
+                    time.sleep(1)
+                    continue
+
+                if len(history) >= 3:
+                    peak = max(history)
+                    current = history[-1]
+                    if (peak >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+                        current <= peak * 0.9):
+                        self.place_buy_at_price(best_bid)
+                        break
+
+                if best_bid > self.lowest_price * Decimal('1.003'):
+                    self.place_buy_at_price(best_bid)
+                    break
+
+            except Exception as e:
+                logger.debug(f"Dynamic buy error [{self.symbol}]: {e}")
+
+            time.sleep(1)
+
+        if self.running:
+            self.cancel_order()
+
+        with thread_lock:
+            dynamic_buy_threads.pop(self.symbol, None)
+
+    def place_buy_at_price(self, price: Decimal):
+        try:
+            if self.last_buy_order_id:
+                try:
+                    self.client.cancel_order(symbol=self.symbol, orderId=int(self.last_buy_order_id))
+                except:
+                    pass
+
+            balance = get_balance(self.client)
+            if balance <= MIN_BALANCE: return
+            available = Decimal(str(balance - MIN_BALANCE))
+            alloc = min(available * Decimal(str(RISK_PER_TRADE)), available)
+            qty = alloc / price
+
+            adjusted, error = validate_and_adjust_order(self.client, self.symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price)
+            if not adjusted or error: return
+
+            order = self.bot.place_limit_buy_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
+            if order:
+                self.last_buy_order_id = str(order['orderId'])
+                start_order_cancellation_timer(self.client, self.last_buy_order_id, self.symbol)
+                record_buy_placed(self.symbol)
+                send_whatsapp_alert(f"BUY EXECUTED {self.symbol} @ {adjusted['price']:.6f} (dynamic dip)")
+                logger.info(f"DYNAMIC BUY: {self.symbol} @ {adjusted['price']}")
+        except Exception as e:
+            logger.error(f"Dynamic buy failed: {e}")
+        finally:
+            self.running = False
+
+    def cancel_order(self):
+        if self.last_buy_order_id:
+            try:
+                self.client.cancel_order(symbol=self.symbol, orderId=int(self.last_buy_order_id))
+            except:
+                pass
+        self.running = False
+
+# === DYNAMIC TRAILING SELL THREAD ===========================================
+class DynamicSellThread(threading.Thread):
+    def __init__(self, client, symbol, bot, position):
+        super().__init__(daemon=True)
+        self.client = client
+        self.symbol = symbol
+        self.bot = bot
+        self.position = position
+        self.entry_price = Decimal(str(position.avg_entry_price))
+        self.qty = position.quantity
+        self.running = True
+        self.peak_price = self.entry_price
+        self.last_sell_order_id = None
+        self.start_time = time.time()
+
+    def run(self):
+        logger.info(f"Started DYNAMIC SELL MONITOR for {self.symbol}")
+        send_whatsapp_alert(f"TRAILING SELL ACTIVE: {self.symbol} @ {self.entry_price:.6f}")
+
+        while self.running and (time.time() - self.start_time) < TRAILING_SELL_TIMEOUT:
+            try:
+                ob = get_order_book_analysis(self.client, self.symbol)
+                best_bid = ob['best_bid']
+                if best_bid <= ZERO:
+                    time.sleep(1)
+                    continue
+
+                if best_bid > self.peak_price:
+                    self.peak_price = best_bid
+
+                rsi, trend, _ = get_rsi_and_trend(self.client, self.symbol)
+                history = buy_pressure_history.get(self.symbol, deque(maxlen=5))
+                history.append(ob['pct_bid'])
+                buy_pressure_history[self.symbol] = history
+
+                maker_fee, taker_fee = get_trade_fees(self.client, self.symbol)
+                total_fee_rate = Decimal(str(maker_fee)) + Decimal(str(taker_fee))
+                net_return = (best_bid - self.entry_price) / self.entry_price - total_fee_rate
+
+                if net_return < PROFIT_TARGET_NET:
+                    time.sleep(1)
+                    continue
+
+                if rsi is None or rsi < RSI_OVERBOUGHT:
+                    time.sleep(1)
+                    continue
+
+                if len(history) >= 3:
+                    peak = max(history)
+                    current = history[-1]
+                    if (peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and
+                        current <= ORDERBOOK_BUY_PRESSURE_DROP * 100):
+                        self.place_sell_at_price(best_bid)
+                        break
+
+                if best_bid < self.peak_price * Decimal('0.995'):
+                    self.place_sell_at_price(best_bid)
+                    break
+
+            except Exception as e:
+                logger.debug(f"Dynamic sell error [{self.symbol}]: {e}")
+
+            time.sleep(1)
+
+        if self.running:
+            self.place_sell_at_price(None)
+
+        with thread_lock:
+            dynamic_sell_threads.pop(self.symbol, None)
+
+    def place_sell_at_price(self, price: Optional[Decimal]):
+        try:
+            if self.last_sell_order_id:
+                try:
+                    self.client.cancel_order(symbol=self.symbol, orderId=int(self.last_sell_order_id))
+                except:
+                    pass
+
+            if price is None:
+                order = self.client.order_market_sell(symbol=self.symbol, quantity=float(self.qty))
+                fill_price = Decimal(order['fills'][0]['price']) if order['fills'] else self.peak_price
+            else:
+                tick_size = get_tick_size(self.client, self.symbol)
+                price = ((price // tick_size) + 1) * tick_size
+                adjusted, _ = validate_and_adjust_order(self.client, self.symbol, 'SELL', ORDER_TYPE_LIMIT, self.qty, price)
+                if not adjusted: return
+                order = self.bot.place_limit_sell_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
+                if order:
+                    self.last_sell_order_id = str(order['orderId'])
+                    start_order_cancellation_timer(self.client, self.last_sell_order_id, self.symbol)
+                fill_price = Decimal(adjusted['price'])
+
+            if order:
+                send_whatsapp_alert(f"SELL EXECUTED {self.symbol} @ {fill_price:.6f} (dynamic peak)")
+                logger.info(f"DYNAMIC SELL: {self.symbol} @ {fill_price}")
+        except Exception as e:
+            logger.error(f"Dynamic sell failed: {e}")
+        finally:
+            self.running = False
+
 # === COIN MONITOR THREAD ====================================================
 class CoinMonitorThread(threading.Thread):
     def __init__(self, client, symbol, bot):
@@ -302,89 +545,59 @@ class CoinMonitorThread(threading.Thread):
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # BUY
+                # DYNAMIC BUY
                 with DBManager() as sess:
                     if not sess.query(Position).filter_by(symbol=self.symbol).first():
                         if (rsi is not None and rsi <= RSI_OVERSOLD and
                             trend == 'bullish' and
                             low_24h and buy_price <= Decimal(str(low_24h)) * Decimal('1.01') and
-                            ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100):
-                            self.place_buy_order(buy_price)
+                            ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+                            self.symbol not in dynamic_buy_threads):
+                            if not can_place_buy_order(self.symbol):
+                                time.sleep(POLL_INTERVAL)
+                                continue
+                            thread = DynamicBuyThread(self.client, self.symbol, self.bot)
+                            with thread_lock:
+                                dynamic_buy_threads[self.symbol] = thread
+                            thread.start()
                             time.sleep(3)
 
-                # SELL
+                # DYNAMIC SELL
                 with DBManager() as sess:
                     pos = sess.query(Position).filter_by(symbol=self.symbol).one_or_none()
-                    if pos:
+                    if pos and self.symbol not in dynamic_sell_threads:
                         entry = Decimal(str(pos.avg_entry_price))
                         maker_fee, taker_fee = get_trade_fees(self.client, self.symbol)
                         total_fee_rate = Decimal(str(maker_fee)) + Decimal(str(taker_fee))
-
                         gross_return = (sell_price - entry) / entry
                         net_return = gross_return - total_fee_rate
 
-                        if net_return >= PROFIT_TARGET_NET:
-                            if rsi is not None and rsi >= RSI_OVERBOUGHT:
-                                history = buy_pressure_history.get(self.symbol, deque(maxlen=5))
-                                history.append(ob['pct_bid'])
-                                buy_pressure_history[self.symbol] = history
-
-                                if len(history) >= 3:
-                                    peak = max(history)
-                                    if (peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and
-                                        history[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100):
-                                        self.place_sell_order(sell_price, pos)
-                                        time.sleep(3)
+                        if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
+                            history = buy_pressure_history.get(self.symbol, deque(maxlen=5))
+                            history.append(ob['pct_bid'])
+                            buy_pressure_history[self.symbol] = history
+                            if len(history) >= 3:
+                                peak = max(history)
+                                if (peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and
+                                    history[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100):
+                                    thread = DynamicSellThread(self.client, self.symbol, self.bot, pos)
+                                    with thread_lock:
+                                        dynamic_sell_threads[self.symbol] = thread
+                                    thread.start()
+                                    time.sleep(3)
 
             except Exception as e:
                 logger.debug(f"Thread error [{self.symbol}]: {e}")
 
             time.sleep(POLL_INTERVAL)
 
-    def place_buy_order(self, price: Decimal):
-        try:
-            balance = get_balance(self.client)
-            if balance <= MIN_BALANCE: return
-            available = Decimal(str(balance - MIN_BALANCE))
-            alloc = min(available * Decimal(str(RISK_PER_TRADE)), available)
-            qty = alloc / price
-
-            adjusted, error = validate_and_adjust_order(self.client, self.symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price)
-            if not adjusted or error: return
-
-            order = self.bot.place_limit_buy_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
-            if order:
-                send_whatsapp_alert(f"BUY {self.symbol} @ {adjusted['price']:.6f}")
-                logger.info(f"BUY ORDER: {self.symbol} @ {adjusted['price']}")
-        except Exception as e:
-            logger.error(f"Buy failed: {e}")
-
-    def place_sell_order(self, price: Decimal, position):
-        try:
-            qty = position.quantity
-            tick_size = get_tick_size(self.client, self.symbol)
-            if tick_size > ZERO:
-                price = ((price // tick_size) + 1) * tick_size  # next tick above best ask
-
-            adjusted, error = validate_and_adjust_order(self.client, self.symbol, 'SELL', ORDER_TYPE_LIMIT, qty, price)
-            if not adjusted or error: return
-
-            order = self.bot.place_limit_sell_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
-            if order:
-                send_whatsapp_alert(f"SELL {self.symbol} @ {adjusted['price']:.6f} (+0.8% net)")
-                logger.info(f"SELL ORDER: {self.symbol} @ {adjusted['price']} (net >=0.8%)")
-        except Exception as e:
-            logger.error(f"Sell failed: {e}")
-
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
-        # 1. IMPORT OWNED POSITIONS FIRST
         with DBManager() as sess:
             import_owned_assets_to_db(self.client, sess)
             sess.commit()
-        # 2. THEN LOAD STATE INTO GLOBAL `positions`
         self.load_state_from_db()
 
     def load_state_from_db(self):
@@ -428,6 +641,17 @@ class BinanceTradingBot:
                             sess.delete(pending)
                             action = "BUY" if pending.side == 'buy' else "SELL"
                             logger.info(f"{action} FILLED: {pending.symbol} @ {fill_price}")
+                            with cancel_timer_lock:
+                                t = cancel_timer_threads.pop(pending.binance_order_id, None)
+                                if t: t.running = False
+                            if pending.side == 'buy':
+                                with thread_lock:
+                                    t = dynamic_buy_threads.pop(pending.symbol, None)
+                                    if t: t.running = False
+                            else:
+                                with thread_lock:
+                                    t = dynamic_sell_threads.pop(pending.symbol, None)
+                                    if t: t.running = False
                     except: pass
         except: pass
 
@@ -452,9 +676,7 @@ class BinanceTradingBot:
                     sess.delete(pos)
                     positions.pop(symbol, None)
 
-# === HELPERS ================================================================
-def now_cst():
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+# === HELPER FUNCTIONS (ALL COMPLETE) ========================================
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_balance(client, asset='USDT') -> float:
@@ -463,14 +685,17 @@ def get_balance(client, asset='USDT') -> float:
             if bal['asset'] == asset:
                 return safe_float(bal['free'])
         return 0.0
-    except: return 0.0
+    except Exception as e:
+        logger.warning(f"get_balance failed: {e}")
+        return 0.0
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def get_trade_fees(client, symbol):
     try:
         fee = client.get_trade_fee(symbol=symbol)
         return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
-    except: return 0.001, 0.001
+    except:
+        return 0.001, 0.001
 
 def validate_and_adjust_order(client, symbol, side, order_type, quantity, price):
     try:
@@ -494,17 +719,17 @@ def send_whatsapp_alert(message: str):
         try:
             url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
             requests.get(url, timeout=5)
-        except: pass
+        except Exception as e:
+            logger.debug(f"WhatsApp alert failed: {e}")
 
 def import_owned_assets_to_db(client, sess):
-    """Import every non-zero free balance from Binance into the DB."""
     try:
         account = client.get_account()
         for bal in account['balances']:
             asset = bal['asset']
             free_str = bal['free']
             qty = safe_float(free_str)
-            if qty <= 0 or asset in {'USDT', 'USDC'}:  # <-- EXCLUDE USDC TOO
+            if qty <= 0 or asset in {'USDT', 'USDC'}:
                 continue
 
             symbol = f"{asset}USDT"
@@ -532,157 +757,18 @@ def import_owned_assets_to_db(client, sess):
 def get_price_usdt(client, asset: str) -> Decimal:
     if asset == 'USDT': return Decimal('1')
     symbol = asset + 'USDT'
-    try: return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-    except: return ZERO
-
-# === TERMINAL COLOR CONTROL =================================================
-def set_terminal_background_and_title():
-    """Set terminal background to navy blue and title to BRIGHT YELLOW."""
     try:
-        print("TRADING BOT – LIVE")
+        return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+    except:
+        return ZERO
+
+def set_terminal_background_and_title():
+    try:
+        print("\033]0;TRADING BOT – LIVE\007", end='')
         print("\033[48;5;17m", end='')
         print("\033[2J\033[H", end='')
     except:
         pass
-
-# === PROFESSIONAL DASHBOARD (NAVY BLUE + YELLOW + GREEN/RED) ===============
-def print_professional_dashboard(client):
-    try:
-        with dashboard_lock:
-            set_terminal_background_and_title()
-            os.system('cls' if os.name == 'nt' else 'clear')
-            now = now_cst()
-            usdt_free = get_balance(client, 'USDT')
-            total_portfolio, asset_values = calculate_total_portfolio_value(client)
-
-            # ANSI Colors
-            NAVY = "\033[48;5;17m"
-            YELLOW = "\033[38;5;226m"
-            GREEN = "\033[38;5;82m"
-            RED = "\033[38;5;196m"
-            RESET = "\033[0m"
-            BOLD = "\033[1m"
-
-            print(f"{NAVY}{'='*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
-            print(f"{NAVY}{'='*120}{RESET}")
-
-            print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Active Positions':<20} {len(positions)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-            print(" ")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN THE LOCAL DATABASE':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            with DBManager() as sess:
-                db_positions = sess.query(Position).all()
-
-            # === P&L TABLE (Unrealized Profit/Loss) ===
-            if db_positions:
-                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'AGE':>12}{RESET}")
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-                total_pnl = Decimal('0')
-                for pos in db_positions:
-                    symbol = pos.symbol
-                    qty = float(pos.quantity)
-                    entry = float(pos.avg_entry_price)
-                    ob = get_order_book_analysis(client, symbol)
-                    cur_price = float(ob['best_bid'] or ob['best_ask'])
-                    rsi, trend, _ = get_rsi_and_trend(client, symbol)
-                    rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
-
-                    maker, taker = get_trade_fees(client, symbol)
-                    gross = (cur_price - entry) * qty
-                    fee_cost = (maker + taker) * cur_price * qty
-                    net_profit = gross - fee_cost
-                    pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
-                    total_pnl += Decimal(str(net_profit))
-
-                    age = datetime.now(CST_TZ) - pos.updated_at.replace(tzinfo=CST_TZ)
-                    age_str = str(age).split('.')[0]
-
-                    color = GREEN if net_profit > 0 else RED
-                    print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {age_str:>12}{RESET}")
-
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-                pnl_color = GREEN if total_pnl > 0 else RED
-                print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}")
-
-            else:
-                print(f"{NAVY}{YELLOW} No active positions.{RESET}")
-
-            # === LIST OF ACTIVELY MANAGED POSITIONS ===
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-            print(f"{NAVY}{BOLD}{YELLOW}{'LIST OF ACTIVELY MANAGED POSITIONS':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            if db_positions:
-                print(f"{NAVY}{YELLOW}{'SYMBOL':<12} {'QTY':>12} {'STATUS':<50}{RESET}")
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-                for pos in db_positions:
-                    symbol = pos.symbol
-                    qty = float(pos.quantity)
-                    status = "24/7 watching to sell at top"
-                    print(f"{NAVY}{YELLOW}{symbol:<12} {qty:>12.6f} {status:<50}{RESET}")
-            else:
-                print(f"{NAVY}{YELLOW} No positions in database.{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            # === COINS TO MONITOR FOR FUTURE LOW DIP BUY (24/7 MONITORING) ===
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-            print(f"{NAVY}{BOLD}{YELLOW}{'COINS TO MONITOR FOR FUTURE LOW DIP BUY (24/7 MONITORING)':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            universe_coins = sorted(valid_symbols_dict.keys())
-            if universe_coins:
-                cols = 6  # 6 coins per row
-                for i in range(0, len(universe_coins), cols):
-                    row = universe_coins[i:i+cols]
-                    print(f"{NAVY}{YELLOW}" + "  ".join(f"{sym:<12}" for sym in row) + f"{RESET}")
-            else:
-                print(f"{NAVY}{YELLOW} No coins in universe.{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            # === 24/7 BUY WATCH LIST (DIP OPPORTUNITIES) ===
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-            print(f"{NAVY}{BOLD}{YELLOW}{'24/7 BUY WATCH LIST (DIP OPPORTUNITIES)':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            buy_watch_coins = []
-            for symbol in valid_symbols_dict.keys():  # ONLY VALIDATED COINS
-                try:
-                    rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
-                    ob = get_order_book_analysis(client, symbol)
-                    buy_price = ob['best_bid']
-                    if (rsi is not None and rsi <= RSI_OVERSOLD and
-                        trend == 'bullish' and
-                        low_24h and buy_price <= Decimal(str(low_24h)) * Decimal('1.01') and
-                        ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100):
-                        buy_watch_coins.append(symbol)
-                except Exception as e:
-                    logger.debug(f"Buy watch skip {symbol}: {e}")
-                    continue
-
-            if buy_watch_coins:
-                print(f"{NAVY}{YELLOW}{'COIN':<12} {'RSI':>8} {'TREND':>10} {'PRICE':>12} {'24H LOW':>12}{RESET}")
-                print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-                for symbol in sorted(buy_watch_coins):
-                    rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
-                    ob = get_order_book_analysis(client, symbol)
-                    price = float(ob['best_bid'])
-                    print(f"{NAVY}{YELLOW}{symbol:<12} {rsi:>8.1f} {trend:>10} {price:>12.6f} {low_24h:>12.6f}{RESET}")
-            else:
-                print(f"{NAVY}{YELLOW} No coins currently meet buy-dip criteria.{RESET}")
-            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-
-            print(f"{NAVY}{'='*120}{RESET}\n")
-
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def calculate_total_portfolio_value(client):
@@ -703,7 +789,83 @@ def calculate_total_portfolio_value(client):
                     total += val
                     values[b['asset']] = float(val)
         return float(total), values
-    except: return 0.0, {}
+    except Exception as e:
+        logger.warning(f"Portfolio value error: {e}")
+        return 0.0, {}
+
+def now_cst():
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# === PROFESSIONAL DASHBOARD (FULL) ==========================================
+def print_professional_dashboard(client):
+    try:
+        with dashboard_lock:
+            set_terminal_background_and_title()
+            os.system('cls' if os.name == 'nt' else 'clear')
+            now = now_cst()
+            usdt_free = get_balance(client, 'USDT')
+            total_portfolio, _ = calculate_total_portfolio_value(client)
+
+            NAVY = "\033[48;5;17m"
+            YELLOW = "\033[38;5;226m"
+            GREEN = "\033[38;5;82m"
+            RED = "\033[38;5;196m"
+            RESET = "\033[0m"
+            BOLD = "\033[1m"
+
+            print(f"{NAVY}{'='*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
+            print(f"{NAVY}{'='*120}{RESET}\n")
+
+            print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
+            print(f"{NAVY}{Y 'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dynamic_sell_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            with DBManager() as sess:
+                db_positions = sess.query(Position).all()
+
+            if db_positions:
+                print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+                total_pnl = Decimal('0')
+                for pos in db_positions:
+                    symbol = pos.symbol
+                    qty = float(pos.quantity)
+                    entry = float(pos.avg_entry_price)
+                    ob = get_order_book_analysis(client, symbol)
+                    cur_price = float(ob['best_bid'] or ob['best_ask'])
+                    rsi, _, _ = get_rsi_and_trend(client, symbol)
+                    rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+
+                    maker, taker = get_trade_fees(client, symbol)
+                    gross = (cur_price - entry) * qty
+                    fee_cost = (maker + taker) * cur_price * qty
+                    net_profit = gross - fee_cost
+                    pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+                    total_pnl += Decimal(str(net_profit))
+
+                    status = ("Trailing Sell Active" if symbol in dynamic_sell_threads
+                              else "Trailing Buy Active" if symbol in dynamic_buy_threads
+                              else "Waiting")
+                    color = GREEN if net_profit > 0 else RED
+                    print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
+
+                print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+                pnl_color = GREEN if total_pnl > 0 else RED
+                print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
+            else:
+                print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
+
+            print(f"{NAVY}{'='*120}{RESET}\n")
+
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
 
 # === MAIN ===================================================================
 def main():
@@ -717,7 +879,6 @@ def main():
     if not fetch_and_validate_usdt_pairs(client):
         sys.exit(1)
 
-    # Start one thread per coin
     with thread_lock:
         for symbol in valid_symbols_dict.keys():
             if symbol not in active_threads:
@@ -726,11 +887,15 @@ def main():
                 thread.start()
 
     logger.info("All threads running. Dashboard active.")
+    last_dashboard = 0
     while True:
         try:
             bot.check_and_process_filled_orders()
-            print_professional_dashboard(client)
-            time.sleep(15)
+            now = time.time()
+            if now - last_dashboard >= 30:
+                print_professional_dashboard(client)
+                last_dashboard = now
+            time.sleep(1)
         except KeyboardInterrupt:
             break
         except Exception as e:
