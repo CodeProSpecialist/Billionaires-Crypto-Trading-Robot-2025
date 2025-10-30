@@ -138,7 +138,7 @@ AVAXUSDT  +1.89%  68.4
 ## How to Run
 
 ```bash
-python 2025-coin-trading-bot.py
+python3 2025-coin-trading-bot.py
 ```
 
 > Press **Ctrl+C** to shut down gracefully.
