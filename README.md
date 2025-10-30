@@ -64,7 +64,7 @@ A high-performance, production-grade **automated trading bot** for **Binance.US*
 | `ORDERBOOK_BUY_PRESSURE_SPIKE` | 65% → 55% drop |
 
 ---
-
+********
 ## Dashboard Preview (Live Terminal)
 
 ```
@@ -112,7 +112,7 @@ SOLUSDT   +3.42%  70.1
 AVAXUSDT  +1.89%  68.4
 ========================================================================================================================
 ```
-
+********
 ---
 
 ## Database Schema
