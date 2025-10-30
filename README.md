@@ -80,7 +80,7 @@ This also fixes any program startup errors. )
 | `RSI` | 14-period RSI (1m) |
 | `P&L%` | **Net return %** after **maker + taker fees** |
 | `PROFIT` | **Net unrealized profit/loss in USDT** |
-| `STATUS` | `Trailing Sell Active` / `Trailing Buy Active` / `Waiting` |
+| `STATUS` | `Trailing Sell Active` / `Trailing Buy Active` / `24/7 Monitoring` |
 
 > **Color Coding**:
 > - **Green** → Positive P&L
