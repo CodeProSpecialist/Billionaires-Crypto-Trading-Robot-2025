@@ -907,7 +907,7 @@ def print_professional_dashboard(client):
 
                     status = ("Trailing Sell Active" if symbol in dynamic_sell_threads
                               else "Trailing Buy Active" if symbol in dynamic_buy_threads
-                              else "Waiting")
+                              else "24/7 Monitoring")
                     color = GREEN if net_profit > 0 else RED
                     print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
 
