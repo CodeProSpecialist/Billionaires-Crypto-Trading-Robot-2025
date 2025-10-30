@@ -13,145 +13,203 @@ completed on October 30, 2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-**Binance.US Trading Bot – Professional Version**  
-*1 thread per coin • 24/7 real-time monitoring • Navy blue + yellow + green/red P&L dashboard*
+**Trading Bot – Professional Version**  
+*1 thread per coin • 24/7 real-time monitoring • ## **Complete Dashboard Features & Scenarios**  
+*(For the **Dynamic Trailing Bot** — Terminal-based, real-time, color-coded UI)*
 
 ---
 
-### **Core Strategy Summary (Buy & Sell Logic)**
-
-- **BUY Signal** → **Strong Dip Entry**  
-  - **RSI ≤ 35** *(oversold)*  
-  - **Trend = Bullish** *(price above Bollinger middle + MACD > signal)*  
-  - **Price near 24h low** *(≤ 1.01 × 24h low)*  
-  - **≥60% sell pressure** *(order book ask volume ≥60% of top 5 levels)*
-
-- **SELL Signal** → **Take Profit + Momentum Reversal**  
-  - **≥0.8% NET profit** *(after maker + taker fees)*  
-  - **RSI ≥ 65** *(overbought)*  
-  - **Buy pressure spike → drop**:  
-    - Peak buy pressure ≥65%  
-    - Current buy pressure drops to ≤55%  
-    → *Confirms fading momentum after profit*
+### **Dashboard Overview**
+- **Refresh Rate**: Every **30 seconds**
+- **Terminal-based** (ANSI colors, fixed-width)
+- **Full-screen layout** with **5 main sections**
+- **Live, reactive** — reflects **real-time bot state**
+- **No external dependencies** beyond `python-binance` and standard libraries
 
 ---
 
-### **Architecture & Execution Model**
+## **1. Header Section (Top Banner)**
 
-- **One dedicated thread per USDT pair**  
-  → Parallel, independent 24/7 monitoring  
-  → Polls every **1 second**
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                         TRADING BOT – LIVE DASHBOARD                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-- **Real-time data sources**  
-  - 1-minute klines (last 100) → RSI, MACD, Bollinger Bands  
-  - Order book depth (top 5 bid/ask) → buy/sell pressure  
-  - 24h ticker stats → volume, low/high filtering
-
-- **Symbol filtering (on startup & retry)**  
-  - Only **USDT pairs** in `TRADING` status  
-  - Price: **$0.01 – $1,000**  
-  - 24h volume: **≥ $100,000 USDT**  
-  → Ensures liquidity & tradeability
+- **Navy blue background**, **yellow bold title**
+- Always visible — confirms bot is **running**
 
 ---
 
-### **Risk & Position Management**
+## **2. System Status Panel**
 
-- **Risk per trade**: **10% of available USDT**  
-  - `available = free USDT – $2.00 (buffer)`  
-  - Position size = `min(10% of available, full available)`
+| Field | Description | Example |
+|------|------------|--------|
+| `Time (CST)` | Current time in **Chicago timezone** | `2025-10-30 14:22:01 CDT` |
+| `Available USDT` | **Free USDT balance** (after reserving $2) | `$1,234.567890` |
+| `Portfolio Value` | **Total value** of all positions + USDT | `$5,678.901234` |
+| `Active Threads` | Number of **per-symbol monitor threads** | `42` |
+| `Trailing Buys` | Active **DynamicBuyThread** count | `2` |
+| `Trailing Sells` | Active **DynamicSellThread** count | `1` |
 
-- **Position tracking via SQLAlchemy + SQLite**  
-  - Tables: `trades`, `pending_orders`, `positions`  
-  - Tracks: entry price, quantity, fees, fill time, order IDs  
-  - Supports **partial fills** & **average cost recalculation**
-
-- **Fee-aware profit calculation**  
-  - Uses actual **maker/taker rates** per symbol  
-  - Net P&L = Gross – (maker + taker fees)
+> **Colors**: All labels in **yellow**, values in **white** on navy
 
 ---
 
-### **Order Execution & Validation**
+## **3. Positions Table**  
+*(Only appears if `Position` records exist in DB)*
 
-- **Limit orders only** → precise entry/exit  
-- **Tick size & lot size compliance**  
-  - Auto-adjusts price & quantity to exchange rules  
-  - Rounds down to valid step/tick
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                            POSITIONS IN DATABASE                                         │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ SYMBOL     QTY        ENTRY      CURRENT   RSI  P&L%   PROFIT   STATUS                  │
+│ BTCUSDT  0.012345   63200.00   63850.00  68.2  +0.95%  +7.82  Trailing Sell Active     │
+│ ETHUSDT  0.456789   2450.00    2480.00   32.1  -0.10%  -0.56  Trailing Buy Active      │
+│ SOLUSDT  1.234567   180.00     175.50    28.5  -2.40%  -5.55  Waiting                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-- **Order lifecycle tracking**  
-  1. Place limit order → save to `pending_orders`  
-  2. Poll Binance → detect `FILLED`  
-  3. Record fill → update `trades` + `positions`  
-  4. Delete pending order
+### **Columns Explained**
+| Column | Meaning |
+|-------|--------|
+| `SYMBOL` | Trading pair |
+| `QTY` | Current position size |
+| `ENTRY` | **Average entry price** (volume-weighted) |
+| `CURRENT` | **Live best bid** (or ask if no bid) |
+| `RSI` | 14-period RSI (1m) |
+| `P&L%` | **Net return %** after **maker + taker fees** |
+| `PROFIT` | **Net unrealized profit/loss in USDT** |
+| `STATUS` | `Trailing Sell Active` / `Trailing Buy Active` / `Waiting` |
 
-- **WhatsApp alerts via CallMeBot**  
-  - On every **BUY** and **SELL** execution  
-  - Format: `BUY BTCUSDT @ 62345.12`
-
----
-
-### **Technical Indicators (TA-Lib)**
-
-| Indicator | Settings | Purpose |
-|--------|----------|-------|
-| **RSI** | 14-period | Oversold (≤35) / Overbought (≥65) |
-| **Bollinger Bands** | 20-period, 2σ | Middle band for trend context |
-| **MACD** | 12, 26, 9 | Confirm bullish/bearish momentum |
-
----
-
-### **Order Book Pressure Logic**
-
-- Analyzes **top 5 bid/ask levels**  
-- **Sell Pressure** = % of ask volume → triggers buy on panic  
-- **Buy Pressure History** (deque, last 5 polls):  
-  - Detects **spike (≥65%) → drop (≤55%)** → sell signal
+> **Color Coding**:
+> - **Green** → Positive P&L
+> - **Red** → Negative P&L
+> - **Yellow** → Neutral or waiting
 
 ---
 
-### **Professional Live Dashboard (Terminal UI)**
+## **4. Market Universe Summary**
 
-- **Navy blue background** (`\033[48;5;17m`)  
-- **Bright yellow headers** (`\033[38;5;226m`)  
-- **Green/Red P&L** based on net profit  
-- Updates **every 15 seconds**
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 MARKET UNIVERSE                                          │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ VALID SYMBOLS      42                                                                  │
+│ AVG 24H VOLUME     $1,234,567,890                                                      │
+│ PRICE RANGE        $0.01 → $1,000.00                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-#### Dashboard Fields:
-| Field | Description |
-|------|-------------|
-| Time (CST) | Current time in Chicago timezone |
-| Available USDT | Free balance (minus $2 buffer) |
-| Portfolio Value | Total value of all assets in USDT |
-| Active Threads | # of coin monitor threads |
-| Active Positions | # of open trades |
-| Per Position | Symbol, Qty, Entry, Current, RSI, **P&L%**, **Profit $**, Age, Signal |
-
----
-
-### **Safety & Reliability Features**
-
-- **Graceful shutdown** on `Ctrl+C` → stops all threads  
-- **Retry logic** (`tenacity`) on API failures (3 attempts, exponential backoff)  
-- **Logging**  
-  - Rotating daily logs (`crypto_trading_bot.log`, 7-day retention)  
-  - Console + file, with function/line info  
-- **Error resilience**  
-  - All critical sections in `try/except`  
-  - DB transactions with rollback  
-  - Thread isolation → one coin crash ≠ bot crash
+- Shows **how many pairs** passed filters
+- **Total 24h volume** of valid symbols
+- **Configured price bounds**
 
 ---
 
-### **Database Persistence**
+## **5. Buy Watchlist**  
+*(Top 10 strongest dip signals)*
 
-- **SQLite** (`binance_trades.db`)  
-- Survives restarts:  
-  - Open positions reloaded  
-  - Pending orders rechecked  
-  - Trade history preserved
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│               BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)                                 │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ SYMBOL     RSI   SELL %      PRICE                                                       │
+│ ADAUSDT   28.1    68.4%    $0.412356                                                      │
+│ XRPUSDT   30.2    65.1%    $0.587123                                                      │
+│ DOGEUSDT  32.5    62.8%    $0.098765                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### **Signal Criteria**
+- `RSI ≤ 35`
+- `Sell pressure ≥ 60%`
+- `Price ≤ 1.01 × 24h low`
+- **Sorted by RSI (lowest first)**
+
+> **No signal?** → `"No strong dip signals."`
 
 ---
+
+## **6. Sell Watchlist**  
+*(Top 10 best exit opportunities)*
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                   SELL WATCHLIST (PROFIT + RSI ≥ 65)                                   │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ SYMBOL     NET %   RSI                                                                 │
+│ BTCUSDT   +1.85%  72.3                                                               │
+│ BNBUSDT   +1.42%  69.8                                                               │
+│ LTCUSDT   +0.98%  67.1                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### **Signal Criteria**
+- `Net profit ≥ 0.8%` (after fees)
+- `RSI ≥ 65`
+- **Sorted by net return % (descending)**
+
+> **No signal?** → `"No profitable sell signals."`
+
+---
+
+## **7. Status Indicators & Scenarios**
+
+| Scenario | Dashboard Shows | Bot Behavior |
+|--------|------------------|------------|
+| **Bot just started** | All fields `0`, no positions | Fetching symbols, spawning threads |
+| **Dip detected** | `Trailing Buys: 1+`, symbol in **Buy Watchlist** | `DynamicBuyThread` active |
+| **Trailing buy active** | `STATUS: Trailing Buy Active` | Adjusting limit buy every sec |
+| **Buy filled** | Position appears, `PROFIT` updates, WhatsApp alert | Thread stops, cooldown starts |
+| **Profit target hit** | Symbol in **Sell Watchlist**, `Trailing Sells: 1+` | `DynamicSellThread` starts |
+| **Trailing sell active** | `STATUS: Trailing Sell Active` | Adjusting limit sell |
+| **Sell filled** | Position removed or reduced, profit realized | Thread stops |
+| **60-min timeout** | Order auto-canceled, alert sent | Capital freed |
+| **Network error** | Dashboard still updates (cached data) | `@retry` handles API calls |
+| **No signals** | Watchlists empty, `Waiting` status | Monitoring continues |
+
+---
+
+## **8. Visual Design & UX**
+
+- **Fixed-width columns** → no wrapping
+- **Horizontal rules** (`─`) for clean separation
+- **Color hierarchy**:
+  - **Navy background** → all panels
+  - **Yellow** → labels, headers
+  - **Green/Red** → P&L direction
+  - **White** → neutral values
+- **Cursor hidden**, **title bar updated** → feels like a real app
+
+---
+
+## **9. Error Handling in Dashboard**
+
+| Error | Behavior |
+|------|---------|
+| API down | Uses **cached order book**, shows last known values |
+| DB locked | Skips update, logs warning |
+| Symbol delisted | Thread exits, removed from active list |
+| Memory leak | All threads daemon → safe exit |
+
+---
+
+## **Summary: What You See, When**
+
+| You Want To Know | Look Here |
+|------------------|----------|
+| **Is the bot alive?** | Header + Time |
+| **How much cash?** | `Available USDT` |
+| **Total wealth?** | `Portfolio Value` |
+| **What’s being traded?** | **Positions Table** |
+| **What’s about to be bought?** | **Buy Watchlist** |
+| **What’s ready to sell?** | **Sell Watchlist** |
+| **Is a trade in progress?** | `Trailing Buys/Sells` count + `STATUS` |
+
+---
+
+**This dashboard is your **command center** — no guesswork, no lag, full transparency.**
 
 ### **Setup Requirements**
 
