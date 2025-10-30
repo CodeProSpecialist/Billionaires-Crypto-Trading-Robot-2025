@@ -796,7 +796,8 @@ def calculate_total_portfolio_value(client):
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# === PROFESSIONAL DASHBOARD (FULL) ==========================================
+
+# === PROFESSIONAL DASHBOARD (FULL & CORRECTED) ==============================
 def print_professional_dashboard(client):
     try:
         with dashboard_lock:
@@ -821,10 +822,11 @@ def print_professional_dashboard(client):
             print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
             print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
             print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
-            print(f"{NAVY}{Y 'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dynamic_sell_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
+            # === POSITIONS TABLE ===
             with DBManager() as sess:
                 db_positions = sess.query(Position).all()
 
@@ -862,10 +864,65 @@ def print_professional_dashboard(client):
             else:
                 print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
 
+            # === UNIVERSE SUMMARY ===
+            print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'AVG 24H VOLUME':<20} ${sum(s['volume'] for s in valid_symbols_dict.values()):,.0f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # === BUY WATCHLIST ===
+            print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            watchlist = []
+            for symbol in valid_symbols_dict.keys():
+                ob = get_order_book_analysis(client, symbol)
+                rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
+                if (rsi is not None and rsi <= RSI_OVERSOLD and
+                    ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+                    low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01')):
+                    watchlist.append((symbol, rsi, ob['pct_ask'], ob['best_bid']))
+
+            if watchlist:
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'RSI':>6} {'SELL %':>8} {'PRICE':>12}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*40}{RESET}")
+                for sym, rsi_val, sell_pct, price in sorted(watchlist, key=lambda x: x[1])[:10]:
+                    print(f"{NAVY}{YELLOW}{sym:<10} {rsi_val:>6.1f} {sell_pct:>7.1f}% ${price:>11.6f}{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No strong dip signals.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # === SELL WATCHLIST ===
+            print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            sell_watch = []
+            with DBManager() as sess:
+                for pos in sess.query(Position).all():
+                    symbol = pos.symbol
+                    entry = Decimal(str(pos.avg_entry_price))
+                    ob = get_order_book_analysis(client, symbol)
+                    sell_price = ob['best_ask']
+                    rsi, _, _ = get_rsi_and_trend(client, symbol)
+                    maker, taker = get_trade_fees(client, symbol)
+                    net_return = (sell_price - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
+                    if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
+                        sell_watch.append((symbol, float(net_return * 100), rsi))
+
+            if sell_watch:
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'NET %':>8} {'RSI':>6}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*30}{RESET}")
+                for sym, ret_pct, rsi_val in sorted(sell_watch, key=lambda x: x[1], reverse=True)[:10]:
+                    print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f}{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No profitable sell signals.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
             print(f"{NAVY}{'='*120}{RESET}\n")
 
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
+
 
 # === MAIN ===================================================================
 def main():
