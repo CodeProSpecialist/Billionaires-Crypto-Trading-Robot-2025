@@ -68,6 +68,8 @@ A high-performance, production-grade **automated trading bot** for **Binance.US*
 ## Dashboard Preview (Live Terminal)
 
 ```
+
+```markdown
 ========================================================================================================================
                                       TRADING BOT – LIVE DASHBOARD                                      
 ========================================================================================================================
