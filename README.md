@@ -299,6 +299,41 @@ Let me know if you hit any issues!
    ```bash
    python -c "print('Hello, Anaconda!')"
    ```
+********
+Step-by-Step Guide to Create API Keys
+
+Log In to Your Binance.US Account:
+
+Go to www.binance.us and sign in with your credentials.
+
+
+Access API Management:
+
+Hover over your profile icon or email address in the upper right corner of the dashboard.
+From the dropdown menu, select API Management (or Settings > API Management).
+
+
+Create a New API Key:
+
+In the API Management section, enter a descriptive name for your key (e.g., "Trading Bot Key").
+Click Create API (or Create).
+Complete 2FA verification (e.g., Google Authenticator or SMS code).
+Confirm via email verification from Binance.US.
+
+
+Copy Your Keys:
+
+Your API Key and Secret Key will be displayed once—copy and save them securely (e.g., in a password manager).
+The Secret Key will be hidden forever after you leave the page. If lost, delete the key and create a new one.
+
+
+Configure Permissions (API Restrictions):
+
+Defaults to Read-Only—ideal for data access (e.g., portfolio tracking).
+For trading bots: Enable Spot Trading if needed (allows buying/selling), but NEVER enable Withdrawals unless absolutely required, as it risks fund theft.
+IP Restrictions: Add trusted IP addresses (e.g., your server's IP) to limit access. Leave unrestricted only if necessary.
+Click Save or Confirm to apply.
+********
 
 #### What to Add to `.bashrc` in Ubuntu Linux
 The Anaconda installer automatically adds Conda initialization to `~/.bashrc` (e.g., export PATH and conda setup block). For the bot's environment variables (used via `os.getenv`), add these exports at the end of `~/.bashrc` (replace placeholders with your actual values):
