@@ -5,6 +5,9 @@ Binance.US Dynamic Trailing Bot – FINAL VERSION
 - 15-Min Price Stall → Market Sell
 - No 60-min timeout
 - Full Dashboard + Alerts
+- Rate Limiting (8s + 3s/thread)
+- Exponential Backoff
+- Global Circuit Breaker
 """
 
 import os
@@ -161,6 +164,153 @@ class DBManager:
                 self.session.rollback()
         self.session.close()
 
+# === RATE LIMITER WITH EXPONENTIAL BACKOFF ==================================
+from collections import defaultdict
+from enum import Enum
+
+class CircuitState(Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0, half_open_successes: int = 3):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_successes = half_open_successes
+        self._lock = threading.Lock()
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._open_until = 0.0
+        self._half_open_success_count = 0
+        self._last_failure_time = 0.0
+
+    def _can_proceed(self) -> bool:
+        now = time.time()
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                if now >= self._open_until:
+                    self._state = CircuitState.HALF_OPEN
+                    self._half_open_success_count = 0
+                    logger.info("Circuit breaker HALF-OPEN → probing")
+                    return True
+                return False
+            return True
+
+    def acquire(self) -> bool:
+        if not self._can_proceed():
+            return False
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                if threading.active_count() > 1:
+                    return False
+            return True
+
+    def record_failure(self):
+        now = time.time()
+        with self._lock:
+            self._last_failure_time = now
+            self._failure_count += 1
+            if self._state == CircuitState.HALF_OPEN:
+                self._failure_count = self.failure_threshold
+            if self._failure_count >= self.failure_threshold:
+                self._state = CircuitState.OPEN
+                self._open_until = now + self.recovery_timeout
+                logger.warning(f"CIRCUIT BREAKER OPENED → blocking for {self.recovery_timeout}s ({self._failure_count} failures)")
+                self._failure_count = 0
+
+    def record_success(self):
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_success_count += 1
+                if self._half_open_success_count >= self.half_open_successes:
+                    self._state = CircuitState.CLOSED
+                    self._failure_count = 0
+                    logger.info("Circuit breaker CLOSED → normal operation")
+            else:
+                self._failure_count = 0
+
+    def state(self) -> str:
+        with self._lock:
+            return self._state.value
+
+class ExponentialThreadedRateLimiter:
+    def __init__(self, base_seconds: float = 8.0, extra_per_thread: float = 3.0, max_backoff: float = 120.0):
+        self.base = base_seconds
+        self.extra = extra_per_thread
+        self.max_backoff = max_backoff
+        self.lock = threading.Lock()
+        self.last_call = defaultdict(float)
+        self.backoff_until = defaultdict(float)
+        self.thread_count = 0
+
+    def _current_interval(self) -> float:
+        with self.lock:
+            return self.base + max(0, self.thread_count - 1) * self.extra
+
+    def acquire(self):
+        tid = threading.get_ident()
+        interval = self._current_interval()
+        with self.lock:
+            if tid not in self.last_call:
+                self.thread_count += 1
+            now = time.time()
+            forced = self.backoff_until[tid]
+            wait_until = max(self.last_call[tid] + interval, forced)
+            self.last_call[tid] = max(now, wait_until)
+        sleep_time = max(0.0, wait_until - time.time())
+        if sleep_time:
+            time.sleep(sleep_time)
+
+    def _trigger_backoff(self):
+        tid = threading.get_ident()
+        with self.lock:
+            current = self.backoff_until[tid]
+            new_val = min(current * 2.0, self.max_backoff) if current > 0 else self.base
+            self.backoff_until[tid] = time.time() + new_val
+            logger.debug(f"Back-off triggered for thread {tid}: {new_val:.1f}s")
+
+    def success(self):
+        tid = threading.get_ident()
+        with self.lock:
+            self.backoff_until[tid] = 0.0
+
+    def release(self):
+        tid = threading.get_ident()
+        with self.lock:
+            self.thread_count = max(0, self.thread_count - 1)
+            self.last_call.pop(tid, None)
+            self.backoff_until.pop(tid, None)
+
+# === RATE-LIMITED CLIENT WITH CIRCUIT BREAKER ===============================
+from binance.client import Client as _BinanceClient
+
+class RateLimitedClient:
+    def __init__(self, raw_client: _BinanceClient, limiter: ExponentialThreadedRateLimiter, circuit_breaker: CircuitBreaker):
+        self._raw = raw_client
+        self._limiter = limiter
+        self._cb = circuit_breaker
+
+    def __getattr__(self, name):
+        attr = getattr(self._raw, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            self._limiter.acquire()
+            if not self._cb.acquire():
+                raise BinanceAPIException(status_code=529, message="Circuit breaker OPEN – API blocked")
+            try:
+                result = attr(*args, **kwargs)
+                self._limiter.success()
+                self._cb.record_success()
+                return result
+            except (BinanceAPIException, requests.RequestException) as e:
+                self._limiter._trigger_backoff()
+                self._cb.record_failure()
+                raise
+        return wrapped
+
 # === SIGNAL HANDLER =========================================================
 def signal_handler(signum, frame):
     logger.info("Shutting down all threads...")
@@ -172,6 +322,10 @@ def signal_handler(signum, frame):
             t.running = False
     for t in list(dynamic_buy_threads.values()) + list(dynamic_sell_threads.values()):
         t.running = False
+    try:
+        bot.client._limiter.release()
+        bot.client._cb.record_success()
+    except: pass
     sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -302,28 +456,6 @@ def can_place_buy_order(symbol: str) -> bool:
 def record_buy_placed(symbol: str):
     buy_cooldown[symbol] = time.time()
 
-# === 60-MIN ORDER CANCELLATION TIMER ========================================
-def start_order_cancellation_timer(client, order_id: str, symbol: str):
-    def _cancel_after_delay():
-        time.sleep(60 * 60)
-        if not getattr(_cancel_after_delay, "running", True):
-            return
-        try:
-            client.cancel_order(symbol=symbol, orderId=int(order_id))
-            logger.info(f"CANCELLED unfilled order {order_id} for {symbol} after 60 min")
-            send_whatsapp_alert(f"CANCELLED {symbol} order {order_id} (60 min timeout)")
-        except Exception as e:
-            logger.warning(f"Failed to cancel order {order_id}: {e}")
-        finally:
-            with cancel_timer_lock:
-                cancel_timer_threads.pop(order_id, None)
-
-    thread = threading.Thread(target=_cancel_after_delay, daemon=True)
-    thread.running = True
-    with cancel_timer_lock:
-        cancel_timer_threads[order_id] = thread
-    thread.start()
-
 # === DYNAMIC TRAILING BUY THREAD ============================================
 class DynamicBuyThread(threading.Thread):
     def __init__(self, client, symbol, bot):
@@ -429,7 +561,6 @@ class DynamicBuyThread(threading.Thread):
                 order = self.bot.place_limit_buy_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
                 if order:
                     self.last_buy_order_id = str(order['orderId'])
-                    start_order_cancellation_timer(self.client, self.last_buy_order_id, self.symbol)
                 fill_price = Decimal(adjusted['price'])
 
             if order:
@@ -463,7 +594,7 @@ class DynamicSellThread(threading.Thread):
         self.peak_price = self.entry_price
         self.last_sell_order_id = None
         self.start_time = time.time()
-        self.price_peaks_history = {}  # symbol → list of (timestamp, price)
+        self.price_peaks_history = {}
 
     def run(self):
         logger.info(f"Started DYNAMIC SELL MONITOR for {self.symbol}")
@@ -566,7 +697,6 @@ class DynamicSellThread(threading.Thread):
                 order = self.bot.place_limit_sell_with_tracking(self.symbol, str(adjusted['price']), float(adjusted['quantity']))
                 if order:
                     self.last_sell_order_id = str(order['orderId'])
-                    start_order_cancellation_timer(self.client, self.last_sell_order_id, self.symbol)
                 fill_price = Decimal(adjusted['price'])
 
             if order:
@@ -649,7 +779,11 @@ class CoinMonitorThread(threading.Thread):
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
-        self.client = Client(API_KEY, API_SECRET, tld='us')
+        self.rate_limiter = ExponentialThreadedRateLimiter(base_seconds=8.0, extra_per_thread=3.0, max_backoff=120.0)
+        self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0, half_open_successes=3)
+        raw_client = Client(API_KEY, API_SECRET, tld='us')
+        self.client = RateLimitedClient(raw_client, self.rate_limiter, self.circuit_breaker)
+
         with DBManager() as sess:
             import_owned_assets_to_db(self.client, sess)
             sess.commit()
@@ -850,8 +984,8 @@ def calculate_total_portfolio_value(client):
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# === PROFESSIONAL DASHBOARD (FULL & CORRECTED) ==============================
-def print_professional_dashboard(client):
+# === PROFESSIONAL DASHBOARD =================================================
+def print_professional_dashboard(client, bot):
     try:
         with dashboard_lock:
             set_terminal_background_and_title()
@@ -877,6 +1011,7 @@ def print_professional_dashboard(client):
             print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dynamic_sell_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Circuit Breaker':<20} {bot.client._cb.state()}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
             # === POSITIONS TABLE ===
@@ -982,8 +1117,17 @@ def main():
         logger.critical("API keys missing.")
         sys.exit(1)
 
-    client = Client(API_KEY, API_SECRET, tld='us')
+    # === SHARED CIRCUIT BREAKER & LIMITER ===
+    circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0, half_open_successes=3)
+    limiter = ExponentialThreadedRateLimiter(base_seconds=8.0, extra_per_thread=3.0, max_backoff=120.0)
+
+    raw_client = Client(API_KEY, API_SECRET, tld='us')
+    client = RateLimitedClient(raw_client, limiter, circuit_breaker)
+
     bot = BinanceTradingBot()
+    bot.client = client  # share same client instance
+    bot.circuit_breaker = circuit_breaker
+    bot.rate_limiter = limiter
 
     if not fetch_and_validate_usdt_pairs(client):
         sys.exit(1)
@@ -1002,7 +1146,7 @@ def main():
             bot.check_and_process_filled_orders()
             now = time.time()
             if now - last_dashboard >= 30:
-                print_professional_dashboard(client)
+                print_professional_dashboard(client, bot)
                 last_dashboard = now
             time.sleep(1)
         except KeyboardInterrupt:
