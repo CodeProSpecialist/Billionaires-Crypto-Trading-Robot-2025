@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Binance.US Dynamic Trailing Bot – FINAL VERSION
+Binance.US Dynamic Trailing Bot – FINAL FIXED VERSION
 - Flash Dip → Market Buy
 - 15-Min Price Stall → Market Sell
-- No 60-min timeout
 - Full Dashboard + Alerts
-- Rate Limiting (3s default + 2s per thread)
-- Bot Heartbeat (balance/positions every 30s)
-- Dashboard Refresh (every 20s)
-- Auto-Restart on Crash (4m30s)
-- HEARTBEAT FAILURE DETECTION + ALERT + SAFE RESTART
+- Rate Limiting
+- Bot Heartbeat + Failure Detection
+- Auto-Restart on Crash
+- NO MORE 'function - float' ERRORS
 """
 
 import os
@@ -76,10 +74,10 @@ BASE_RATE_LIMIT_SECONDS = 3
 RATE_LIMIT_INCREMENT_PER_THREAD = 2
 
 # Heartbeat & Dashboard
-HEARTBEAT_INTERVAL = 30          # seconds
-HEARTBEAT_TIMEOUT = 90           # no pulse in 90s → failure
-DASHBOARD_REFRESH_INTERVAL = 20  # seconds
-CRASH_RESTART_DELAY = 4 * 60 + 30  # 4 min 30 sec
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = 90
+DASHBOARD_REFRESH_INTERVAL = 20
+CRASH_RESTART_DELAY = 4 * 60 + 30
 
 # === CONSTANTS ==============================================================
 HUNDRED = Decimal('100')
@@ -114,7 +112,7 @@ sell_pressure_history: Dict[str, deque] = {}
 active_threads: Dict[str, threading.Thread] = {}
 dynamic_buy_threads: Dict[str, threading.Thread] = {}
 dynamic_sell_threads: Dict[str, threading.Thread] = {}
-last_price_cache: Dict[str, Tuple[float, float]] = {}  # (price, timestamp)
+last_price_cache: Dict[str, Tuple[float, float]] = {}
 thread_lock = threading.Lock()
 dashboard_lock = threading.Lock()
 heartbeat_lock = threading.Lock()
@@ -184,7 +182,7 @@ class DBManager:
 def signal_handler(signum, frame):
     logger.info("Shutting down all threads...")
     with thread_lock:
-        for symbol, thread in active_threads.items():
+        for thread in active_threads.values():
             thread.running = False
     with cancel_timer_lock:
         for t in cancel_timer_threads.values():
@@ -221,7 +219,7 @@ def to_decimal(value) -> Decimal:
     except:
         return ZERO
 
-# === FETCH SYMBOLS (FIXED: Removed get_trade_fees call) =====================
+# === FETCH SYMBOLS (FIXED: NO get_trade_fees call) ==========================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
     global valid_symbols_dict
@@ -699,7 +697,9 @@ class BinanceTradingBot:
                 sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='buy',
                                     price=Decimal(price), quantity=Decimal(str(qty))))
             return order
-        except: return None
+        except Exception as e:
+            logger.error(f"place_limit_buy_with_tracking failed: {e}")
+            return None
 
     def place_limit_sell_with_tracking(self, symbol, price: str, qty: float):
         try:
@@ -708,7 +708,9 @@ class BinanceTradingBot:
                 sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='sell',
                                     price=Decimal(price), quantity=Decimal(str(qty))))
             return order
-        except: return None
+        except Exception as e:
+            logger.error(f"place_limit_sell_with_tracking failed: {e}")
+            return None
 
     def check_and_process_filled_orders(self):
         try:
@@ -734,8 +736,10 @@ class BinanceTradingBot:
                                 with thread_lock:
                                     t = dynamic_sell_threads.pop(pending.symbol, None)
                                     if t: t.running = False
-                    except: pass
-        except: pass
+                    except Exception as e:
+                        logger.debug(f"Order check failed for {pending.binance_order_id}: {e}")
+        except Exception as e:
+            logger.error(f"check_and_process_filled_orders failed: {e}")
 
     def record_trade(self, sess, symbol, side, price, qty, binance_order_id, pending_order):
         trade = Trade(symbol=symbol, side=side, price=price, quantity=qty,
@@ -776,7 +780,8 @@ def get_trade_fees(client, symbol):
     try:
         fee = rate_limited_api_call(client.get_trade_fee, symbol=symbol)
         return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
-    except:
+    except Exception as e:
+        logger.warning(f"get_trade_fees failed for {symbol}: {e}")
         return 0.001, 0.001
 
 def validate_and_adjust_order(client, symbol, side, order_type, quantity, price):
@@ -824,7 +829,7 @@ def import_owned_assets_to_db(client, sess):
                 logger.warning(f"Could not get price for {asset}, skipping import")
                 continue
 
-            maker_fee, _ = get_trade_fees(client, symbol)
+            maker_fee, _ = get_trade_fees(client, symbol)  # CORRECT CALL
             pos = Position(
                 symbol=symbol,
                 quantity=Decimal(str(qty)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN),
@@ -915,7 +920,7 @@ def monitor_heartbeat_and_restart():
                 logger.warning("Trailing trades active. Waiting...")
                 send_whatsapp_alert("HEARTBEAT LOST but trailing trades active. Monitoring...")
 
-# === FULL PROFESSIONAL DASHBOARD ============================================
+# === FULL DASHBOARD (included) ==============================================
 def print_professional_dashboard(client):
     try:
         with dashboard_lock:
@@ -945,7 +950,6 @@ def print_professional_dashboard(client):
             print(f"{NAVY}{YELLOW}{'Rate Limit':<20} 1 call / {get_dynamic_rate_limit()} sec{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
-            # === POSITIONS TABLE ===
             with DBManager() as sess:
                 db_positions = sess.query(Position).all()
 
@@ -983,7 +987,6 @@ def print_professional_dashboard(client):
             else:
                 print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
 
-            # === MARKET UNIVERSE ===
             print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
             print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
@@ -991,7 +994,6 @@ def print_professional_dashboard(client):
             print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
-            # === BUY WATCHLIST ===
             print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
             watchlist = []
@@ -1012,7 +1014,6 @@ def print_professional_dashboard(client):
                 print(f"{NAVY}{YELLOW} No strong dip signals.{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
-            # === SELL WATCHLIST ===
             print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
             sell_watch = []
@@ -1053,6 +1054,7 @@ def main_loop():
     bot = BinanceTradingBot()
 
     if not fetch_and_validate_usdt_pairs(client):
+        logger.critical("Failed to fetch valid symbols. Exiting.")
         sys.exit(1)
 
     with thread_lock:
@@ -1080,7 +1082,7 @@ def main_loop():
                 last_dashboard = now
             time.sleep(1)
         except Exception as e:
-            logger.critical(f"Main loop crashed: {e}", exc_info=True)
+            logger.critical(f"Main loop crashed: {e", exc_info=True)
             raise
 
 def main():
