@@ -1082,7 +1082,7 @@ def main_loop():
                 last_dashboard = now
             time.sleep(1)
         except Exception as e:
-            logger.critical(f"Main loop crashed: {e", exc_info=True)
+            logger.critical(f"Main loop crashed: {e}", exc_info=True)
             raise
 
 def main():
