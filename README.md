@@ -2,14 +2,11 @@
 **Skyrocketing Wealth Creation with Precision Automation**  
 
 *****
-There is an in-progress upgrade 
-that has a few bugs that I will fix as soon as possible. It is just related to decimal and float conversions. 
-
 Update to the newest version 
 for the best working 
 trading robot python code. 
 Newest Python code updates were 
-completed on October 30, 2025. 
+completed on October 31, 2025. 
 *****
 
 ( Note: delete the file named 
