@@ -7,7 +7,7 @@ Binance.US Dynamic Trailing Bot – FINAL VERSION
 - Full Dashboard + Alerts
 - Rate Limiting (8s + 3s/thread)
 - Exponential Backoff
-- Global Circuit Breaker
+- Global Circuit Breaker (disabled first 120s after DB import + dashboard)
 """
 
 import os
@@ -110,6 +110,10 @@ buy_cooldown: Dict[str, float] = {}
 cancel_timer_threads: Dict[str, threading.Thread] = {}
 cancel_timer_lock = threading.Lock()
 
+# === STARTUP GRACE PERIOD (Circuit Breaker Disabled for 120s) ===============
+STARTUP_GRACE_END = 0.0
+STARTUP_GRACE_LOCK = threading.Lock()
+
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
 engine = create_engine(DB_URL, echo=False, future=True)
@@ -207,6 +211,12 @@ class CircuitBreaker:
             return True
 
     def record_failure(self):
+        # --- SKIP DURING STARTUP GRACE PERIOD ---
+        with STARTUP_GRACE_LOCK:
+            if time.time() < STARTUP_GRACE_END:
+                return
+        # --- END SKIP ---
+
         now = time.time()
         with self._lock:
             self._last_failure_time = now
@@ -1001,6 +1011,9 @@ def print_professional_dashboard(client, bot):
             RESET = "\033[0m"
             BOLD = "\033[1m"
 
+            grace_remaining = max(0, STARTUP_GRACE_END - time.time())
+            grace_str = f"{grace_remaining:.0f}s" if grace_remaining > 0 else "ACTIVE"
+
             print(f"{NAVY}{'='*120}{RESET}")
             print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
             print(f"{NAVY}{'='*120}{RESET}\n")
@@ -1011,7 +1024,7 @@ def print_professional_dashboard(client, bot):
             print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
             print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dynamic_sell_threads)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Circuit Breaker':<20} {bot.client._cb.state()}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Circuit Breaker':<20} {grace_str} ({bot.client._cb.state()}){RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
             # === POSITIONS TABLE ===
@@ -1125,13 +1138,29 @@ def main():
     client = RateLimitedClient(raw_client, limiter, circuit_breaker)
 
     bot = BinanceTradingBot()
-    bot.client = client  # share same client instance
+    bot.client = client
     bot.circuit_breaker = circuit_breaker
     bot.rate_limiter = limiter
 
     if not fetch_and_validate_usdt_pairs(client):
         sys.exit(1)
 
+    # === IMPORT POSITIONS FROM BINANCE ===
+    with DBManager() as sess:
+        import_owned_assets_to_db(client, sess)
+        sess.commit()
+
+    # === FIRST DASHBOARD (WARM-UP) ===
+    print_professional_dashboard(client, bot)
+    time.sleep(2)
+
+    # === ENABLE CIRCUIT BREAKER AFTER 120s GRACE ===
+    global STARTUP_GRACE_END
+    with STARTUP_GRACE_LOCK:
+        STARTUP_GRACE_END = time.time() + 120.0
+    logger.info("Startup grace period: Circuit breaker disabled for 120s")
+
+    # === START MONITOR THREADS ===
     with thread_lock:
         for symbol in valid_symbols_dict.keys():
             if symbol not in active_threads:
