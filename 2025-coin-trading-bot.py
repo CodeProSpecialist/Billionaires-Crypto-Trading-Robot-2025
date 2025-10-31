@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BINANCE.US SPOT-ONLY TRAILING BOT – FINAL VERSION
+BINANCE.US SPOT-ONLY TRAILING BOT – FINAL PATCHED VERSION
 - USDT pairs only
 - Price: $0.01 – $1000
 - 24h volume ≥ $50,000
@@ -25,7 +25,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from datetime import datetime
 import pytz
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_EVEN
 from collections import deque, defaultdict
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -43,14 +43,14 @@ MIN_24H_VOLUME_USDT = 50_000
 RSI_PERIOD = 14
 PROFIT_TARGET_NET = Decimal('0.008')
 RISK_PER_TRADE    = Decimal('0.10')
-MIN_BALANCE       = 2.0
-ORDERBOOK_SELL_PRESSURE_THRESHOLD = 0.60
-ORDERBOOK_BUY_PRESSURE_SPIKE      = 0.65
-ORDERBOOK_BUY_PRESSURE_DROP       = 0.55
+MIN_BALANCE       = Decimal('2.0')
+ORDERBOOK_SELL_PRESSURE_THRESHOLD = Decimal('0.60')
+ORDERBOOK_BUY_PRESSURE_SPIKE      = Decimal('0.65')
+ORDERBOOK_BUY_PRESSURE_DROP       = Decimal('0.55')
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 STALL_THRESHOLD_SECONDS = 15 * 60
-RAPID_DROP_THRESHOLD = 0.01
+RAPID_DROP_THRESHOLD = Decimal('0.01')
 RAPID_DROP_WINDOW = 5.0
 
 API_KEY    = os.getenv('BINANCE_API_KEY')
@@ -90,14 +90,26 @@ sell_pressure_hist = defaultdict(lambda: deque(maxlen=5))
 buy_cooldown = {}
 stall_timer = {}
 
-positions = {}
+positions = {}  # {sym: {'entry_price': Decimal, 'qty': Decimal}}
 dyn_buy_active = set()
 dyn_sell_active = set()
 
 ws_market = ws_user = None
 listen_key = None
 top_symbols = []
-client = None
+
+# Early client init
+client = Client(API_KEY, API_SECRET, tld='us')
+
+# Balance cache
+_balance_cache = {'value': Decimal('0'), 'ts': 0}
+_balance_lock = threading.Lock()
+
+# Keep-alive control
+_keepalive_evt = threading.Event()
+
+# Step size cache
+_step_size_cache = {}
 
 # ============================= SQLALCHEMY =============================
 DB_URL = "sqlite:///binance_us_spot.db"
@@ -132,6 +144,57 @@ def shutdown(*_):
 signal.signal(signal.SIGINT,  shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
+# ============================= UTILS =============================
+def get_step_size(symbol: str) -> Decimal:
+    if symbol not in _step_size_cache:
+        try:
+            info = client.get_symbol_info(symbol)
+            for f in info['filters']:
+                if f['filterType'] == 'LOT_SIZE':
+                    _step_size_cache[symbol] = Decimal(f['stepSize'])
+                    break
+            else:
+                _step_size_cache[symbol] = Decimal('1e-8')
+        except:
+            _step_size_cache[symbol] = Decimal('1e-8')
+    return _step_size_cache[symbol]
+
+def to_dec(v, symbol=None):
+    d = Decimal(str(v))
+    if symbol:
+        step = get_step_size(symbol)
+        d = d.quantize(step, rounding=ROUND_DOWN)
+    else:
+        d = d.quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
+    return d
+
+def now_cst():
+    return datetime.now(pytz.timezone('America/Chicago')).strftime("%Y-%m-%d %H:%M:%S")
+
+def send_whatsapp(m):
+    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
+        try:
+            requests.get(
+                f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(m)}&apikey={CALLMEBOT_API_KEY}",
+                timeout=5
+            )
+        except:
+            pass
+
+def get_balance() -> Decimal:
+    with _balance_lock:
+        if time.time() - _balance_cache['ts'] < 30:
+            return _balance_cache['value']
+    try:
+        acc = client.get_account()
+        free = next((Decimal(b['free']) for b in acc['balances'] if b['asset'] == 'USDT'), Decimal('0'))
+        with _balance_lock:
+            _balance_cache.update({'value': free, 'ts': time.time()})
+        return free
+    except Exception as e:
+        logger.error(f"get_balance error: {e}")
+        return Decimal('0')
+
 # ============================= SAFE REST =============================
 def safe_rest(method, **kwargs):
     for attempt in range(5):
@@ -151,9 +214,7 @@ def safe_rest(method, **kwargs):
 
 # ============================= LISTENKEY =============================
 def obtain_listen_key():
-    global listen_key, client
-    if client is None:
-        client = Client(API_KEY, API_SECRET, tld='us')
+    global listen_key
     for i in range(5):
         try:
             resp = safe_rest('stream_get_listen_key')
@@ -164,13 +225,13 @@ def obtain_listen_key():
         except Exception as e:
             logger.error(f"listenKey attempt {i+1} failed: {e}")
         time.sleep(5)
-    logger.warning("Continuing without user stream (listenKey failed)")
+    logger.warning("Continuing without user stream")
     return False
 
 def keepalive_listen_key():
-    while True:
-        time.sleep(30 * 60)
-        if listen_key:
+    while not _keepalive_evt.is_set():
+        _keepalive_evt.wait(30 * 60)
+        if listen_key and not _keepalive_evt.is_set():
             try:
                 client.stream_keepalive(listen_key)
                 logger.debug("listenKey keep-alive sent")
@@ -304,11 +365,9 @@ def on_open_market(ws):
     threading.Thread(target=sub, daemon=True).start()
 
 def start_websockets():
-    global ws_market, ws_user, listen_key, client
+    global ws_market, ws_user, listen_key
     stop_ws()
-
-    if client is None:
-        client = Client(API_KEY, API_SECRET, tld='us')
+    _keepalive_evt.clear()
 
     have_key = obtain_listen_key()
 
@@ -336,25 +395,10 @@ def start_websockets():
     return True
 
 def stop_ws():
+    _keepalive_evt.set()
     for w in (ws_market, ws_user):
         if w: w.close()
-
-# ============================= UTILS =============================
-def to_dec(v): return Decimal(str(v)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
-def now_cst(): return datetime.now(pytz.timezone('America/Chicago')).strftime("%Y-%m-%d %H:%M:%S")
-def send_whatsapp(m):
-    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
-        try:
-            requests.get(f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(m)}&apikey={CALLMEBOT_API_KEY}", timeout=5)
-        except: pass
-
-def get_balance():
-    acc = safe_rest('get_account')
-    if not acc: return 0.0
-    for b in acc.get('balances', []):
-        if b['asset'] == 'USDT':
-            return float(b['free'])
-    return 0.0
+    time.sleep(1)
 
 # ============================= STRATEGY =============================
 def check_buy_signal(sym):
@@ -376,8 +420,8 @@ def check_sell_signal(sym):
     try:
         if sym not in positions or sym in dyn_sell_active: return
         p = positions[sym]
-        entry = Decimal(str(p['entry_price']))
-        qty = Decimal(str(p['qty']))
+        entry = p['entry_price']
+        qty = p['qty']
         b = book_cache.get(sym, {})
         if not b: return
         ask = b['best_ask']
@@ -417,13 +461,16 @@ def run_dynamic_buy(sym, trig):
 
         bal = get_balance()
         if bal <= MIN_BALANCE: return
-        alloc = min(Decimal(str(bal - MIN_BALANCE)) * RISK_PER_TRADE, Decimal(str(bal - MIN_BALANCE)))
+        alloc = min((bal - MIN_BALANCE) * RISK_PER_TRADE, bal - MIN_BALANCE)
+        if alloc <= 0: return
+
         if force:
             o = safe_rest('order_market_buy', symbol=sym, quoteOrderQty=float(alloc))
             fp = to_dec(o['fills'][0]['price']) if o and o.get('fills') else Decimal('0')
             send_whatsapp(f"FLASH BUY {sym} @ {fp:.6f}")
         else:
-            qty = alloc / price
+            qty = to_dec(alloc / price, sym)
+            if qty <= 0: return
             safe_rest('order_limit_buy', symbol=sym, quantity=float(qty), price=str(price))
             send_whatsapp(f"LIMIT BUY {sym} @ {price:.6f}")
         buy_cooldown[sym] = time.time()
@@ -461,14 +508,16 @@ def record_buy(sym, price, qty):
     try:
         with DB() as s:
             p = s.query(Position).filter_by(symbol=sym).first()
-            q = to_dec(qty); pr = to_dec(price)
+            q = to_dec(qty, sym)
+            pr = to_dec(price)
             if not p:
                 s.add(Position(symbol=sym, quantity=q, avg_entry_price=pr))
+                positions[sym] = {'entry_price': pr, 'qty': q}
             else:
                 tot = p.quantity * p.avg_entry_price + q * pr
                 p.quantity += q
                 p.avg_entry_price = tot / p.quantity
-            positions[sym] = {'entry_price': price, 'qty': qty}
+                positions[sym] = {'entry_price': p.avg_entry_price, 'qty': p.quantity}
     except Exception as e: logger.error(f"record_buy: {e}")
 
 def record_sell(sym, price, qty):
@@ -476,10 +525,13 @@ def record_sell(sym, price, qty):
         with DB() as s:
             p = s.query(Position).filter_by(symbol=sym).first()
             if p:
-                p.quantity -= to_dec(qty)
+                q = to_dec(qty, sym)
+                p.quantity -= q
                 if p.quantity <= 0:
                     s.delete(p)
                     positions.pop(sym, None)
+                else:
+                    positions[sym]['qty'] = p.quantity
     except Exception as e: logger.error(f"record_sell: {e}")
 
 # ============================= DASHBOARD =============================
@@ -498,7 +550,7 @@ def print_dashboard():
         print(f"{NAVY}{'='*120}{RST}")
         print(f"{NAVY}{YEL}{'BINANCE.US SPOT BOT – LIVE':^120}{RST}")
         print(f"{NAVY}{'='*120}{RST}\n")
-        print(f"{NAVY}{YEL}Time (CST): {now:<20} USDT: ${usdt:,.6f}{RST}")
+        print(f"{NAVY}{YEL}Time (CST): {now:<20} USDT: ${float(usdt):,.6f}{RST}")
         print(f"{NAVY}{YEL}Symbols: {len(top_symbols):>3}  Buy: {len(dyn_buy_active):>2}  Sell: {len(dyn_sell_active):>2}{RST}")
         print(f"{NAVY}{YEL}{'-'*120}{RST}\n")
 
@@ -510,9 +562,9 @@ def print_dashboard():
                 b = book_cache.get(sym, {})
                 cur = float(b.get('best_bid') or b.get('best_ask', 0))
                 rsi = rsi_cache.get(sym, 0)
-                pnl = ((cur - p['entry_price']) / p['entry_price'] - 0.002) * 100
+                pnl = ((cur - float(p['entry_price'])) / float(p['entry_price']) - 0.002) * 100
                 color = GRN if pnl > 0 else RED
-                print(f"{NAVY}{YEL}{sym:<10} {p['qty']:>12.6f} {p['entry_price']:>12.6f} {cur:>12.6f} {rsi:>6.1f} {color}{pnl:>7.2f}%{RST}")
+                print(f"{NAVY}{YEL}{sym:<10} {float(p['qty']):>12.6f} {float(p['entry_price']):>12.6f} {cur:>12.6f} {rsi:>6.1f} {color}{pnl:>7.2f}%{RST}")
             print(f"{NAVY}{YEL}{'-'*120}{RST}")
         else:
             print(f"{NAVY}{YEL}No open positions.{RST}\n")
@@ -531,7 +583,10 @@ def main():
     try:
         with DB() as s:
             for p in s.query(Position).all():
-                positions[p.symbol] = {'entry_price': float(p.avg_entry_price), 'qty': float(p.quantity)}
+                positions[p.symbol] = {
+                    'entry_price': Decimal(str(p.avg_entry_price)),
+                    'qty': Decimal(str(p.quantity))
+                }
     except Exception as e:
         logger.error(f"DB load error: {e}")
 
