@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Binance.US Dynamic Trailing Bot – FINAL VERSION
-- ZERO RATE LIMITS for first 8 minutes (480 seconds)
-- No thread limits, no backoff, no circuit breaker during startup
-- Fixes DB creation stall
-- Full dashboard, alerts, trailing buy/sell, 15-min stall → market sell
+- ZERO rate limits for first 8 minutes (480s)
+- Custom rate limiter (no tenacity, no ratelimit)
+- Full control: base interval, per-thread delay, backoff
+- Fixes DB stall, full dashboard, trailing buy/sell
+- 15-min price stall → market sell
+- WhatsApp alerts, SQLite DB, thread-safe
 """
 
 import os
@@ -18,14 +20,13 @@ from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
-from tenacity import retry, stop_after_attempt, wait_exponential
 import talib
 from datetime import datetime
 import pytz
 import requests
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Tuple
-from collections import deque
+from collections import deque, defaultdict
 
 # === SQLALCHEMY ==============================================================
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, ForeignKey, func
@@ -112,6 +113,196 @@ buy_cooldown: Dict[str, float] = {}
 cancel_timer_threads: Dict[str, threading.Thread] = {}
 cancel_timer_lock = threading.Lock()
 
+# === CUSTOM RATE LIMITER (NO TENACITY) ======================================
+class CustomRateLimiter:
+    def __init__(self, base_seconds: float = 8.0, extra_per_thread: float = 3.0, max_backoff: float = 120.0):
+        self.base = base_seconds
+        self.extra = extra_per_thread
+        self.max_backoff = max_backoff
+        self.lock = threading.Lock()
+        self.last_call = defaultdict(float)
+        self.backoff_until = defaultdict(float)
+        self.active_threads = 0
+
+    def _current_interval(self) -> float:
+        with self.lock:
+            return self.base + max(0, self.active_threads - 1) * self.extra
+
+    def acquire(self):
+        with STARTUP_GRACE_LOCK:
+            if time.time() < STARTUP_GRACE_END:
+                return
+        tid = threading.get_ident()
+        interval = self._current_interval()
+        with self.lock:
+            if tid not in self.last_call:
+                self.active_threads += 1
+            now = time.time()
+            forced = self.backoff_until[tid]
+            wait_until = max(self.last_call[tid] + interval, forced)
+            self.last_call[tid] = max(now, wait_until)
+        sleep_time = max(0.0, wait_until - time.time())
+        if sleep_time:
+            time.sleep(sleep_time)
+
+    def trigger_backoff(self):
+        with STARTUP_GRACE_LOCK:
+            if time.time() < STARTUP_GRACE_END:
+                return
+        tid = threading.get_ident()
+        with self.lock:
+            current = self.backoff_until[tid]
+            new_val = min(current * 2.0, self.max_backoff) if current > 0 else self.base
+            self.backoff_until[tid] = time.time() + new_val
+            logger.debug(f"Back-off triggered: {new_val:.1f}s")
+
+    def success(self):
+        with STARTUP_GRACE_LOCK:
+            if time.time() < STARTUP_GRACE_END:
+                return
+        tid = threading.get_ident()
+        with self.lock:
+            self.backoff_until[tid] = 0.0
+
+    def release(self):
+        tid = threading.get_ident()
+        with self.lock:
+            self.active_threads = max(0, self.active_threads - 1)
+            self.last_call.pop(tid, None)
+            self.backoff_until.pop(tid, None)
+
+# === CIRCUIT BREAKER ========================================================
+from enum import Enum
+
+class CircuitState(Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0, half_open_successes: int = 3):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_successes = half_open_successes
+        self._lock = threading.Lock()
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._open_until = 0.0
+        self._half_open_success_count = 0
+
+    def acquire(self) -> bool:
+        with STARTUP_GRACE_LOCK:
+            if time.time() < STARTUP_GRACE_END:
+                return True
+        now = time.time()
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                if now >= self._open_until:
+                    self._state = CircuitState.HALF_OPEN
+                    self._half_open_success_count = 0
+                    logger.info("Circuit breaker HALF-OPEN → probing")
+                    return True
+                return False
+            if self._state == CircuitState.HALF_OPEN:
+                if threading.active_count() > 1:
+                    return False
+            return True
+
+    def record_failure(self):
+        with STARTUP_GRACE_LOCK:
+            if time.time() < STARTUP_GRACE_END:
+                return
+        with self._lock:
+            self._failure_count += 1
+            if self._state == CircuitState.HALF_OPEN:
+                self._failure_count = self.failure_threshold
+            if self._failure_count >= self.failure_threshold:
+                self._state = CircuitState.OPEN
+                self._open_until = time.time() + self.recovery_timeout
+                logger.warning(f"CIRCUIT BREAKER OPENED → blocking for {self.recovery_timeout}s")
+                self._failure_count = 0
+
+    def record_success(self):
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_success_count += 1
+                if self._half_open_success_count >= self.half_open_successes:
+                    self._state = CircuitState.CLOSED
+                    self._failure_count = 0
+                    logger.info("Circuit breaker CLOSED → normal operation")
+            else:
+                self._failure_count = 0
+
+    def state(self) -> str:
+        with self._lock:
+            return self._state.value
+
+# === RATE-LIMITED CLIENT ====================================================
+from binance.client import Client as _BinanceClient
+
+class RateLimitedClient:
+    def __init__(self, raw_client: _BinanceClient, limiter: CustomRateLimiter, circuit_breaker: CircuitBreaker):
+        self._raw = raw_client
+        self._limiter = limiter
+        self._cb = circuit_breaker
+
+    def __getattr__(self, name):
+        attr = getattr(self._raw, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            with STARTUP_GRACE_LOCK:
+                if time.time() < STARTUP_GRACE_END:
+                    try:
+                        return attr(*args, **kwargs)
+                    except Exception as e:
+                        raise e
+
+            self._limiter.acquire()
+            if not self._cb.acquire():
+                raise BinanceAPIException(status_code=529, message="Circuit breaker OPEN")
+            try:
+                result = attr(*args, **kwargs)
+                self._limiter.success()
+                self._cb.record_success()
+                return result
+            except (BinanceAPIException, requests.RequestException) as e:
+                self._limiter.trigger_backoff()
+                self._cb.record_failure()
+                raise
+        return wrapped
+
+# === SIGNAL HANDLER =========================================================
+def signal_handler(signum, frame):
+    logger.info("Shutting down all threads...")
+    with thread_lock:
+        for t in active_threads.values():
+            t.running = False
+    with cancel_timer_lock:
+        for t in cancel_timer_threads.values():
+            t.running = False
+    for t in list(dynamic_buy_threads.values()) + list(dynamic_sell_threads.values()):
+        t.running = False
+    try:
+        bot.client._limiter.release()
+    except: pass
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+# === SAFE MATH ==============================================================
+def safe_float(value, default=0.0) -> float:
+    try:
+        return float(value) if value is not None and np.isfinite(float(value)) else default
+    except:
+        return default
+
+def to_decimal(value) -> Decimal:
+    try:
+        return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
+    except:
+        return ZERO
+
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
 engine = create_engine(DB_URL, echo=False, future=True)
@@ -166,315 +357,96 @@ class DBManager:
                 self.session.rollback()
         self.session.close()
 
-# === RATE LIMITER (DISABLED DURING GRACE) ===================================
-from collections import defaultdict
-from enum import Enum
-
-class CircuitState(Enum):
-    CLOSED = "CLOSED"
-    OPEN = "OPEN"
-    HALF_OPEN = "HALF_OPEN"
-
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0, half_open_successes: int = 3):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_successes = half_open_successes
-        self._lock = threading.Lock()
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._open_until = 0.0
-        self._half_open_success_count = 0
-        self._last_failure_time = 0.0
-
-    def _can_proceed(self) -> bool:
-        now = time.time()
-        with self._lock:
-            if self._state == CircuitState.OPEN:
-                if now >= self._open_until:
-                    self._state = CircuitState.HALF_OPEN
-                    self._half_open_success_count = 0
-                    logger.info("Circuit breaker HALF-OPEN → probing")
-                    return True
-                return False
-            return True
-
-    def acquire(self) -> bool:
-        # DISABLED DURING GRACE
-        with STARTUP_GRACE_LOCK:
-            if time.time() < STARTUP_GRACE_END:
-                return True
-        if not self._can_proceed():
-            return False
-        with self._lock:
-            if self._state == CircuitState.HALF_OPEN:
-                if threading.active_count() > 1:
-                    return False
-            return True
-
-    def record_failure(self):
-        with STARTUP_GRACE_LOCK:
-            if time.time() < STARTUP_GRACE_END:
-                return
-        now = time.time()
-        with self._lock:
-            self._last_failure_time = now
-            self._failure_count += 1
-            if self._state == CircuitState.HALF_OPEN:
-                self._failure_count = self.failure_threshold
-            if self._failure_count >= self.failure_threshold:
-                self._state = CircuitState.OPEN
-                self._open_until = now + self.recovery_timeout
-                logger.warning(f"CIRCUIT BREAKER OPENED → blocking for {self.recovery_timeout}s")
-                self._failure_count = 0
-
-    def record_success(self):
-        with self._lock:
-            if self._state == CircuitState.HALF_OPEN:
-                self._half_open_success_count += 1
-                if self._half_open_success_count >= self.half_open_successes:
-                    self._state = CircuitState.CLOSED
-                    self._failure_count = 0
-                    logger.info("Circuit breaker CLOSED → normal operation")
-            else:
-                self._failure_count = 0
-
-    def state(self) -> str:
-        with self._lock:
-            return self._state.value
-
-class ExponentialThreadedRateLimiter:
-    def __init__(self, base_seconds: float = 8.0, extra_per_thread: float = 3.0, max_backoff: float = 120.0):
-        self.base = base_seconds
-        self.extra = extra_per_thread
-        self.max_backoff = max_backoff
-        self.lock = threading.Lock()
-        self.last_call = defaultdict(float)
-        self.backoff_until = defaultdict(float)
-        self.thread_count = 0
-
-    def _current_interval(self) -> float:
-        with self.lock:
-            return self.base + max(0, self.thread_count - 1) * self.extra
-
-    def acquire(self):
-        # DISABLED DURING GRACE
-        with STARTUP_GRACE_LOCK:
-            if time.time() < STARTUP_GRACE_END:
-                return
-        tid = threading.get_ident()
-        interval = self._current_interval()
-        with self.lock:
-            if tid not in self.last_call:
-                self.thread_count += 1
-            now = time.time()
-            forced = self.backoff_until[tid]
-            wait_until = max(self.last_call[tid] + interval, forced)
-            self.last_call[tid] = max(now, wait_until)
-        sleep_time = max(0.0, wait_until - time.time())
-        if sleep_time:
-            time.sleep(sleep_time)
-
-    def _trigger_backoff(self):
-        with STARTUP_GRACE_LOCK:
-            if time.time() < STARTUP_GRACE_END:
-                return
-        tid = threading.get_ident()
-        with self.lock:
-            current = self.backoff_until[tid]
-            new_val = min(current * 2.0, self.max_backoff) if current > 0 else self.base
-            self.backoff_until[tid] = time.time() + new_val
-            logger.debug(f"Back-off triggered for thread {tid}: {new_val:.1f}s")
-
-    def success(self):
-        with STARTUP_GRACE_LOCK:
-            if time.time() < STARTUP_GRACE_END:
-                return
-        tid = threading.get_ident()
-        with self.lock:
-            self.backoff_until[tid] = 0.0
-
-    def release(self):
-        tid = threading.get_ident()
-        with self.lock:
-            self.thread_count = max(0, self.thread_count - 1)
-            self.last_call.pop(tid, None)
-            self.backoff_until.pop(tid, None)
-
-# === RATE-LIMITED CLIENT (BYPASSES ALL DURING GRACE) ========================
-from binance.client import Client as _BinanceClient
-
-class RateLimitedClient:
-    def __init__(self, raw_client: _BinanceClient, limiter: ExponentialThreadedRateLimiter, circuit_breaker: CircuitBreaker):
-        self._raw = raw_client
-        self._limiter = limiter
-        self._cb = circuit_breaker
-
-    def __getattr__(self, name):
-        attr = getattr(self._raw, name)
-        if not callable(attr):
-            return attr
-
-        def wrapped(*args, **kwargs):
-            # BYPASS ALL DURING GRACE
-            with STARTUP_GRACE_LOCK:
-                if time.time() < STARTUP_GRACE_END:
-                    try:
-                        return attr(*args, **kwargs)
-                    except Exception as e:
-                        raise e
-
-            # Normal path after grace
-            self._limiter.acquire()
-            if not self._cb.acquire():
-                raise BinanceAPIException(status_code=529, message="Circuit breaker OPEN – API blocked")
+# === CUSTOM RETRY DECORATOR =================================================
+def retry_custom(func):
+    def wrapper(*args, **kwargs):
+        max_retries = 5
+        base_delay = 2.0
+        for i in range(max_retries):
             try:
-                result = attr(*args, **kwargs)
-                self._limiter.success()
-                self._cb.record_success()
-                return result
-            except (BinanceAPIException, requests.RequestException) as e:
-                self._limiter._trigger_backoff()
-                self._cb.record_failure()
-                raise
-        return wrapped
+                return func(*args, **kwargs)
+            except Exception as e:
+                if i == max_retries - 1:
+                    raise
+                delay = base_delay * (2 ** i)
+                logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e} → sleep {delay}s")
+                time.sleep(delay)
+    return wrapper
 
-# === SIGNAL HANDLER =========================================================
-def signal_handler(signum, frame):
-    logger.info("Shutting down all threads...")
-    with thread_lock:
-        for symbol, thread in active_threads.items():
-            thread.running = False
-    with cancel_timer_lock:
-        for t in cancel_timer_threads.values():
-            t.running = False
-    for t in list(dynamic_buy_threads.values()) + list(dynamic_sell_threads.values()):
-        t.running = False
-    try:
-        bot.client._limiter.release()
-    except: pass
-    sys.exit(0)
-signal.signal(signal.SIGINT, signal_handler)
-
-# === SAFE MATH ==============================================================
-def safe_float(value, default=0.0) -> float:
-    try:
-        return float(value) if value is not None and np.isfinite(float(value)) else default
-    except:
-        return default
-
-def is_valid_float(value) -> bool:
-    return value is not None and np.isfinite(value) and value > 0
-
-def to_decimal(value) -> Decimal:
-    try:
-        return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
-    except:
-        return ZERO
-
-# === FETCH SYMBOLS (NO RATE LIMIT DURING GRACE) =============================
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
+# === FETCH SYMBOLS ==========================================================
+@retry_custom
 def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
     global valid_symbols_dict
-    try:
-        info = client.get_exchange_info()
-        raw_symbols = [
-            s['symbol'] for s in info['symbols']
-            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
-        ]
+    info = client.get_exchange_info()
+    raw_symbols = [
+        s['symbol'] for s in info['symbols']
+        if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
+    ]
+    raw_symbols = [s for s in raw_symbols if s not in {'USDCUSDT', 'USDTUSDT'}]
 
-        EXCLUDED_PAIRS = {'USDCUSDT', 'USDTUSDT'}
-        raw_symbols = [s for s in raw_symbols if s not in EXCLUDED_PAIRS]
+    valid = {}
+    for symbol in raw_symbols:
+        try:
+            ticker = client.get_ticker(symbol=symbol)
+            price = safe_float(ticker.get('lastPrice'))
+            volume = safe_float(ticker.get('quoteVolume'))
+            low_24h = safe_float(ticker.get('lowPrice'))
+            if MIN_PRICE <= price <= MAX_PRICE and volume >= MIN_24H_VOLUME_USDT and low_24h > 0:
+                valid[symbol] = {'price': price, 'volume': volume, 'low_24h': low_24h}
+        except: continue
 
-        valid = {}
-        for symbol in raw_symbols:
-            try:
-                ticker = client.get_ticker(symbol=symbol)
-                price = safe_float(ticker.get('lastPrice'))
-                volume = safe_float(ticker.get('quoteVolume'))
-                low_24h = safe_float(ticker.get('lowPrice'))
-
-                if not (MIN_PRICE <= price <= MAX_PRICE and volume >= MIN_24H_VOLUME_USDT and is_valid_float(low_24h)):
-                    continue
-
-                valid[symbol] = {
-                    'price': price,
-                    'volume': volume,
-                    'low_24h': low_24h
-                }
-            except Exception as e:
-                logger.debug(f"Failed to validate {symbol}: {e}")
-                continue
-
-        valid_symbols_dict = valid
-        logger.info(f"Valid symbols: {len(valid)}")
-        return valid
-    except Exception as e:
-        logger.error(f"Symbol fetch failed: {e}")
-        return {}
+    valid_symbols_dict = valid
+    logger.info(f"Valid symbols: {len(valid)}")
+    return valid
 
 # === ORDER BOOK =============================================================
+@retry_custom
 def get_order_book_analysis(client, symbol: str) -> dict:
     now = time.time()
     cache = order_book_cache.get(symbol, {})
     if cache and now - cache.get('ts', 0) < 1:
         return cache
+    depth = client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LIMIT)
+    bids = depth.get('bids', [])[:5]
+    asks = depth.get('asks', [])[:5]
+    bid_vol = sum(Decimal(b[1]) for b in bids)
+    ask_vol = sum(Decimal(a[1]) for a in asks)
+    total = bid_vol + ask_vol or Decimal('1')
+    result = {
+        'pct_bid': float(bid_vol / total * 100),
+        'pct_ask': float(ask_vol / total * 100),
+        'best_bid': Decimal(bids[0][0]) if bids else ZERO,
+        'best_ask': Decimal(asks[0][0]) if asks else ZERO,
+        'ts': now
+    }
+    order_book_cache[symbol] = result
+    return result
 
-    try:
-        depth = client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LIMIT)
-        bids = depth.get('bids', [])[:5]
-        asks = depth.get('asks', [])[:5]
-
-        bid_vol = sum(Decimal(b[1]) for b in bids)
-        ask_vol = sum(Decimal(a[1]) for a in asks)
-        total = bid_vol + ask_vol or Decimal('1')
-
-        result = {
-            'pct_bid': float(bid_vol / total * 100),
-            'pct_ask': float(ask_vol / total * 100),
-            'best_bid': Decimal(bids[0][0]) if bids else ZERO,
-            'best_ask': Decimal(asks[0][0]) if asks else ZERO,
-            'ts': now
-        }
-        order_book_cache[symbol] = result
-        return result
-    except:
-        return {'pct_bid': 50.0, 'pct_ask': 50.0, 'best_bid': ZERO, 'best_ask': ZERO}
-
-# === TICK SIZE HELPER =======================================================
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+# === TICK SIZE ==============================================================
+@retry_custom
 def get_tick_size(client, symbol):
-    try:
-        info = client.get_symbol_info(symbol)
-        for f in info['filters']:
-            if f['filterType'] == 'PRICE_FILTER':
-                return Decimal(f['tickSize'])
-        return Decimal('0.00000001')
-    except:
-        return Decimal('0.00000001')
+    info = client.get_symbol_info(symbol)
+    for f in info['filters']:
+        if f['filterType'] == 'PRICE_FILTER':
+            return Decimal(f['tickSize'])
+    return Decimal('0.00000001')
 
 # === METRICS ================================================================
+@retry_custom
 def get_rsi_and_trend(client, symbol) -> Tuple[Optional[float], str, Optional[float]]:
-    try:
-        klines = client.get_klines(symbol=symbol, interval='1m', limit=100)
-        closes = np.array([safe_float(k[4]) for k in klines[-100:]])
-        if len(closes) < RSI_PERIOD: return None, "unknown", None
+    klines = client.get_klines(symbol=symbol, interval='1m', limit=100)
+    closes = np.array([safe_float(k[4]) for k in klines[-100:]])
+    if len(closes) < RSI_PERIOD: return None, "unknown", None
+    rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
+    if not np.isfinite(rsi): return None, "unknown", None
+    upper, middle, _ = talib.BBANDS(closes, timeperiod=BB_PERIOD, nbdevup=BB_DEV, nbdevdn=BB_DEV)
+    macd, signal_line, _ = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
+    trend = ("bullish" if closes[-1] > middle[-1] and macd[-1] > signal_line[-1]
+             else "bearish" if closes[-1] < middle[-1] and macd[-1] < signal_line[-1] else "sideways")
+    low_24h = valid_symbols_dict.get(symbol, {}).get('low_24h')
+    return float(rsi), trend, float(low_24h) if low_24h else None
 
-        rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-        if not np.isfinite(rsi): return None, "unknown", None
-
-        upper, middle, _ = talib.BBANDS(closes, timeperiod=BB_PERIOD, nbdevup=BB_DEV, nbdevdn=BB_DEV)
-        macd, signal_line, _ = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
-
-        trend = ("bullish" if closes[-1] > middle[-1] and macd[-1] > signal_line[-1] else
-                 "bearish" if closes[-1] < middle[-1] and macd[-1] < signal_line[-1] else "sideways")
-
-        low_24h = valid_symbols_dict.get(symbol, {}).get('low_24h')
-        return float(rsi), trend, float(low_24h) if low_24h else None
-    except:
-        return None, "unknown", None
-
-# === 15-MIN BUY COOLDOWN ====================================================
+# === BUY COOLDOWN ===========================================================
 def can_place_buy_order(symbol: str) -> bool:
     now = time.time()
     last_buy = buy_cooldown.get(symbol, 0)
@@ -803,11 +775,254 @@ class CoinMonitorThread(threading.Thread):
 
             time.sleep(POLL_INTERVAL)
 
+# === HELPER FUNCTIONS =======================================================
+@retry_custom
+def get_balance(client, asset='USDT') -> float:
+    for bal in client.get_account()['balances']:
+        if bal['asset'] == asset:
+            return safe_float(bal['free'])
+    return 0.0
+
+@retry_custom
+def get_trade_fees(client, symbol):
+    fee = client.get_trade_fee(symbol=symbol)
+    return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
+
+def validate_and_adjust_order(client, symbol, side, order_type, quantity, price):
+    try:
+        info = client.get_symbol_info(symbol)
+        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
+
+        step_qty = Decimal(lot['stepSize'])
+        tick = Decimal(price_f['tickSize'])
+
+        qty = (quantity // step_qty) * step_qty
+        price = (price // tick) * tick
+
+        return {'quantity': float(qty), 'price': float(price)}, None
+    except Exception as e:
+        logger.error(f"Filter error {symbol}: {e}")
+        return None, "Filter error"
+
+def send_whatsapp_alert(message: str):
+    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
+        try:
+            url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
+            requests.get(url, timeout=5)
+        except Exception as e:
+            logger.debug(f"WhatsApp alert failed: {e}")
+
+def import_owned_assets_to_db(client, sess):
+    try:
+        account = client.get_account()
+        for bal in account['balances']:
+            asset = bal['asset']
+            free_str = bal['free']
+            qty = safe_float(free_str)
+            if qty <= 0 or asset in {'USDT', 'USDC'}:
+                continue
+
+            symbol = f"{asset}USDT"
+            if sess.query(Position).filter_by(symbol=symbol).first():
+                continue
+
+            price = get_price_usdt(client, asset)
+            if price <= ZERO:
+                logger.warning(f"Could not get price for {asset}, skipping import")
+                continue
+
+            maker_fee, _ = get_trade_fees(client, symbol)
+            pos = Position(
+                symbol=symbol,
+                quantity=Decimal(str(qty)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN),
+                avg_entry_price=price,
+                buy_fee_rate=Decimal(str(maker_fee))
+            )
+            sess.add(pos)
+            logger.info(f"Imported existing position {symbol}: {qty} @ {price}")
+    except Exception as e:
+        logger.error(f"import_owned_assets_to_db failed: {e}")
+
+@retry_custom
+def get_price_usdt(client, asset: str) -> Decimal:
+    if asset == 'USDT': return Decimal('1')
+    symbol = asset + 'USDT'
+    try:
+        return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+    except:
+        return ZERO
+
+def set_terminal_background_and_title():
+    try:
+        print("\033]0;TRADING BOT – LIVE\007", end='')
+        print("\033[48;5;17m", end='')
+        print("\033[2J\033[H", end='')
+    except:
+        pass
+
+@retry_custom
+def calculate_total_portfolio_value(client):
+    try:
+        account = client.get_account()
+        total = Decimal('0')
+        values = {}
+        for b in account['balances']:
+            qty = Decimal(str(safe_float(b['free'])))
+            if qty <= 0: continue
+            if b['asset'] == 'USDT':
+                total += qty
+                values['USDT'] = float(qty)
+            else:
+                price = get_price_usdt(client, b['asset'])
+                if price > 0:
+                    val = qty * price
+                    total += val
+                    values[b['asset']] = float(val)
+        return float(total), values
+    except Exception as e:
+        logger.warning(f"Portfolio value error: {e}")
+        return 0.0, {}
+
+def now_cst():
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# === PROFESSIONAL DASHBOARD =================================================
+def print_professional_dashboard(client, bot):
+    try:
+        with dashboard_lock:
+            set_terminal_background_and_title()
+            os.system('cls' if os.name == 'nt' else 'clear')
+            now = now_cst()
+            usdt_free = get_balance(client, 'USDT')
+            total_portfolio, _ = calculate_total_portfolio_value(client)
+
+            NAVY = "\033[48;5;17m"
+            YELLOW = "\033[38;5;226m"
+            GREEN = "\033[38;5;82m"
+            RED = "\033[38;5;196m"
+            RESET = "\033[0m"
+            BOLD = "\033[1m"
+
+            grace_remaining = max(0, STARTUP_GRACE_END - time.time())
+            grace_str = f"{grace_remaining:.0f}s" if grace_remaining > 0 else "ACTIVE"
+
+            print(f"{NAVY}{'='*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
+            print(f"{NAVY}{'='*120}{RESET}\n")
+
+            print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dynamic_sell_threads)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Rate Limits':<20} {'OFF (Grace)' if grace_remaining > 0 else 'ON'}{RESET}")
+            print(f"{NAVY}{YELLOW}{'Circuit Breaker':<20} {grace_str} ({bot.client._cb.state()}){RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # POSITIONS
+            with DBManager() as sess:
+                db_positions = sess.query(Position).all()
+
+            if db_positions:
+                print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+                total_pnl = Decimal('0')
+                for pos in db_positions:
+                    symbol = pos.symbol
+                    qty = float(pos.quantity)
+                    entry = float(pos.avg_entry_price)
+                    ob = get_order_book_analysis(client, symbol)
+                    cur_price = float(ob['best_bid'] or ob['best_ask'])
+                    rsi, _, _ = get_rsi_and_trend(client, symbol)
+                    rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+
+                    maker, taker = get_trade_fees(client, symbol)
+                    gross = (cur_price - entry) * qty
+                    fee_cost = (maker + taker) * cur_price * qty
+                    net_profit = gross - fee_cost
+                    pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+                    total_pnl += Decimal(str(net_profit))
+
+                    status = ("Trailing Sell Active" if symbol in dynamic_sell_threads
+                              else "Trailing Buy Active" if symbol in dynamic_buy_threads
+                              else "24/7 Monitoring")
+                    color = GREEN if net_profit > 0 else RED
+                    print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
+
+                print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+                pnl_color = GREEN if total_pnl > 0 else RED
+                print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
+            else:
+                print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
+
+            # UNIVERSE SUMMARY
+            print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
+            print(f"{NAVY}{YELLOW}{'AVG 24H VOLUME':<20} ${sum(s['volume'] for s in valid_symbols_dict.values()):,.0f}{RESET}")
+            print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # BUY WATCHLIST
+            print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            watchlist = []
+            for symbol in valid_symbols_dict.keys():
+                ob = get_order_book_analysis(client, symbol)
+                rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
+                if (rsi is not None and rsi <= RSI_OVERSOLD and
+                    ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+                    low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01')):
+                    watchlist.append((symbol, rsi, ob['pct_ask'], ob['best_bid']))
+
+            if watchlist:
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'RSI':>6} {'SELL %':>8} {'PRICE':>12}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*40}{RESET}")
+                for sym, rsi_val, sell_pct, nauki in sorted(watchlist, key=lambda x: x[1])[:10]:
+                    print(f"{NAVY}{YELLOW}{sym:<10} {rsi_val:>6.1f} {sell_pct:>7.1f}% ${nauki:>11.6f}{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No strong dip signals.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # SELL WATCHLIST
+            print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            sell_watch = []
+            with DBManager() as sess:
+                for pos in sess.query(Position).all():
+                    symbol = pos.symbol
+                    entry = Decimal(str(pos.avg_entry_price))
+                    ob = get_order_book_analysis(client, symbol)
+                    sell_price = ob['best_ask']
+                    rsi, _, _ = get_rsi_and_trend(client, symbol)
+                    maker, taker = get_trade_fees(client, symbol)
+                    net_return = (sell_price - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
+                    if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
+                        sell_watch.append((symbol, float(net_return * 100), rsi))
+
+            if sell_watch:
+                print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'NET %':>8} {'RSI':>6}{RESET}")
+                print(f"{NAVY}{YELLOW}{'-'*30}{RESET}")
+                for sym, ret_pct, rsi_val in sorted(sell_watch, key=lambda x: x[1], reverse=True)[:10]:
+                    print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f}{RESET}")
+            else:
+                print(f"{NAVY}{YELLOW} No profitable sell signals.{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            print(f"{NAVY}{'='*120}{RESET}\n")
+
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
-        self.rate_limiter = ExponentialThreadedRateLimiter(base_seconds=8.0, extra_per_thread=3.0, max_backoff=120.0)
-        self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0, half_open_successes=3)
+        self.rate_limiter = CustomRateLimiter(base_seconds=8.0, extra_per_thread=3.0, max_backoff=120.0)
+        self.circuit_breaker = CircuitBreaker()
         raw_client = Client(API_KEY, API_SECRET, tld='us')
         self.client = RateLimitedClient(raw_client, self.rate_limiter, self.circuit_breaker)
 
@@ -892,174 +1107,14 @@ class BinanceTradingBot:
                     sess.delete(pos)
                     positions.pop(symbol, None)
 
-# === HELPER FUNCTIONS =======================================================
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-def get_balance(client, asset='USDT') -> float:
-    try:
-        for bal in client.get_account()['balances']:
-            if bal['asset'] == asset:
-                return safe_float(bal['free'])
-        return 0.0
-    except Exception as e:
-        logger.warning(f"get_balance failed: {e}")
-        return 0.0
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-def get_trade_fees(client, symbol):
-    try:
-        fee = client.get_trade_fee(symbol=symbol)
-        return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
-    except:
-        return 0.001, 0.001
-
-def validate_and_adjust_order(client, symbol, side, order_type, quantity, price):
-    try:
-        info = client.get_symbol_info(symbol)
-        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
-
-        step_qty = Decimal(lot['stepSize'])
-        tick = Decimal(price_f['tickSize'])
-
-        qty = (quantity // step_qty) * step_qty
-        price = (price // tick) * tick
-
-        return {'quantity': float(qty), 'price': float(price)}, None
-    except Exception as e:
-        logger.error(f"Filter error {symbol}: {e}")
-        return None, "Filter error"
-
-def send_whatsapp_alert(message: str):
-    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
-        try:
-            url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
-            requests.get(url, timeout=5)
-        except Exception as e:
-            logger.debug(f"WhatsApp alert failed: {e}")
-
-def import_owned_assets_to_db(client, sess):
-    try:
-        account = client.get_account()
-        for bal in account['balances']:
-            asset = bal['asset']
-            free_str = bal['free']
-            qty = safe_float(free_str)
-            if qty <= 0 or asset in {'USDT', 'USDC'}:
-                continue
-
-            symbol = f"{asset}USDT"
-            if sess.query(Position).filter_by(symbol=symbol).first():
-                continue
-
-            price = get_price_usdt(client, asset)
-            if price <= ZERO:
-                logger.warning(f"Could not get price for {asset}, skipping import")
-                continue
-
-            maker_fee, _ = get_trade_fees(client, symbol)
-            pos = Position(
-                symbol=symbol,
-                quantity=Decimal(str(qty)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN),
-                avg_entry_price=price,
-                buy_fee_rate=Decimal(str(maker_fee))
-            )
-            sess.add(pos)
-            logger.info(f"Imported existing position {symbol}: {qty} @ {price}")
-    except Exception as e:
-        logger.error(f"import_owned_assets_to_db failed: {e}")
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-def get_price_usdt(client, asset: str) -> Decimal:
-    if asset == 'USDT': return Decimal('1')
-    symbol = asset + 'USDT'
-    try:
-        return Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-    except:
-        return ZERO
-
-def set_terminal_background_and_title():
-    try:
-        print("\033]0;TRADING BOT – LIVE\007", end='')
-        print("\033[48;5;17m", end='')
-        print("\033[2J\033[H", end='')
-    except:
-        pass
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-def calculate_total_portfolio_value(client):
-    try:
-        account = client.get_account()
-        total = Decimal('0')
-        values = {}
-        for b in account['balances']:
-            qty = Decimal(str(safe_float(b['free'])))
-            if qty <= 0: continue
-            if b['asset'] == 'USDT':
-                total += qty
-                values['USDT'] = float(qty)
-            else:
-                price = get_price_usdt(client, b['asset'])
-                if price > 0:
-                    val = qty * price
-                    total += val
-                    values[b['asset']] = float(val)
-        return float(total), values
-    except Exception as e:
-        logger.warning(f"Portfolio value error: {e}")
-        return 0.0, {}
-
-def now_cst():
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-# === PROFESSIONAL DASHBOARD =================================================
-def print_professional_dashboard(client, bot):
-    try:
-        with dashboard_lock:
-            set_terminal_background_and_title()
-            os.system('cls' if os.name == 'nt' else 'clear')
-            now = now_cst()
-            usdt_free = get_balance(client, 'USDT')
-            total_portfolio, _ = calculate_total_portfolio_value(client)
-
-            NAVY = "\033[48;5;17m"
-            YELLOW = "\033[38;5;226m"
-            GREEN = "\033[38;5;82m"
-            RED = "\033[38;5;196m"
-            RESET = "\033[0m"
-            BOLD = "\033[1m"
-
-            grace_remaining = max(0, STARTUP_GRACE_END - time.time())
-            grace_str = f"{grace_remaining:.0f}s" if grace_remaining > 0 else "ACTIVE"
-
-            print(f"{NAVY}{'='*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
-            print(f"{NAVY}{'='*120}{RESET}\n")
-
-            print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Active Threads':<20} {len(active_threads)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(dynamic_buy_threads)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dynamic_sell_threads)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Rate Limits':<20} {'OFF (Grace)' if grace_remaining > 0 else 'ON'}{RESET}")
-            print(f"{NAVY}{YELLOW}{'Circuit Breaker':<20} {grace_str} ({bot.client._cb.state()}){RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
-
-            # [Positions, Universe, Watchlists — same as before]
-            # (omitted for brevity — identical, but included in full file)
-
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-
 # === MAIN ===================================================================
 def main():
     if not API_KEY or not API_SECRET:
         logger.critical("API keys missing.")
         sys.exit(1)
 
-    # === SHARED CLIENT (NO LIMITS FOR 8 MIN) ===
     circuit_breaker = CircuitBreaker()
-    limiter = ExponentialThreadedRateLimiter()
+    limiter = CustomRateLimiter()
     raw_client = Client(API_KEY, API_SECRET, tld='us')
     client = RateLimitedClient(raw_client, limiter, circuit_breaker)
 
@@ -1068,26 +1123,21 @@ def main():
     bot.circuit_breaker = circuit_breaker
     bot.rate_limiter = limiter
 
-    # === FETCH SYMBOLS (NO LIMIT) ===
     if not fetch_and_validate_usdt_pairs(client):
         sys.exit(1)
 
-    # === IMPORT POSITIONS (NO LIMIT) ===
     with DBManager() as sess:
         import_owned_assets_to_db(client, sess)
         sess.commit()
 
-    # === FIRST DASHBOARD (WARM-UP) ===
     print_professional_dashboard(client, bot)
     time.sleep(2)
 
-    # === ENABLE GRACE PERIOD: 8 MINUTES ===
     global STARTUP_GRACE_END
     with STARTUP_GRACE_LOCK:
         STARTUP_GRACE_END = time.time() + STARTUP_DURATION
     logger.info(f"ZERO RATE LIMITS FOR {STARTUP_DURATION}s (8 minutes)")
 
-    # === START MONITOR THREADS ===
     with thread_lock:
         for symbol in valid_symbols_dict.keys():
             if symbol not in active_threads:
