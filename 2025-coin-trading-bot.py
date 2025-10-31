@@ -254,7 +254,7 @@ def get_balance():
         acc = rate_limited_api_call(lambda c: c.get_account())
         for b in acc['balances']:
             if b['asset'] == 'USDT':
-                return/float(b['free'])
+                return float(b['free'])
         return 0.0
     except: return 0.0
 
