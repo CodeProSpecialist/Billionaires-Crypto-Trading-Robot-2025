@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Binance.US Dynamic Trailing Bot – WEBSOCKET + FULL PRO DASHBOARD
+BINANCE.US DYNAMIC TRAILING BOT – WEBSOCKET + FULL PRO DASHBOARD
 - Flash Dip → Market Buy
 - 15-Min Stall → Market Sell
-- WebSocket-Driven (NO REST polling)
-- Binance.US ONLY (tld='us')
+- 100% Binance.US WebSocket Compliant
+- Full Error Handling + Logging
 """
 
 import os
@@ -15,26 +15,28 @@ import sys
 import numpy as np
 import threading
 import json
+import hmac
+import hashlib
 from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
-from binance import ThreadedWebsocketManager
 from binance.exceptions import BinanceAPIException
 import talib
 from datetime import datetime
 import pytz
 import requests
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict
+from typing import Dict, Any
 from collections import deque, defaultdict
 import queue
+import websocket  # pip install websocket-client
 
-# === CONFIGURATION (BINANCE.US) =============================================
+# === CONFIGURATION ===========================================================
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
 MAX_PRICE = 1000.0
 MIN_PRICE = 0.01
 MIN_24H_VOLUME_USDT = 100000
-LOG_FILE = "crypto_trading_bot.log"
+LOG_FILE = "binance_us_bot.log"
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_DEV = 2
@@ -55,13 +57,16 @@ STALL_THRESHOLD_SECONDS = 15 * 60
 RAPID_DROP_THRESHOLD = 0.01
 RAPID_DROP_WINDOW = 5.0
 
-# BINANCE.US API
+# API
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
 # WebSocket
 MAX_KLINE_SYMBOLS = 30
 KLINE_UPDATE_INTERVAL = 60
+SUBSCRIBE_DELAY = 0.25  # 4 subs/sec → safe under 5/sec
+WS_BASE = "wss://stream.binance.us:9443"
+USER_DATA_URL = "wss://stream.binance.us:9443/ws/{}"
 
 # Dashboard
 DASHBOARD_REFRESH_INTERVAL = 20
@@ -94,12 +99,22 @@ low_24h_cache: Dict[str, float] = {}
 last_price_update: Dict[str, float] = {}
 buy_pressure_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 sell_pressure_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
+buy_cooldown: Dict[str, float] = {}
+stall_timer: Dict[str, float] = {}
 
 positions: Dict[str, dict] = {}
 dynamic_buy_active: set = set()
 dynamic_sell_active: set = set()
-twm = None
 
+# WebSocket
+ws_market = None
+ws_user = None
+ws_thread_market = None
+ws_thread_user = None
+listen_key = None
+last_ping_time = 0
+
+# Threads & locks
 api_queue = queue.Queue()
 api_worker_thread = None
 dashboard_lock = threading.Lock()
@@ -131,22 +146,25 @@ class DBManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
             self.session.rollback()
+            logger.error(f"DB error: {exc_val}")
         else:
             try: self.session.commit()
-            except SQLAlchemyError: self.session.rollback()
+            except SQLAlchemyError as e:
+                self.session.rollback()
+                logger.error(f"DB commit failed: {e}")
         self.session.close()
 
 # === SIGNAL HANDLER =========================================================
 def signal_handler(signum, frame):
     logger.info("Shutting down gracefully...")
-    if twm: twm.stop()
+    stop_websockets()
     sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# === API WORKER (BINANCE.US) ================================================
+# === API WORKER =============================================================
 def api_worker():
-    client = Client(API_KEY, API_SECRET, tld='us')  # BINANCE.US
+    client = Client(API_KEY, API_SECRET, tld='us')
     while True:
         try:
             func, args, kwargs, future = api_queue.get()
@@ -154,6 +172,7 @@ def api_worker():
             future.set_result(result)
         except Exception as e:
             future.set_exception(e)
+            logger.error(f"API worker error: {e}")
         finally:
             time.sleep(3)
         api_queue.task_done()
@@ -161,83 +180,200 @@ def api_worker():
 def rate_limited_api_call(func, *args, **kwargs):
     future = threading.Future()
     api_queue.put((func, args, kwargs, future))
-    return future.result()
+    try:
+        return future.result(timeout=30)
+    except Exception as e:
+        logger.error(f"API call failed: {e}")
+        return None
 
-# === WEBSOCKETS (BINANCE.US) ================================================
+# === WEBSOCKETS =============================================================
+def get_listen_key():
+    try:
+        response = rate_limited_api_call(lambda c: c.stream_get_listen_key())
+        if response and 'listenKey' in response:
+            return response['listenKey']
+        else:
+            logger.error("Invalid listenKey response")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to get listenKey: {e}")
+        return None
+
+def keep_alive_listen_key():
+    global listen_key
+    client = Client(API_KEY, API_SECRET, tld='us')
+    while True:
+        time.sleep(30 * 60)
+        if listen_key:
+            try:
+                client.stream_keepalive(listen_key)
+                logger.debug("listenKey kept alive")
+            except Exception as e:
+                logger.warning(f"listenKey keepalive failed: {e}, renewing...")
+                listen_key = get_listen_key()
+
+def on_message(ws, message):
+    global last_ping_time
+    try:
+        if not message.strip():
+            return
+        data = json.loads(message)
+
+        # Handle combined stream
+        if 'stream' in data and 'data' in data:
+            stream_name = data['stream']
+            payload = data['data']
+        else:
+            stream_name = None
+            payload = data
+
+        # === MARKET DATA ===
+        if stream_name == '!miniTicker@arr':
+            for t in payload:
+                symbol = t['s']
+                price_cache[symbol] = float(t['c'])
+                last_price_update[symbol] = time.time()
+                low_24h_cache[symbol] = min(low_24h_cache.get(symbol, float(t['c'])), float(t['l']))
+
+        elif stream_name == '!bookTicker':
+            symbol = payload['s']
+            bid = Decimal(payload['b'])
+            ask = Decimal(payload['a'])
+            total = bid + ask
+            pct_bid = float(bid / total * 100) if total > 0 else 50.0
+            pct_ask = float(ask / total * 100) if total > 0 else 50.0
+
+            book_cache[symbol] = {
+                'best_bid': bid, 'best_ask': ask,
+                'pct_bid': pct_bid, 'pct_ask': pct_ask,
+                'ts': time.time()
+            }
+            buy_pressure_history[symbol].append(pct_bid)
+            sell_pressure_history[symbol].append(pct_ask)
+
+        elif stream_name and '@kline_1m' in stream_name:
+            symbol = payload['s']
+            k = payload['k']
+            if not k['x']: return
+            close = float(k['c'])
+            klines_cache[symbol].append(close)
+
+            if len(klines_cache[symbol]) >= RSI_PERIOD and int(time.time()) % KLINE_UPDATE_INTERVAL == 0:
+                closes = np.array(list(klines_cache[symbol]))
+                rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
+                if np.isfinite(rsi):
+                    rsi_cache[symbol] = float(rsi)
+
+        # === USER DATA ===
+        elif payload.get('e') == 'executionReport':
+            order = payload
+            symbol = order['s']
+            side = order['S']
+            status = order['X']
+            qty = Decimal(order['q'])
+            price = Decimal(order['L']) if order['L'] else ZERO
+
+            if status == 'FILLED':
+                if side == 'BUY':
+                    record_buy(symbol, float(price), float(qty))
+                    send_whatsapp(f"FILLED BUY {symbol} @ {price:.6f}")
+                    dynamic_buy_active.discard(symbol)
+                elif side == 'SELL':
+                    record_sell(symbol, float(price), float(qty))
+                    send_whatsapp(f"FILLED SELL {symbol} @ {price:.6f}")
+                    dynamic_sell_active.discard(symbol)
+
+        # === PING/PONG ===
+        elif payload == {}:
+            ws.send(json.dumps({}))
+            last_ping_time = time.time()
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e} | Raw: {message[:200]}")
+    except Exception as e:
+        logger.error(f"Message handler error: {e}", exc_info=True)
+
+def on_error(ws, error):
+    logger.error(f"WebSocket error: {error}")
+
+def on_close(ws, code, msg):
+    logger.warning(f"WebSocket closed: {code} - {msg}")
+    time.sleep(5)
+    start_websockets()
+
+def on_open_market(ws):
+    logger.info("Market WebSocket connected. Subscribing...")
+    def subscribe():
+        streams = ["!miniTicker@arr", "!bookTicker"]
+        for sym in top_symbols:
+            streams.append(f"{sym.lower()}@kline_1m")
+        for stream in streams:
+            ws.send(json.dumps({
+                "method": "SUBSCRIBE",
+                "params": [stream],
+                "id": int(time.time() * 1000)
+            }))
+            time.sleep(SUBSCRIBE_DELAY)
+        logger.info(f"Subscribed to {len(streams)} streams")
+    threading.Thread(target=subscribe, daemon=True).start()
+
+def on_open_user(ws):
+    logger.info("User data stream connected")
+
 def start_websockets():
-    global twm
-    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET, tld='us')  # BINANCE.US
-    twm.start()
+    global ws_market, ws_user, ws_thread_market, ws_thread_user, listen_key
 
-    twm.start_multiplex_socket(
-        callback=on_multiplex_message,
-        streams=['!miniTicker@arr', '!bookTicker']
-    )
+    stop_websockets()
 
-    for sym in top_symbols:
-        twm.start_kline_socket(callback=on_kline, symbol=sym, interval='1m')
+    # === 1. Get listenKey ===
+    listen_key = get_listen_key()
+    if not listen_key:
+        logger.critical("Cannot start without listenKey")
+        return False
 
-    twm.start_user_socket(callback=handle_user_data)
+    # === 2. Market Stream ===
+    try:
+        ws_market = websocket.WebSocketApp(
+            f"{WS_BASE}/stream?streams=!miniTicker@arr/!bookTicker",
+            on_open=on_open_market,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
+        ws_thread_market = threading.Thread(target=ws_market.run_forever, kwargs={'ping_interval': 20}, daemon=True)
+        ws_thread_market.start()
+    except Exception as e:
+        logger.error(f"Market WS failed: {e}")
+        return False
 
-def on_multiplex_message(msg):
-    if 'stream' not in msg or 'data' not in msg: return
-    stream = msg['stream']
-    data = msg['data']
+    # === 3. User Stream ===
+    try:
+        user_url = USER_DATA_URL.format(listen_key)
+        ws_user = websocket.WebSocketApp(
+            user_url,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open_user
+        )
+        ws_thread_user = threading.Thread(target=ws_user.run_forever, kwargs={'ping_interval': 20}, daemon=True)
+        ws_thread_user.start()
+    except Exception as e:
+        logger.error(f"User WS failed: {e}")
+        return False
 
-    if stream == '!miniTicker@arr':
-        for t in data:
-            symbol = t['s']
-            price_cache[symbol] = float(t['c'])
-            last_price_update[symbol] = time.time()
-            low_24h_cache[symbol] = min(low_24h_cache.get(symbol, float(t['c'])), float(t['l']))
+    # === 4. Keepalive ===
+    threading.Thread(target=keep_alive_listen_key, daemon=True).start()
 
-    elif stream == '!bookTicker':
-        symbol = data['s']
-        bid = Decimal(data['b'])
-        ask = Decimal(data['a'])
-        total = bid + ask
-        pct_bid = float(bid / total * 100) if total > 0 else 50.0
-        pct_ask = float(ask / total * 100) if total > 0 else 50.0
+    logger.info("All WebSocket streams started")
+    return True
 
-        book_cache[symbol] = {
-            'best_bid': bid, 'best_ask': ask,
-            'pct_bid': pct_bid, 'pct_ask': pct_ask,
-            'ts': time.time()
-        }
-        buy_pressure_history[symbol].append(pct_bid)
-        sell_pressure_history[symbol].append(pct_ask)
-
-def on_kline(msg):
-    k = msg['k']
-    if not k['x']: return
-    symbol = msg['s']
-    close = float(k['c'])
-    klines_cache[symbol].append(close)
-
-    if len(klines_cache[symbol]) >= RSI_PERIOD and int(time.time()) % KLINE_UPDATE_INTERVAL == 0:
-        closes = np.array(list(klines_cache[symbol]))
-        rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-        if np.isfinite(rsi):
-            rsi_cache[symbol] = float(rsi)
-
-def handle_user_data(msg):
-    if msg.get('e') == 'executionReport':
-        order = msg
-        symbol = order['s']
-        side = order['S']
-        status = order['X']
-        qty = Decimal(order['q'])
-        price = Decimal(order['L']) if order['L'] else ZERO
-
-        if status == 'FILLED':
-            if side == 'BUY':
-                record_buy(symbol, float(price), float(qty))
-                send_whatsapp(f"FILLED BUY {symbol} @ {price:.6f}")
-                dynamic_buy_active.discard(symbol)
-            elif side == 'SELL':
-                record_sell(symbol, float(price), float(qty))
-                send_whatsapp(f"FILLED SELL {symbol} @ {price:.6f}")
-                dynamic_sell_active.discard(symbol)
+def stop_websockets():
+    global ws_market, ws_user
+    try:
+        if ws_market: ws_market.close()
+        if ws_user: ws_user.close()
+    except: pass
 
 # === UTILS ==================================================================
 def to_decimal(v): return Decimal(str(v)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
@@ -247,95 +383,103 @@ def send_whatsapp(msg):
         try:
             url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}"
             requests.get(url, timeout=5)
-        except: pass
+        except Exception as e:
+            logger.error(f"WhatsApp failed: {e}")
 
 def get_balance():
     try:
         acc = rate_limited_api_call(lambda c: c.get_account())
+        if not acc: return 0.0
         for b in acc['balances']:
             if b['asset'] == 'USDT':
                 return float(b['free'])
         return 0.0
-    except: return 0.0
+    except Exception as e:
+        logger.error(f"Balance error: {e}")
+        return 0.0
 
 # === STRATEGY LOGIC =========================================================
 def check_buy_signal(symbol):
-    if (symbol in dynamic_buy_active or symbol in positions or
-        time.time() - buy_cooldown.get(symbol, 0) < 15 * 60):
-        return
+    try:
+        if (symbol in dynamic_buy_active or symbol in positions or
+            time.time() - buy_cooldown.get(symbol, 0) < 15 * 60):
+            return
 
-    book = book_cache.get(symbol, {})
-    if not book or book['best_bid'] <= 0: return
-    bid = book['best_bid']
-    rsi = rsi_cache.get(symbol)
-    low_24h = low_24h_cache.get(symbol)
+        book = book_cache.get(symbol, {})
+        if not book or book['best_bid'] <= 0: return
+        bid = book['best_bid']
+        rsi = rsi_cache.get(symbol)
+        low_24h = low_24h_cache.get(symbol)
 
-    if (rsi is not None and rsi <= RSI_OVERSOLD and
-        book['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
-        low_24h and bid <= Decimal(str(low_24h)) * Decimal('1.01')):
-        start_dynamic_buy(symbol, bid)
+        if (rsi is not None and rsi <= RSI_OVERSOLD and
+            book['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+            low_24h and bid <= Decimal(str(low_24h)) * Decimal('1.01')):
+            start_dynamic_buy(symbol, bid)
+    except Exception as e:
+        logger.error(f"Buy signal error {symbol}: {e}")
 
 def check_sell_signal(symbol):
-    if symbol not in positions or symbol in dynamic_sell_active: return
-    pos = positions[symbol]
-    entry = Decimal(str(pos['entry_price']))
-    qty = Decimal(str(pos['qty']))
-    book = book_cache.get(symbol, {})
-    if not book: return
-    ask = book['best_ask']
-    rsi = rsi_cache.get(symbol)
+    try:
+        if symbol not in positions or symbol in dynamic_sell_active: return
+        pos = positions[symbol]
+        entry = Decimal(str(pos['entry_price']))
+        qty = Decimal(str(pos['qty']))
+        book = book_cache.get(symbol, {})
+        if not book: return
+        ask = book['best_ask']
+        rsi = rsi_cache.get(symbol)
 
-    net_return = (ask - entry) / entry - Decimal('0.002')
-    if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
-        history = buy_pressure_history[symbol]
-        if len(history) >= 3:
-            peak = max(history)
-            if peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and history[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
-                start_dynamic_sell(symbol, entry, qty)
+        net_return = (ask - entry) / entry - Decimal('0.002')
+        if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
+            history = buy_pressure_history[symbol]
+            if len(history) >= 3:
+                peak = max(history)
+                if peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and history[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
+                    start_dynamic_sell(symbol, entry, qty)
+    except Exception as e:
+        logger.error(f"Sell signal error {symbol}: {e}")
 
 # === DYNAMIC BUY/SELL =======================================================
-buy_cooldown: Dict[str, float] = {}
-
 def start_dynamic_buy(symbol, trigger_price):
     if symbol in dynamic_buy_active: return
     dynamic_buy_active.add(symbol)
     threading.Thread(target=run_dynamic_buy, args=(symbol, trigger_price), daemon=True).start()
 
 def run_dynamic_buy(symbol, trigger_price):
-    lowest = trigger_price
-    force_market = False
-
-    while symbol in dynamic_buy_active:
-        book = book_cache.get(symbol, {})
-        if not book: time.sleep(0.5); continue
-        price = book['best_bid']
-
-        now = time.time()
-        if symbol in last_price_update and now - last_price_update[symbol] < RAPID_DROP_WINDOW:
-            drop = (price_cache.get(symbol, price) - price) / price
-            if drop >= RAPID_DROP_THRESHOLD:
-                force_market = True
-                break
-
-        if price < lowest: lowest = price
-        if price > lowest * Decimal('1.003'): break
-
-        history = sell_pressure_history[symbol]
-        if len(history) >= 3:
-            peak = max(history)
-            if peak >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and history[-1] <= peak * 0.9:
-                break
-
-        time.sleep(0.5)
-
     try:
+        lowest = trigger_price
+        force_market = False
+
+        while symbol in dynamic_buy_active:
+            book = book_cache.get(symbol, {})
+            if not book: time.sleep(0.5); continue
+            price = book['best_bid']
+
+            now = time.time()
+            if symbol in last_price_update and now - last_price_update[symbol] < RAPID_DROP_WINDOW:
+                drop = (price_cache.get(symbol, price) - price) / price
+                if drop >= RAPID_DROP_THRESHOLD:
+                    force_market = True
+                    break
+
+            if price < lowest: lowest = price
+            if price > lowest * Decimal('1.003'): break
+
+            history = sell_pressure_history[symbol]
+            if len(history) >= 3:
+                peak = max(history)
+                if peak >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and history[-1] <= peak * 0.9:
+                    break
+
+            time.sleep(0.5)
+
         balance = get_balance()
         if balance <= MIN_BALANCE: return
         alloc = min(Decimal(str(balance - MIN_BALANCE)) * RISK_PER_TRADE, Decimal(str(balance - MIN_BALANCE)))
 
         if force_market:
             order = rate_limited_api_call(lambda c: c.order_market_buy(symbol=symbol, quoteOrderQty=float(alloc)))
-            fill_price = to_decimal(order['fills'][0]['price'])
+            fill_price = to_decimal(order['fills'][0]['price']) if order and order.get('fills') else ZERO
             send_whatsapp(f"FLASH DIP BUY {symbol} @ {fill_price:.6f}")
         else:
             qty = alloc / price
@@ -343,7 +487,7 @@ def run_dynamic_buy(symbol, trigger_price):
             send_whatsapp(f"LIMIT BUY {symbol} @ {price:.6f}")
         buy_cooldown[symbol] = time.time()
     except Exception as e:
-        logger.error(f"Buy failed: {e}")
+        logger.error(f"Dynamic buy failed {symbol}: {e}")
     finally:
         dynamic_buy_active.discard(symbol)
 
@@ -353,33 +497,34 @@ def start_dynamic_sell(symbol, entry, qty):
     threading.Thread(target=run_dynamic_sell, args=(symbol, entry, qty), daemon=True).start()
 
 def run_dynamic_sell(symbol, entry, qty):
-    peak = entry
-    while symbol in dynamic_sell_active:
-        book = book_cache.get(symbol, {})
-        if not book: time.sleep(0.5); continue
-        price = book['best_bid']
-        if price > peak: peak = price
+    try:
+        peak = entry
+        while symbol in dynamic_sell_active:
+            book = book_cache.get(symbol, {})
+            if not book: time.sleep(0.5); continue
+            price = book['best_bid']
+            if price > peak: peak = price
 
-        if price >= entry * Decimal('1.005'):
-            stall_timer[symbol] = time.time()
-        if symbol in stall_timer and time.time() - stall_timer[symbol] >= STALL_THRESHOLD_SECONDS:
-            execute_market_sell(symbol, qty)
-            break
+            if price >= entry * Decimal('1.005'):
+                stall_timer[symbol] = time.time()
+            if symbol in stall_timer and time.time() - stall_timer[symbol] >= STALL_THRESHOLD_SECONDS:
+                execute_market_sell(symbol, qty)
+                break
 
-        if price < peak * Decimal('0.995'):
-            execute_limit_sell(symbol, price, qty)
-            break
+            if price < peak * Decimal('0.995'):
+                execute_limit_sell(symbol, price, qty)
+                break
 
-        time.sleep(0.5)
-
-    dynamic_sell_active.discard(symbol)
-
-stall_timer: Dict[str, float] = {}
+            time.sleep(0.5)
+    except Exception as e:
+        logger.error(f"Dynamic sell failed {symbol}: {e}")
+    finally:
+        dynamic_sell_active.discard(symbol)
 
 def execute_market_sell(symbol, qty):
     try:
         order = rate_limited_api_call(lambda c: c.order_market_sell(symbol=symbol, quantity=float(qty)))
-        fill_price = to_decimal(order['fills'][0]['price'])
+        fill_price = to_decimal(order['fills'][0]['price']) if order and order.get('fills') else ZERO
         send_whatsapp(f"STALL SELL {symbol} @ {fill_price:.6f}")
     except Exception as e:
         logger.error(f"Market sell failed: {e}")
@@ -393,24 +538,30 @@ def execute_limit_sell(symbol, price, qty):
 
 # === DB HELPERS =============================================================
 def record_buy(symbol, price, qty):
-    with DBManager() as sess:
-        pos = sess.query(Position).filter_by(symbol=symbol).first()
-        if not pos:
-            sess.add(Position(symbol=symbol, quantity=to_decimal(qty), avg_entry_price=to_decimal(price)))
-        else:
-            total = pos.quantity * pos.avg_entry_price + to_decimal(qty) * to_decimal(price)
-            pos.quantity += to_decimal(qty)
-            pos.avg_entry_price = total / pos.quantity
-        positions[symbol] = {'entry_price': price, 'qty': qty}
+    try:
+        with DBManager() as sess:
+            pos = sess.query(Position).filter_by(symbol=symbol).first()
+            if not pos:
+                sess.add(Position(symbol=symbol, quantity=to_decimal(qty), avg_entry_price=to_decimal(price)))
+            else:
+                total = pos.quantity * pos.avg_entry_price + to_decimal(qty) * to_decimal(price)
+                pos.quantity += to_decimal(qty)
+                pos.avg_entry_price = total / pos.quantity
+            positions[symbol] = {'entry_price': price, 'qty': qty}
+    except Exception as e:
+        logger.error(f"Record buy failed: {e}")
 
 def record_sell(symbol, price, qty):
-    with DBManager() as sess:
-        pos = sess.query(Position).filter_by(symbol=symbol).first()
-        if pos:
-            pos.quantity -= to_decimal(qty)
-            if pos.quantity <= 0:
-                sess.delete(pos)
-                positions.pop(symbol, None)
+    try:
+        with DBManager() as sess:
+            pos = sess.query(Position).filter_by(symbol=symbol).first()
+            if pos:
+                pos.quantity -= to_decimal(qty)
+                if pos.quantity <= 0:
+                    sess.delete(pos)
+                    positions.pop(symbol, None)
+    except Exception as e:
+        logger.error(f"Record sell failed: {e}")
 
 # === DASHBOARD ==============================================================
 def set_terminal_background_and_title():
@@ -437,7 +588,7 @@ def print_professional_dashboard():
             BOLD = "\033[1m"
 
             print(f"{NAVY}{'='*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'BINANCE.US TRADING BOT – LIVE':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'BINANCE.US TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
             print(f"{NAVY}{'='*120}{RESET}\n")
 
             print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
@@ -453,7 +604,7 @@ def print_professional_dashboard():
                 db_positions = sess.query(Position).all()
 
             if db_positions:
-                print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS (BINANCE.US)':^120}{RESET}")
+                print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS':^120}{RESET}")
                 print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
                 print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
                 print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
@@ -473,30 +624,22 @@ def print_professional_dashboard():
                     pnl_pct = ((cur_price - entry) / entry - 0.002) * 100
                     total_pnl += Decimal(str(net_profit))
 
-                    status = ("Trailing Sell Active" if symbol in dynamic_sell_active
-                              else "Trailing Buy Active" if symbol in dynamic_buy_active
-                              else "24/7 Monitoring")
+                    status = ("Trailing Sell" if symbol in dynamic_sell_active
+                              else "Trailing Buy" if symbol in dynamic_buy_active
+                              else "Monitoring")
                     color = GREEN if net_profit > 0 else RED
                     print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
 
                 print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
                 pnl_color = GREEN if total_pnl > 0 else RED
-                print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
+                print(f"{NAVY}{YELLOW}{'TOTAL P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
             else:
-                print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
-
-            print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE (BINANCE.US)':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(price_cache)}{RESET}")
-            print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
-
-            # ... (BUY/SELL WATCHLISTS same as before) ...
+                print(f"{NAVY}{YELLOW} No positions.{RESET}\n")
 
             print(f"{NAVY}{'='*120}{RESET}\n")
 
     except Exception as e:
-        logger.error(f"Dashboard error: {e}")
+        logger.error(f"Dashboard error: {e}", exc_info=True)
 
 def calculate_total_portfolio_value():
     try:
@@ -507,37 +650,52 @@ def calculate_total_portfolio_value():
             if price > 0:
                 total += qty * price
         return float(total + Decimal(str(get_balance()))), {}
-    except:
+    except Exception as e:
+        logger.error(f"Portfolio calc error: {e}")
         return 0.0, {}
 
 # === MAIN ===================================================================
 top_symbols = []
 
 def main():
-    global twm, top_symbols
+    global top_symbols
 
     if not API_KEY or not API_SECRET:
         logger.critical("API keys missing")
         return
 
+    # Start API worker
+    global api_worker_thread
     api_worker_thread = threading.Thread(target=api_worker, daemon=True)
     api_worker_thread.start()
 
-    client = Client(API_KEY, API_SECRET, tld='us')  # BINANCE.US
-    info = client.get_exchange_info()
-    symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
-    tickers = client.get_ticker()
-    valid = [(t['symbol'], float(t['quoteVolume'])) for t in tickers
-             if t['symbol'] in symbols and float(t['quoteVolume']) >= MIN_24H_VOLUME_USDT]
-    top_symbols = [s[0] for s in sorted(valid, key=lambda x: x[1], reverse=True)[:MAX_KLINE_SYMBOLS]]
+    # Load symbols
+    client = Client(API_KEY, API_SECRET, tld='us')
+    try:
+        info = client.get_exchange_info()
+        symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+        tickers = client.get_ticker()
+        valid = [(t['symbol'], float(t['quoteVolume'])) for t in tickers
+                 if t['symbol'] in symbols and float(t['quoteVolume']) >= MIN_24H_VOLUME_USDT]
+        top_symbols = [s[0] for s in sorted(valid, key=lambda x: x[1], reverse=True)[:MAX_KLINE_SYMBOLS]]
+    except Exception as e:
+        logger.critical(f"Failed to load symbols: {e}")
+        return
 
-    start_websockets()
+    # Load positions
+    try:
+        with DBManager() as sess:
+            for p in sess.query(Position).all():
+                positions[p.symbol] = {'entry_price': float(p.avg_entry_price), 'qty': float(p.quantity)}
+    except Exception as e:
+        logger.error(f"DB load error: {e}")
 
-    with DBManager() as sess:
-        for p in sess.query(Position).all():
-            positions[p.symbol] = {'entry_price': float(p.avg_entry_price), 'qty': float(p.quantity)}
+    # Start WebSockets
+    if not start_websockets():
+        logger.critical("WebSocket startup failed")
+        return
 
-    logger.info(f"Binance.US WebSocket bot started with {len(top_symbols)} symbols")
+    logger.info(f"Bot started | {len(top_symbols)} symbols")
     last_dash = 0
     while True:
         try:
@@ -562,4 +720,5 @@ if __name__ == "__main__":
             main()
         except Exception as e:
             logger.critical(f"Bot crashed: {e}", exc_info=True)
+            stop_websockets()
             time.sleep(CRASH_RESTART_DELAY)
