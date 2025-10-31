@@ -9,6 +9,7 @@ Binance.US Dynamic Trailing Bot – FINAL VERSION
 - Bot Heartbeat (balance/positions every 30s)
 - Dashboard Refresh (every 20s)
 - Auto-Restart on Crash (4m30s)
+- HEARTBEAT FAILURE DETECTION + ALERT + SAFE RESTART
 """
 
 import os
@@ -30,7 +31,7 @@ import requests
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Tuple
 from collections import deque
-from ratelimit import limits, sleep_and_retry          # <-- ADDED
+from ratelimit import limits, sleep_and_retry
 
 # === SQLALCHEMY ==============================================================
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, ForeignKey, func
@@ -76,6 +77,7 @@ RATE_LIMIT_INCREMENT_PER_THREAD = 2
 
 # Heartbeat & Dashboard
 HEARTBEAT_INTERVAL = 30          # seconds
+HEARTBEAT_TIMEOUT = 90           # no pulse in 90s → failure
 DASHBOARD_REFRESH_INTERVAL = 20  # seconds
 CRASH_RESTART_DELAY = 4 * 60 + 30  # 4 min 30 sec
 
@@ -116,6 +118,8 @@ last_price_cache: Dict[str, Tuple[float, float]] = {}  # (price, timestamp)
 thread_lock = threading.Lock()
 dashboard_lock = threading.Lock()
 heartbeat_lock = threading.Lock()
+last_heartbeat_time = 0.0
+heartbeat_monitor_running = False
 
 # === Buy cooldown & order cancellation tracking ===
 buy_cooldown: Dict[str, float] = {}
@@ -217,7 +221,7 @@ def to_decimal(value) -> Decimal:
     except:
         return ZERO
 
-# === FETCH SYMBOLS ==========================================================
+# === FETCH SYMBOLS (FIXED: Removed get_trade_fees call) =====================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
 def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
     global valid_symbols_dict
@@ -377,7 +381,6 @@ class DynamicBuyThread(threading.Thread):
                 current_price = float(best_bid)
                 now = time.time()
 
-                # RAPID DROP → MARKET BUY
                 if self.symbol not in last_price_cache:
                     last_price_cache[self.symbol] = (current_price, now)
                 else:
@@ -626,7 +629,6 @@ class CoinMonitorThread(threading.Thread):
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # DYNAMIC BUY
                 with DBManager() as sess:
                     if not sess.query(Position).filter_by(symbol=self.symbol).first():
                         if (rsi is not None and rsi <= RSI_OVERSOLD and
@@ -643,7 +645,6 @@ class CoinMonitorThread(threading.Thread):
                             thread.start()
                             time.sleep(3)
 
-                # DYNAMIC SELL
                 with DBManager() as sess:
                     pos = sess.query(Position).filter_by(symbol=self.symbol).one_or_none()
                     if pos and self.symbol not in dynamic_sell_threads:
@@ -803,6 +804,7 @@ def send_whatsapp_alert(message: str):
         except Exception as e:
             logger.debug(f"WhatsApp alert failed: {e}")
 
+# === FIXED: import_owned_assets_to_db with correct args =====================
 def import_owned_assets_to_db(client, sess):
     try:
         account = rate_limited_api_call(client.get_account)
@@ -877,20 +879,43 @@ def calculate_total_portfolio_value(client):
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# === BOT HEARTBEAT (NEW) ====================================================
+# === BOT HEARTBEAT WITH FAILURE DETECTION ===================================
 def bot_heartbeat(client):
+    global last_heartbeat_time
     while True:
         try:
             with heartbeat_lock:
-                logger.debug("Heartbeat: Refreshing balance and positions...")
-                get_balance(client)  # Triggers API call
+                last_heartbeat_time = time.time()
+                logger.debug("Heartbeat pulse sent.")
+                get_balance(client)
                 with DBManager() as sess:
                     import_owned_assets_to_db(client, sess)
         except Exception as e:
             logger.error(f"Heartbeat failed: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
 
-# === PROFESSIONAL DASHBOARD (FULL & COMPLETE) ==============================
+def monitor_heartbeat_and_restart():
+    global last_heartbeat_time, heartbeat_monitor_running
+    heartbeat_monitor_running = True
+    while heartbeat_monitor_running:
+        time.sleep(10)
+        now = time.time()
+        if now - last_heartbeat_time > HEARTBEAT_TIMEOUT:
+            send_whatsapp_alert("HEARTBEAT FAILURE: Bot not responding!")
+            logger.critical("HEARTBEAT FAILURE DETECTED")
+
+            with thread_lock:
+                has_trailing = bool(dynamic_buy_threads or dynamic_sell_threads)
+
+            if not has_trailing:
+                logger.warning("No active trailing trades. Restarting main loop...")
+                send_whatsapp_alert("RESTARTING BOT: Safe to restart (no open trades)")
+                raise RuntimeError("Heartbeat timeout - safe restart")
+            else:
+                logger.warning("Trailing trades active. Waiting...")
+                send_whatsapp_alert("HEARTBEAT LOST but trailing trades active. Monitoring...")
+
+# === FULL PROFESSIONAL DASHBOARD ============================================
 def print_professional_dashboard(client):
     try:
         with dashboard_lock:
@@ -966,7 +991,7 @@ def print_professional_dashboard(client):
             print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
-            # === BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE) ===
+            # === BUY WATCHLIST ===
             print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
             watchlist = []
@@ -987,7 +1012,7 @@ def print_professional_dashboard(client):
                 print(f"{NAVY}{YELLOW} No strong dip signals.{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
 
-            # === SELL WATCHLIST (PROFIT + RSI ≥ 65) ===
+            # === SELL WATCHLIST ===
             print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
             sell_watch = []
@@ -1017,8 +1042,9 @@ def print_professional_dashboard(client):
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
-# === MAIN WITH CRASH RESTART ================================================
+# === MAIN WITH CRASH & HEARTBEAT RESTART ====================================
 def main_loop():
+    global last_heartbeat_time
     if not API_KEY or not API_SECRET:
         logger.critical("API keys missing.")
         sys.exit(1)
@@ -1036,9 +1062,12 @@ def main_loop():
                 active_threads[symbol] = thread
                 thread.start()
 
-    # Start heartbeat
+    last_heartbeat_time = time.time()
     heartbeat_thread = threading.Thread(target=bot_heartbeat, args=(client,), daemon=True)
     heartbeat_thread.start()
+
+    monitor_thread = threading.Thread(target=monitor_heartbeat_and_restart, daemon=True)
+    monitor_thread.start()
 
     logger.info("All threads running. Dashboard active.")
     last_dashboard = 0
