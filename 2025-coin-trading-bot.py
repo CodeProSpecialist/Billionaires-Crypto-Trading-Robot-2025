@@ -60,6 +60,7 @@ if not API_KEY or not API_SECRET:
 
 MAX_KLINE_SYMBOLS = 30
 WS_BASE = "wss://stream.binance.us:9443"
+WS_USER_BASE = "wss://ws-api.binance.us:443"
 SUBSCRIBE_DELAY = 0.25
 DASHBOARD_REFRESH = 20
 SYMBOL_CACHE_FILE = "symbol_cache.json"
@@ -212,16 +213,23 @@ def safe_rest(method, **kwargs):
     logger.error(f"REST {method} failed after 5 attempts")
     return None
 
-# ============================= LISTENKEY =============================
+# ============================= LISTENKEY (FIXED FOR BINANCE.US) =============================
 def obtain_listen_key():
     global listen_key
     for i in range(5):
         try:
-            resp = safe_rest('stream_get_listen_key')
-            if resp and 'listenKey' in resp:
-                listen_key = resp['listenKey']
+            resp = requests.post(
+                "https://api.binance.us/api/v3/userDataStream",
+                headers={"X-MBX-APIKEY": API_KEY},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                listen_key = data['listenKey']
                 logger.info(f"listenKey obtained: {listen_key[:8]}...")
                 return True
+            else:
+                logger.warning(f"listenKey failed: {resp.status_code} {resp.text}")
         except Exception as e:
             logger.error(f"listenKey attempt {i+1} failed: {e}")
         time.sleep(5)
@@ -233,10 +241,20 @@ def keepalive_listen_key():
         _keepalive_evt.wait(30 * 60)
         if listen_key and not _keepalive_evt.is_set():
             try:
-                client.stream_keepalive(listen_key)
-                logger.debug("listenKey keep-alive sent")
+                resp = requests.put(
+                    "https://api.binance.us/api/v3/userDataStream",
+                    params={"listenKey": listen_key},
+                    headers={"X-MBX-APIKEY": API_KEY},
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    logger.debug("listenKey keep-alive sent")
+                else:
+                    logger.warning(f"keepalive failed: {resp.text}")
+                    obtain_listen_key()
             except Exception as e:
                 logger.warning(f"keepalive failed: {e}")
+                obtain_listen_key()
 
 # ============================= SYMBOL CACHE =============================
 def load_symbol_cache():
@@ -331,6 +349,7 @@ def on_message(ws, msg):
             status = o['X']
             qty = Decimal(o['q'])
             price = Decimal(o['L']) if o['L'] else Decimal('0')
+            logger.info(f"EXECUTION: {side} {status} {sym} qty={qty} price={price}")
             if status == 'FILLED':
                 if side == 'BUY':
                     record_buy(sym, float(price), float(qty))
@@ -341,12 +360,23 @@ def on_message(ws, msg):
                     send_whatsapp(f"FILLED SELL {sym} @ {price:.6f}")
                     dyn_sell_active.discard(sym)
 
+        elif payload.get('e') == 'outboundAccountPosition':
+            logger.info(f"Account position update: {payload}")
+
         elif payload == {}:
             ws.send(json.dumps({}))
     except Exception as e:
         logger.error(f"WS message error: {e}", exc_info=True)
 
-def on_error(ws, err): logger.error(f"WS error: {err}")
+def on_error(ws, err):
+    err_str = str(err)
+    if "410" in err_str or "listenKey" in err_str.lower():
+        logger.warning("listenKey expired or invalid – refreshing...")
+        obtain_listen_key()
+        start_websockets()
+    else:
+        logger.error(f"WS error: {err}")
+
 def on_close(ws, code, msg):
     logger.warning(f"WS closed ({code}): {msg}")
     time.sleep(5)
@@ -382,10 +412,15 @@ def start_websockets():
 
     if have_key and listen_key:
         try:
-            user_url = f"{WS_BASE}/ws/{listen_key}"
+            user_url = f"{WS_USER_BASE}/ws/{listen_key}"
             global ws_user
-            ws_user = websocket.WebSocketApp(user_url, on_message=on_message, on_error=on_error, on_close=on_close,
-                                             on_open=lambda _: logger.info("User WS connected"))
+            ws_user = websocket.WebSocketApp(
+                user_url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=lambda _: logger.info("User WS connected")
+            )
             threading.Thread(target=ws_user.run_forever, kwargs={'ping_interval': 20}, daemon=True).start()
             threading.Thread(target=keepalive_listen_key, daemon=True).start()
         except Exception as e:
@@ -397,7 +432,9 @@ def start_websockets():
 def stop_ws():
     _keepalive_evt.set()
     for w in (ws_market, ws_user):
-        if w: w.close()
+        if w:
+            try: w.close()
+            except: pass
     time.sleep(1)
 
 # ============================= STRATEGY =============================
@@ -587,6 +624,7 @@ def main():
                     'entry_price': Decimal(str(p.avg_entry_price)),
                     'qty': Decimal(str(p.quantity))
                 }
+        logger.info(f"Loaded {len(positions)} positions from DB")
     except Exception as e:
         logger.error(f"DB load error: {e}")
 
