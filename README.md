@@ -2,6 +2,9 @@
 **Skyrocketing Wealth Creation with Precision Automation**  
 
 *****
+There is an in-progress upgrade 
+that has a few bugs that I will fix as soon as possible. It is just related to decimal and float conversions. 
+
 Update to the newest version 
 for the best working 
 trading robot python code. 
