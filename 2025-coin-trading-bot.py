@@ -4,7 +4,7 @@ Binance.US Dynamic Trailing Bot – WEBSOCKET + FULL PRO DASHBOARD
 - Flash Dip → Market Buy
 - 15-Min Stall → Market Sell
 - WebSocket-Driven (NO REST polling)
-- Full Professional Dashboard (your original)
+- Full Professional Dashboard
 - WhatsApp Alerts + DB + Order Fills
 """
 
@@ -18,14 +18,14 @@ import threading
 import json
 from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
-from binance.websocket.spot.websocket_client import SpotWebsocketClient as WebSocket
+from binance import ThreadedWebsocketManager  # FIXED IMPORT
 from binance.exceptions import BinanceAPIException
 import talib
 from datetime import datetime
 import pytz
 import requests
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any
 from collections import deque, defaultdict
 import queue
 
@@ -98,6 +98,8 @@ last_price_update: Dict[str, float] = {}
 peak_price: Dict[str, Decimal] = {}
 stall_timer: Dict[str, float] = {}
 buy_cooldown: Dict[str, float] = {}
+buy_pressure_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
+sell_pressure_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
 # Trading state
 positions: Dict[str, dict] = {}
@@ -105,9 +107,7 @@ dynamic_buy_active: set = set()
 dynamic_sell_active: set = set()
 
 # WebSocket
-ws_client = None
-user_ws_client = None
-listen_key = None
+twm = None
 
 # Threads & locks
 api_queue = queue.Queue()
@@ -150,8 +150,7 @@ class DBManager:
 # === SIGNAL HANDLER =========================================================
 def signal_handler(signum, frame):
     logger.info("Shutting down gracefully...")
-    if ws_client: ws_client.stop()
-    if user_ws_client: user_ws_client.stop()
+    if twm: twm.stop()
     sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
@@ -175,31 +174,52 @@ def rate_limited_api_call(func, *args, **kwargs):
     api_queue.put((func, args, kwargs, future))
     return future.result()
 
-# === WEBSOCKET CALLBACKS ====================================================
-def on_mini_ticker(msg):
-    for t in msg:
-        symbol = t['s']
-        price = float(t['c'])
-        price_cache[symbol] = price
-        last_price_update[symbol] = time.time()
-        low_24h_cache[symbol] = min(low_24h_cache.get(symbol, price), float(t['l']))
+# === WEBSOCKETS =============================================================
+def start_websockets():
+    global twm
+    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+    twm.start()
 
-def on_book_ticker(msg):
-    symbol = msg['s']
-    bid = Decimal(msg['b'])
-    ask = Decimal(msg['a'])
-    total = bid + ask
-    pct_bid = float(bid / total * 100) if total > 0 else 50.0
-    pct_ask = float(ask / total * 100) if total > 0 else 50.0
+    # Market data
+    twm.start_multiplex_socket(
+        callback=on_multiplex_message,
+        streams=['!miniTicker@arr', '!bookTicker']
+    )
 
-    book_cache[symbol] = {
-        'best_bid': bid, 'best_ask': ask,
-        'pct_bid': pct_bid, 'pct_ask': pct_ask,
-        'ts': time.time()
-    }
+    # Kline streams
+    for sym in top_symbols:
+        twm.start_kline_socket(callback=on_kline, symbol=sym, interval='1m')
 
-    buy_pressure_history[symbol].append(pct_bid)
-    sell_pressure_history[symbol].append(pct_ask)
+    # User data
+    twm.start_user_socket(callback=handle_user_data)
+
+def on_multiplex_message(msg):
+    if 'stream' not in msg or 'data' not in msg: return
+    stream = msg['stream']
+    data = msg['data']
+
+    if stream == '!miniTicker@arr':
+        for t in data:
+            symbol = t['s']
+            price_cache[symbol] = float(t['c'])
+            last_price_update[symbol] = time.time()
+            low_24h_cache[symbol] = min(low_24h_cache.get(symbol, float(t['c'])), float(t['l']))
+
+    elif stream == '!bookTicker':
+        symbol = data['s']
+        bid = Decimal(data['b'])
+        ask = Decimal(data['a'])
+        total = bid + ask
+        pct_bid = float(bid / total * 100) if total > 0 else 50.0
+        pct_ask = float(ask / total * 100) if total > 0 else 50.0
+
+        book_cache[symbol] = {
+            'best_bid': bid, 'best_ask': ask,
+            'pct_bid': pct_bid, 'pct_ask': pct_ask,
+            'ts': time.time()
+        }
+        buy_pressure_history[symbol].append(pct_bid)
+        sell_pressure_history[symbol].append(pct_ask)
 
 def on_kline(msg):
     k = msg['k']
@@ -220,23 +240,6 @@ def on_kline(msg):
                  else "bearish" if closes[-1] < middle[-1] and macd[-1] < signal_line[-1]
                  else "sideways")
         trend_cache[symbol] = trend
-
-# === USER DATA STREAM =======================================================
-def start_user_data_stream():
-    global listen_key, user_ws_client
-    client = Client(API_KEY, API_SECRET, tld='us')
-    listen_key = client.stream_get_listen_key()['listenKey']
-    user_ws_client = WebSocket()
-    user_ws_client.start()
-    user_ws_client.user_data(listen_key=listen_key, callback=handle_user_data)
-
-    def keep_alive():
-        while True:
-            time.sleep(30 * 60)
-            try:
-                client.stream_keepalive(listen_key)
-            except: pass
-    threading.Thread(target=keep_alive, daemon=True).start()
 
 def handle_user_data(msg):
     if msg.get('e') == 'executionReport':
@@ -277,9 +280,6 @@ def get_balance():
     except: return 0.0
 
 # === STRATEGY LOGIC =========================================================
-buy_pressure_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
-sell_pressure_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
-
 def check_buy_signal(symbol):
     if (symbol in dynamic_buy_active or symbol in positions or
         time.time() - buy_cooldown.get(symbol, 0) < 15 * 60):
@@ -306,9 +306,7 @@ def check_sell_signal(symbol):
     ask = book['best_ask']
     rsi = rsi_cache.get(symbol)
 
-    maker_fee, taker_fee = 0.001, 0.001
-    net_return = (ask - entry) / entry - Decimal(str(maker_fee + taker_fee))
-
+    net_return = (ask - entry) / entry - Decimal('0.002')
     if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
         history = buy_pressure_history[symbol]
         if len(history) >= 3:
@@ -431,14 +429,13 @@ def record_sell(symbol, price, qty):
                 sess.delete(pos)
                 positions.pop(symbol, None)
 
-# === FULL PROFESSIONAL DASHBOARD (YOUR ORIGINAL) ============================
+# === FULL PROFESSIONAL DASHBOARD ============================================
 def set_terminal_background_and_title():
     try:
         print("\033]0;TRADING BOT – LIVE\007", end='')
         print("\033[48;5;17m", end='')
         print("\033[2J\033[H", end='')
-    except:
-        pass
+    except: pass
 
 def print_professional_dashboard():
     try:
@@ -487,11 +484,10 @@ def print_professional_dashboard():
                     rsi = rsi_cache.get(symbol)
                     rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
 
-                    maker, taker = 0.001, 0.001
                     gross = (cur_price - entry) * qty
-                    fee_cost = (maker + taker) * cur_price * qty
+                    fee_cost = 0.002 * cur_price * qty
                     net_profit = gross - fee_cost
-                    pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+                    pnl_pct = ((cur_price - entry) / entry - 0.002) * 100
                     total_pnl += Decimal(str(net_profit))
 
                     status = ("Trailing Sell Active" if symbol in dynamic_sell_active
@@ -574,36 +570,32 @@ def calculate_total_portfolio_value():
         return 0.0, {}
 
 # === MAIN ===================================================================
+top_symbols = []
+
 def main():
-    global ws_client, api_worker_thread
+    global twm, top_symbols
 
     if not API_KEY or not API_SECRET:
         logger.critical("API keys missing")
         return
 
+    # Start API worker
     api_worker_thread = threading.Thread(target=api_worker, daemon=True)
     api_worker_thread.start()
 
-    ws_client = WebSocket()
-    ws_client.start()
-    ws_client.mini_ticker(callback=on_mini_ticker)
-    ws_client.book_ticker(callback=on_book_ticker)
-
+    # Load symbols
     client = Client(API_KEY, API_SECRET, tld='us')
     info = client.get_exchange_info()
     symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
     tickers = client.get_ticker()
-    valid = []
-    for t in tickers:
-        if t['symbol'] in symbols and float(t['quoteVolume']) >= MIN_24H_VOLUME_USDT:
-            valid.append((t['symbol'], float(t['quoteVolume'])))
+    valid = [(t['symbol'], float(t['quoteVolume'])) for t in tickers
+             if t['symbol'] in symbols and float(t['quoteVolume']) >= MIN_24H_VOLUME_USDT]
     top_symbols = [s[0] for s in sorted(valid, key=lambda x: x[1], reverse=True)[:MAX_KLINE_SYMBOLS]]
 
-    for sym in top_symbols:
-        ws_client.kline(symbol=sym.lower(), interval='1m', callback=on_kline)
+    # Start WebSockets
+    start_websockets()
 
-    start_user_data_stream()
-
+    # Load positions
     with DBManager() as sess:
         for p in sess.query(Position).all():
             positions[p.symbol] = {'entry_price': float(p.avg_entry_price), 'qty': float(p.quantity)}
