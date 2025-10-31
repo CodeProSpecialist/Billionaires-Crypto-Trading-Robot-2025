@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Websockets + REST Hybrid Bot for Binance.US – v6
-- REST API: Symbols, Positions, Orders, Pairs
-- WebSocket: Real-time price, order book, RSI
-- LIVE TRADING: Market Buy/Sell
+Websockets + REST Hybrid Bot for Binance.US – v7 STABLE
+- REST: Symbols, Positions, Orders
+- WebSocket: Price, Order Book, RSI
+- LIVE TRADING
+- NO RESTART SPAM
 - Central Time (CST/CDT)
-- Professional Dashboard
 """
 
 import os
@@ -33,7 +33,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # ============================= CONFIG =============================
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE   = os.getenv('CALLMEBOT_PHONE')
-LOG_FILE = "binance_us_rest_bot.log"
+LOG_FILE = "binance_us_stable_bot.log"
 
 MIN_PRICE = Decimal('0.01')
 MAX_PRICE = Decimal('1000.0')
@@ -48,11 +48,7 @@ ORDERBOOK_BUY_PRESSURE_SPIKE      = Decimal('0.65')
 ORDERBOOK_BUY_PRESSURE_DROP       = Decimal('0.55')
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
-STALL_THRESHOLD_SECONDS = 15 * 60
-RAPID_DROP_THRESHOLD = Decimal('0.01')
-RAPID_DROP_WINDOW = 5.0
 BUY_COOLDOWN_SECONDS = 15 * 60
-ORDER_CANCEL_TIMEOUT = 60 * 60
 
 API_KEY    = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
@@ -63,9 +59,8 @@ MAX_KLINE_SYMBOLS = 30
 WS_BASE = "wss://stream.binance.us:9443"
 SUBSCRIBE_DELAY = 0.25
 DASHBOARD_REFRESH = 30
-SYMBOL_CACHE_FILE = "symbol_cache_v6.json"
+SYMBOL_CACHE_FILE = "symbol_cache_v7.json"
 SYMBOL_CACHE_TTL = 60 * 60
-CRASH_RESTART_DELAY = 4 * 60 + 30
 
 # ============================= LOGGING =============================
 logger = logging.getLogger(__name__)
@@ -103,12 +98,11 @@ client = Client(API_KEY, API_SECRET, tld='us')
 
 _balance_cache = {'value': Decimal('0'), 'ts': 0}
 _balance_lock = threading.Lock()
-_keepalive_evt = threading.Event()
 _step_size_cache = {}
 _tick_size_cache = {}
 
 # ============================= SQLALCHEMY =============================
-DB_URL = "sqlite:///binance_us_rest_v6.db"
+DB_URL = "sqlite:///binance_us_v7.db"
 engine = create_engine(DB_URL, echo=False, future=True)
 Base = declarative_base()
 Session = sessionmaker(bind=engine, expire_on_commit=False)
@@ -153,35 +147,7 @@ def send_whatsapp(m):
             )
         except: pass
 
-def get_step_size(symbol: str) -> Decimal:
-    if symbol not in _step_size_cache:
-        try:
-            info = client.get_symbol_info(symbol)
-            for f in info['filters']:
-                if f['filterType'] == 'LOT_SIZE':
-                    _step_size_cache[symbol] = Decimal(f['stepSize'])
-                    break
-            else:
-                _step_size_cache[symbol] = Decimal('1e-8')
-        except:
-            _step_size_cache[symbol] = Decimal('1e-8')
-    return _step_size_cache[symbol]
-
-def get_tick_size(symbol: str) -> Decimal:
-    if symbol not in _tick_size_cache:
-        try:
-            info = client.get_symbol_info(symbol)
-            for f in info['filters']:
-                if f['filterType'] == 'PRICE_FILTER':
-                    _tick_size_cache[symbol] = Decimal(f['tickSize'])
-                    break
-            else:
-                _tick_size_cache[symbol] = Decimal('1e-8')
-        except:
-            _tick_size_cache[symbol] = Decimal('1e-8')
-    return _tick_size_cache[symbol]
-
-# ============================= REST API: SYMBOLS & PAIRS =============================
+# ============================= REST API: SYMBOLS =============================
 def fetch_usdt_pairs():
     global top_symbols
     logger.info("Fetching USDT pairs via REST API...")
@@ -206,7 +172,7 @@ def fetch_usdt_pairs():
         logger.critical(f"Failed to fetch symbols: {e}")
         sys.exit(1)
 
-# ============================= REST API: BALANCE & POSITIONS =============================
+# ============================= REST API: POSITIONS =============================
 def get_balance():
     with _balance_lock:
         if time.time() - _balance_cache['ts'] < 30:
@@ -254,7 +220,7 @@ def get_trade_fees(symbol):
     except:
         return 0.001, 0.001
 
-# ============================= LIVE ORDER EXECUTION (REST) =============================
+# ============================= LIVE ORDER EXECUTION =============================
 def place_market_buy(symbol, quote_qty):
     try:
         order = client.order_market_buy(symbol=symbol, quoteOrderQty=float(quote_qty))
@@ -275,7 +241,7 @@ def place_market_sell(symbol, qty):
         logger.error(f"Sell failed: {e}")
         return None
 
-# ============================= WEBSOCKET (PRICE ONLY) =============================
+# ============================= WEBSOCKET =============================
 def on_message(ws, msg):
     try:
         data = json.loads(msg)
@@ -321,8 +287,15 @@ def on_message(ws, msg):
     except Exception as e:
         logger.error(f"WS error: {e}", exc_info=True)
 
-def on_error(ws, err): logger.warning(f"WS error: {err}"); time.sleep(5); start_websockets()
-def on_close(ws, code, msg): logger.warning(f"WS closed: {code}"); time.sleep(5); start_websockets()
+def on_error(ws, err):
+    logger.warning(f"WS error: {err}")
+    time.sleep(5)
+    start_websockets()
+
+def on_close(ws, code, msg):
+    logger.warning(f"WS closed: {code}")
+    time.sleep(5)
+    start_websockets()
 
 def on_open_market(ws):
     logger.info("WebSocket connected")
@@ -426,7 +399,7 @@ def print_professional_dashboard():
         BOLD = "\033[1m"
 
         print(f"{NAVY}{'=' * 120}{RESET}")
-        print(f"{NAVY}{BOLD}{WHITE}{' Websockets Fast Trading Bot for Binance.US ':^120}{RESET}")
+        print(f"{NAVY}{BOLD}{WHITE}{' Binance.US Live Trading Bot v7 ':^120}{RESET}")
         print(f"{NAVY}{'=' * 120}{RESET}\n")
 
         print(f"{NAVY}{YELLOW}{'Time (CST/CDT)':<20} {WHITE}{now}{RESET}")
@@ -441,9 +414,9 @@ def print_professional_dashboard():
             db_positions = s.query(Position).all()
 
         if db_positions:
-            print(f"{NAVY}{BOLD}{YELLOW}{' OWNED POSITIONS (/USDT PAIRS) ':^120}{RESET}")
+            print(f"{NAVY}{BOLD}{YELLOW}{' OWNED POSITIONS ':^120}{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>14} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L %':>8} {'VALUE':>12}{RESET}")
+            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>14} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L %':>8}{RESET}")
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
 
             total_unrealized = Decimal('0')
@@ -463,9 +436,8 @@ def print_professional_dashboard():
                 total_unrealized += Decimal(str(net_profit))
 
                 pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
-                value = qty * cur
                 color = GREEN if net_profit > 0 else RED
-                print(f"{NAVY}{YELLOW}{sym:<10} {qty:>14.6f} {entry:>12.6f} {cur:>12.6f} {rsi_str:>6} {color}{pnl_pct:>7.2f}%{RESET} {color}${value:>11.2f}{RESET}")
+                print(f"{NAVY}{YELLOW}{sym:<10} {qty:>14.6f} {entry:>12.6f} {cur:>12.6f} {rsi_str:>6} {color}{pnl_pct:>7.2f}%{RESET}")
 
             print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
             pnl_color = GREEN if total_unrealized > 0 else RED
@@ -480,7 +452,7 @@ def print_professional_dashboard():
 
 # ============================= MAIN =============================
 def main():
-    global top_symbols
+    # === ONE-TIME SETUP ===
     fetch_usdt_pairs()
     if not top_symbols:
         logger.critical("No symbols loaded")
@@ -492,6 +464,7 @@ def main():
     if not start_websockets():
         return
 
+    # === MAIN LOOP ===
     last_dash = 0
     while True:
         try:
@@ -509,11 +482,6 @@ def main():
             logger.critical(f"Main loop error: {e}", exc_info=True)
             time.sleep(10)
 
+# ============================= RUN ONCE =============================
 if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except Exception as e:
-            logger.critical(f"Bot crashed: {e}", exc_info=True)
-            stop_ws()
-            time.sleep(CRASH_RESTART_DELAY)
+    main()  # No restart loop
