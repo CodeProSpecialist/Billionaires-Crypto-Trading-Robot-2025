@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-BINANCE.US SPOT-ONLY TRAILING BOT – FINAL PATCHED VERSION
+BINANCE.US SPOT-ONLY TRAILING BOT – FINAL WORKING VERSION
 - USDT pairs only
 - Price: $0.01 – $1000
 - 24h volume ≥ $50,000
-- 100% WebSocket, symbol cache, safe listenKey
+- 100% WebSocket, safe listenKey, no 404
 - Flash Dip → Market Buy
 - 15-Min Stall → Market Sell
 """
@@ -59,8 +59,7 @@ if not API_KEY or not API_SECRET:
     raise SystemExit("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET")
 
 MAX_KLINE_SYMBOLS = 30
-WS_BASE = "wss://stream.binance.us:9443"
-WS_USER_BASE = "wss://ws-api.binance.us:443"
+WS_BASE = "wss://stream.binance.us:9443"  # UNIFIED: Market + User
 SUBSCRIBE_DELAY = 0.25
 DASHBOARD_REFRESH = 20
 SYMBOL_CACHE_FILE = "symbol_cache.json"
@@ -213,9 +212,25 @@ def safe_rest(method, **kwargs):
     logger.error(f"REST {method} failed after 5 attempts")
     return None
 
-# ============================= LISTENKEY (FIXED FOR BINANCE.US) =============================
+# ============================= LISTENKEY (FIXED) =============================
+def close_listen_key():
+    global listen_key
+    if listen_key:
+        try:
+            requests.delete(
+                "https://api.binance.us/api/v3/userDataStream",
+                params={"listenKey": listen_key},
+                headers={"X-MBX-APIKEY": API_KEY},
+                timeout=10
+            )
+            logger.debug(f"Closed listenKey: {listen_key[:8]}...")
+        except Exception as e:
+            logger.warning(f"Failed to close listenKey: {e}")
+        listen_key = None
+
 def obtain_listen_key():
     global listen_key
+    close_listen_key()  # Prevent reuse
     for i in range(5):
         try:
             resp = requests.post(
@@ -224,8 +239,7 @@ def obtain_listen_key():
                 timeout=10
             )
             if resp.status_code == 200:
-                data = resp.json()
-                listen_key = data['listenKey']
+                listen_key = resp.json()['listenKey']
                 logger.info(f"listenKey obtained: {listen_key[:8]}...")
                 return True
             else:
@@ -361,7 +375,7 @@ def on_message(ws, msg):
                     dyn_sell_active.discard(sym)
 
         elif payload.get('e') == 'outboundAccountPosition':
-            logger.info(f"Account position update: {payload}")
+            logger.info(f"Account update: {len(payload.get('B', []))} assets")
 
         elif payload == {}:
             ws.send(json.dumps({}))
@@ -370,8 +384,8 @@ def on_message(ws, msg):
 
 def on_error(ws, err):
     err_str = str(err)
-    if "410" in err_str or "listenKey" in err_str.lower():
-        logger.warning("listenKey expired or invalid – refreshing...")
+    if "404" in err_str or "410" in err_str or "listenKey" in err_str.lower():
+        logger.warning("listenKey invalid – refreshing...")
         obtain_listen_key()
         start_websockets()
     else:
@@ -412,7 +426,7 @@ def start_websockets():
 
     if have_key and listen_key:
         try:
-            user_url = f"{WS_USER_BASE}/ws/{listen_key}"
+            user_url = f"{WS_BASE}/ws/{listen_key}"
             global ws_user
             ws_user = websocket.WebSocketApp(
                 user_url,
@@ -435,6 +449,7 @@ def stop_ws():
         if w:
             try: w.close()
             except: pass
+    close_listen_key()
     time.sleep(1)
 
 # ============================= STRATEGY =============================
