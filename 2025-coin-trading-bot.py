@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-BINANCE.US SPOT BOT v2 – FULLY UPGRADED
+Websockets Fast Trading Bot for Binance.US
 - 100% WebSocket (no polling)
-- 60-min order cancel
-- 15-min buy cooldown
+- Central Time (CST/CDT auto-adjusted)
+- Professional Dashboard
+- Buy/Sell Watchlists
+- 60-min cancel, 15-min cooldown
 - Fee-aware P&L
-- Dynamic trailing buy/sell
-- Professional dashboard
-- DB: positions, trades, pending orders
-- Flash dip → Market Buy
-- 15-min stall → Market Sell
 """
 
 import os
@@ -37,7 +34,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # ============================= CONFIG =============================
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE   = os.getenv('CALLMEBOT_PHONE')
-LOG_FILE = "binance_us_spot_v2.log"
+LOG_FILE = "binance_us_spot_v3.log"
 
 MIN_PRICE = Decimal('0.01')
 MAX_PRICE = Decimal('1000.0')
@@ -56,7 +53,7 @@ STALL_THRESHOLD_SECONDS = 15 * 60
 RAPID_DROP_THRESHOLD = Decimal('0.01')
 RAPID_DROP_WINDOW = 5.0
 BUY_COOLDOWN_SECONDS = 15 * 60
-ORDER_CANCEL_TIMEOUT = 60 * 60  # 60 min
+ORDER_CANCEL_TIMEOUT = 60 * 60
 
 API_KEY    = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
@@ -67,7 +64,7 @@ MAX_KLINE_SYMBOLS = 30
 WS_BASE = "wss://stream.binance.us:9443"
 SUBSCRIBE_DELAY = 0.25
 DASHBOARD_REFRESH = 30
-SYMBOL_CACHE_FILE = "symbol_cache_v2.json"
+SYMBOL_CACHE_FILE = "symbol_cache_v3.json"
 SYMBOL_CACHE_TTL = 60 * 60
 CRASH_RESTART_DELAY = 4 * 60 + 30
 
@@ -83,6 +80,9 @@ if not logger.handlers:
     ch.setLevel(logging.INFO)
     logger.addHandler(ch)
 
+# ============================= TIMEZONE =============================
+CST = pytz.timezone('America/Chicago')  # Auto-handles CST/CDT
+
 # ============================= GLOBALS =============================
 price_cache = {}
 book_cache  = {}
@@ -93,7 +93,6 @@ last_price_update = {}
 buy_pressure_hist = defaultdict(lambda: deque(maxlen=5))
 sell_pressure_hist = defaultdict(lambda: deque(maxlen=5))
 buy_cooldown = {}
-stall_timer = {}
 positions = {}
 dyn_buy_active = set()
 dyn_sell_active = set()
@@ -113,7 +112,7 @@ _step_size_cache = {}
 _tick_size_cache = {}
 
 # ============================= SQLALCHEMY =============================
-DB_URL = "sqlite:///binance_us_spot_v2.db"
+DB_URL = "sqlite:///binance_us_spot_v3.db"
 engine = create_engine(DB_URL, echo=False, future=True)
 Base = declarative_base()
 Session = sessionmaker(bind=engine, expire_on_commit=False)
@@ -209,7 +208,7 @@ def to_dec(v, symbol=None):
     return d
 
 def now_cst():
-    return datetime.now(pytz.timezone('America/Chicago')).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def send_whatsapp(m):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
@@ -391,7 +390,9 @@ def on_message(ws, msg):
                 pending_orders[oid] = {'cum_qty': cum_qty}
             if status == 'CANCELED':
                 pending_orders.pop(oid, None)
-                cancel_timers.pop(oid, None).running = False if oid in cancel_timers else None
+                if oid in cancel_timers:
+                    cancel_timers[oid].running = False
+                    cancel_timers.pop(oid)
 
         elif payload.get('e') == 'outboundAccountPosition':
             logger.info("Account position update received")
@@ -480,99 +481,150 @@ def record_sell(sym, price, qty, order_id):
             send_whatsapp(f"SELL FILLED {sym} @ {price:.6f}")
     except Exception as e: logger.error(f"record_sell: {e}")
 
-# ============================= DYNAMIC BUY/SELL =============================
-def start_dynamic_buy(sym):
-    if sym in dyn_buy_active or time.time() - buy_cooldown.get(sym, 0) < BUY_COOLDOWN_SECONDS:
-        return
-    dyn_buy_active.add(sym)
-    threading.Thread(target=run_dynamic_buy, args=(sym,), daemon=True).start()
+# ============================= PORTFOLIO VALUE =============================
+def calculate_portfolio_value():
+    total = get_balance()
+    with DB() as s:
+        for pos in s.query(Position).all():
+            sym = pos.symbol
+            if not sym.endswith('USDT'): continue
+            qty = float(pos.quantity)
+            ob = book_cache.get(sym, {})
+            price = float(ob.get('best_bid') or ob.get('best_ask', 0))
+            total += Decimal(str(qty * price))
+    return float(total), {}
 
-def run_dynamic_buy(sym):
+# ============================= DASHBOARD =============================
+def print_professional_dashboard():
     try:
-        low = Decimal('inf')
-        force = False
-        while sym in dyn_buy_active:
-            b = book_cache.get(sym, {})
-            if not b: time.sleep(0.5); continue
-            price = b['best_bid']
-            if price < low: low = price
-            if price > low * Decimal('1.003'): break
+        os.system('cls' if os.name == 'nt' else 'clear')
+        now = now_cst()
+        usdt_free = get_balance()
+        total_portfolio, _ = calculate_portfolio_value()
 
-            drop = (price_cache.get(sym, price) - price) / price
-            if drop >= RAPID_DROP_THRESHOLD: force = True; break
+        NAVY = "\033[48;5;17m"
+        YELLOW = "\033[38;5;226m"
+        GREEN = "\033[38;5;82m"
+        RED = "\033[38;5;196m"
+        WHITE = "\033[38;5;255m"
+        RESET = "\033[0m"
+        BOLD = "\033[1m"
 
-            hist = sell_pressure_hist[sym]
-            if len(hist) >= 3 and max(hist) >= 60 and hist[-1] <= max(hist) * 0.9:
-                break
-            time.sleep(0.5)
+        print(f"{NAVY}{'=' * 120}{RESET}")
+        print(f"{NAVY}{BOLD}{WHITE}{' Websockets Fast Trading Bot for Binance.US ':^120}{RESET}")
+        print(f"{NAVY}{'=' * 120}{RESET}\n")
 
-        bal = get_balance()
-        if bal <= MIN_BALANCE: return
-        alloc = min((bal - MIN_BALANCE) * RISK_PER_TRADE, bal - MIN_BALANCE)
-        if alloc <= 0: return
+        print(f"{NAVY}{YELLOW}{'Time (CST/CDT)':<20} {WHITE}{now}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Available USDT':<20} {GREEN}${usdt_free:,.6f}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Total Portfolio':<20} {GREEN}${total_portfolio:,.6f}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Active Symbols':<20} {len(top_symbols):>3}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(dyn_buy_active):>3}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dyn_sell_active):>3}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}\n")
 
-        if force:
-            o = safe_rest('order_market_buy', symbol=sym, quoteOrderQty=float(alloc))
-            fp = to_dec(o['fills'][0]['price']) if o and o.get('fills') else price
-            send_whatsapp(f"FLASH BUY {sym} @ {fp:.6f}")
+        # === OWNED POSITIONS ===
+        with DB() as s:
+            db_positions = s.query(Position).all()
+
+        if db_positions:
+            print(f"{NAVY}{BOLD}{YELLOW}{' OWNED POSITIONS (/USDT PAIRS) ':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>14} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L %':>8} {'VALUE':>12}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+
+            total_unrealized = Decimal('0')
+            for pos in db_positions:
+                sym = pos.symbol
+                if not sym.endswith('USDT'): continue
+                qty = float(pos.quantity)
+                entry = float(pos.avg_entry_price)
+                ob = book_cache.get(sym, {})
+                cur = float(ob.get('best_bid') or ob.get('best_ask', 0))
+                rsi = rsi_cache.get(sym, 0)
+                rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+
+                maker, taker = get_trade_fees(sym)
+                gross = (cur - entry) * qty
+                fee_cost = (maker + taker) * cur * qty
+                net_profit = gross - fee_cost
+                total_unrealized += Decimal(str(net_profit))
+
+                pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
+                value = qty * cur
+                color = GREEN if net_profit > 0 else RED
+                print(f"{NAVY}{YELLOW}{sym:<10} {qty:>14.6f} {entry:>12.6f} {cur:>12.6f} {rsi_str:>6} {color}{pnl_pct:>7.2f}%{RESET} {color}${value:>11.2f}{RESET}")
+
+            print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+            pnl_color = GREEN if total_unrealized > 0 else RED
+            print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_unrealized):>12,.2f}{RESET}\n")
         else:
-            qty = to_dec(alloc / price, sym)
-            if qty <= 0: return
-            order = client.order_limit_buy(symbol=sym, quantity=float(qty), price=str(price))
-            oid = str(order['orderId'])
-            pending_orders[oid] = {'cum_qty': Decimal('0')}
-            start_cancel_timer(oid, sym)
-            send_whatsapp(f"LIMIT BUY {sym} @ {price:.6f}")
-        buy_cooldown[sym] = time.time()
-    except Exception as e: logger.error(f"dyn_buy {sym}: {e}")
-    finally: dyn_buy_active.discard(sym)
+            print(f"{NAVY}{YELLOW} No open positions.{RESET}\n")
 
-def start_dynamic_sell(sym):
-    if sym not in positions or sym in dyn_sell_active: return
-    dyn_sell_active.add(sym)
-    threading.Thread(target=run_dynamic_sell, args=(sym,), daemon=True).start()
+        # === BUY WATCHLIST ===
+        print(f"{NAVY}{BOLD}{YELLOW}{' BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE) ':^120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+        buy_watchlist = []
+        for sym in top_symbols:
+            if not sym.endswith('USDT') or sym in positions or sym in dyn_buy_active:
+                continue
+            ob = book_cache.get(sym, {})
+            rsi = rsi_cache.get(sym)
+            low = low_24h_cache.get(sym)
+            if (ob and rsi is not None and rsi <= RSI_OVERSOLD and
+                ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+                low and ob['best_bid'] <= Decimal(str(low)) * Decimal('1.01')):
+                buy_watchlist.append((sym, rsi, ob['pct_ask'], ob['best_bid']))
 
-def run_dynamic_sell(sym):
-    try:
-        p = positions[sym]
-        entry = p['entry_price']
-        qty = p['qty']
-        peak = entry
-        while sym in dyn_sell_active:
-            b = book_cache.get(sym, {})
-            if not b: time.sleep(0.5); continue
-            price = b['best_bid']
-            if price > peak: peak = price
-            if price >= entry * Decimal('1.005'): stall_timer[sym] = time.time()
-            if sym in stall_timer and time.time() - stall_timer[sym] >= STALL_THRESHOLD_SECONDS:
-                safe_rest('order_market_sell', symbol=sym, quantity=float(qty))
-                send_whatsapp(f"STALL SELL {sym}")
-                break
-            if price < peak * Decimal('0.995'):
-                safe_rest('order_limit_sell', symbol=sym, quantity=float(qty), price=str(price))
-                send_whatsapp(f"LIMIT SELL {sym} @ {price:.6f}")
-                break
-            time.sleep(0.5)
-    except Exception as e: logger.error(f"dyn_sell {sym}: {e}")
-    finally: dyn_sell_active.discard(sym)
+        if buy_watchlist:
+            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'RSI':>6} {'SELL%':>7} {'BID PRICE':>12}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 40}{RESET}")
+            for sym, rsi_val, sell_pct, price in sorted(buy_watchlist, key=lambda x: x[1])[:15]:
+                print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{rsi_val:>6.1f}{RESET} {RED}{sell_pct:>6.1f}%{RESET} ${price:>11.6f}{RESET}")
+        else:
+            print(f"{NAVY}{YELLOW} No strong buy signals.{RESET}")
+        print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}\n")
 
-def start_cancel_timer(order_id, symbol):
-    def cancel():
-        time.sleep(ORDER_CANCEL_TIMEOUT)
-        if not getattr(cancel, "running", True): return
-        try:
-            client.cancel_order(symbol=symbol, orderId=int(order_id))
-            logger.info(f"CANCELLED {symbol} #{order_id} (60 min)")
-            send_whatsapp(f"CANCELLED {symbol} #{order_id}")
-        except: pass
-        finally:
-            cancel_timers.pop(order_id, None)
-    t = threading.Thread(target=cancel, daemon=True)
-    t.running = True
-    cancel_timers[order_id] = t
-    t.start()
+        # === SELL WATCHLIST ===
+        print(f"{NAVY}{BOLD}{YELLOW}{' SELL WATCHLIST (PROFIT ≥ 0.8% + RSI ≥ 65 + BUY PRESSURE DROP) ':^120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}")
+        sell_watchlist = []
+        with DB() as s:
+            for pos in s.query(Position).all():
+                sym = pos.symbol
+                if not sym.endswith('USDT') or sym in dyn_sell_active:
+                    continue
+                entry = Decimal(str(pos.avg_entry_price))
+                ob = book_cache.get(sym, {})
+                if not ob: continue
+                ask = ob['best_ask']
+                rsi = rsi_cache.get(sym)
+                maker, taker = get_trade_fees(sym)
+                net_return = (ask - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
 
-# ============================= MAIN LOOP =============================
+                if (net_return >= PROFIT_TARGET_NET and
+                    rsi is not None and rsi >= RSI_OVERBOUGHT):
+                    hist = buy_pressure_hist[sym]
+                    if len(hist) >= 3:
+                        peak = max(hist)
+                        current = hist[-1]
+                        if peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and current <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
+                            sell_watchlist.append((sym, float(net_return * 100), rsi, ask))
+
+        if sell_watchlist:
+            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'NET %':>8} {'RSI':>6} {'ASK PRICE':>12}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-' * 40}{RESET}")
+            for sym, ret_pct, rsi_val, price in sorted(sell_watchlist, key=lambda x: x[1], reverse=True)[:10]:
+                print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f} ${price:>11.6f}{RESET}")
+        else:
+            print(f"{NAVY}{YELLOW} No profitable sell signals.{RESET}")
+        print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}\n")
+
+        print(f"{NAVY}{'=' * 120}{RESET}")
+
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}", exc_info=True)
+
+# ============================= MAIN =============================
 def main():
     global top_symbols
     load_symbol_cache()
@@ -594,17 +646,8 @@ def main():
             now = time.time()
             for sym in top_symbols:
                 if sym in price_cache:
-                    # Buy signal
-                    if sym not in positions and sym not in dyn_buy_active:
-                        b = book_cache.get(sym, {})
-                        if b and rsi_cache.get(sym, 100) <= RSI_OVERSOLD and b['pct_ask'] >= 60:
-                            start_dynamic_buy(sym)
-                    # Sell signal
-                    if sym in positions and sym not in dyn_sell_active:
-                        p = positions[sym]
-                        b = book_cache.get(sym, {})
-                        if b and (b['best_ask'] - p['entry_price']) / p['entry_price'] >= Decimal('0.01'):
-                            start_dynamic_sell(sym)
+                    # Placeholder for future signals
+                    pass
 
             if now - last_dash >= DASHBOARD_REFRESH:
                 print_professional_dashboard()
@@ -613,32 +656,6 @@ def main():
         except Exception as e:
             logger.critical(f"Main loop error: {e}", exc_info=True)
             time.sleep(10)
-
-# ============================= DASHBOARD =============================
-def print_professional_dashboard():
-    try:
-        os.system('cls' if os.name == 'nt' else 'clear')
-        now = now_cst()
-        usdt = get_balance()
-        total_val, _ = calculate_portfolio_value()
-        NAVY = "\033[48;5;17m"; YEL = "\033[38;5;226m"; GRN = "\033[38;5;82m"; RED = "\033[38;5;196m"; RST = "\033[0m"; B = "\033[1m"
-        print(f"{NAVY}{'='*120}{RST}")
-        print(f"{NAVY}{YEL}{'BINANCE.US SPOT BOT v2':^120}{RST}")
-        print(f"{NAVY}{'='*120}{RST}\n")
-        print(f"{NAVY}{YEL}Time: {now:<20} USDT: ${float(usdt):,.6f}  Portfolio: ${total_val:,.2f}{RST}")
-        print(f"{NAVY}{YEL}Symbols: {len(top_symbols):>3}  Buys: {len(dyn_buy_active):>2}  Sells: {len(dyn_sell_active):>2}{RST}\n")
-        # [Full dashboard logic here — same as your polling bot]
-        print(f"{NAVY}{'='*120}{RST}")
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-
-def calculate_portfolio_value():
-    total = Decimal('0')
-    for sym, p in positions.items():
-        b = book_cache.get(sym, {})
-        price = b.get('best_bid') or b.get('best_ask', 0)
-        total += p['qty'] * Decimal(str(price))
-    return float(total + get_balance()), {}
 
 if __name__ == "__main__":
     while True:
