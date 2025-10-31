@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Websockets Fast Trading Bot for Binance.US – LIVE TRADING v5
-- WebSocket: Real-time prices, order book, RSI
-- REST API: Balance, positions, order execution
-- LIVE ORDERS: Market Buy/Sell, Limit Orders, 60-min cancel
+Websockets + REST Hybrid Bot for Binance.US – v6
+- REST API: Symbols, Positions, Orders, Pairs
+- WebSocket: Real-time price, order book, RSI
+- LIVE TRADING: Market Buy/Sell
 - Central Time (CST/CDT)
 - Professional Dashboard
-- Only /USDT pairs
 """
 
 import os
@@ -34,7 +33,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # ============================= CONFIG =============================
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE   = os.getenv('CALLMEBOT_PHONE')
-LOG_FILE = "binance_us_live_bot.log"
+LOG_FILE = "binance_us_rest_bot.log"
 
 MIN_PRICE = Decimal('0.01')
 MAX_PRICE = Decimal('1000.0')
@@ -64,7 +63,7 @@ MAX_KLINE_SYMBOLS = 30
 WS_BASE = "wss://stream.binance.us:9443"
 SUBSCRIBE_DELAY = 0.25
 DASHBOARD_REFRESH = 30
-SYMBOL_CACHE_FILE = "symbol_cache_v5.json"
+SYMBOL_CACHE_FILE = "symbol_cache_v6.json"
 SYMBOL_CACHE_TTL = 60 * 60
 CRASH_RESTART_DELAY = 4 * 60 + 30
 
@@ -96,11 +95,8 @@ buy_cooldown = {}
 positions = {}
 dyn_buy_active = set()
 dyn_sell_active = set()
-pending_orders = {}
-cancel_timers = {}
 
 ws_market = None
-listen_key = None
 top_symbols = []
 
 client = Client(API_KEY, API_SECRET, tld='us')
@@ -112,33 +108,10 @@ _step_size_cache = {}
 _tick_size_cache = {}
 
 # ============================= SQLALCHEMY =============================
-DB_URL = "sqlite:///binance_us_live_v5.db"
+DB_URL = "sqlite:///binance_us_rest_v6.db"
 engine = create_engine(DB_URL, echo=False, future=True)
 Base = declarative_base()
 Session = sessionmaker(bind=engine, expire_on_commit=False)
-
-class Trade(Base):
-    __tablename__ = "trades"
-    id = Column(Integer, primary_key=True)
-    symbol = Column(String(20), nullable=False, index=True)
-    side = Column(String(4), nullable=False)
-    price = Column(Numeric(20, 8), nullable=False)
-    quantity = Column(Numeric(20, 8), nullable=False)
-    executed_at = Column(DateTime, nullable=False, default=func.now())
-    binance_order_id = Column(String(64), nullable=False, index=True)
-    pending_order_id = Column(Integer, ForeignKey("pending_orders.id"), nullable=True)
-    pending_order = relationship("PendingOrder", back_populates="filled_trades")
-
-class PendingOrder(Base):
-    __tablename__ = "pending_orders"
-    id = Column(Integer, primary_key=True)
-    binance_order_id = Column(String(64), unique=True, nullable=False, index=True)
-    symbol = Column(String(20), nullable=False)
-    side = Column(String(4), nullable=False)
-    price = Column(Numeric(20, 8), nullable=False)
-    quantity = Column(Numeric(20, 8), nullable=False)
-    placed_at = Column(DateTime, nullable=False, default=func.now())
-    filled_trades = relationship("Trade", back_populates="pending_order")
 
 class Position(Base):
     __tablename__ = "positions"
@@ -147,7 +120,6 @@ class Position(Base):
     quantity = Column(Numeric(20, 8), nullable=False)
     avg_entry_price = Column(Numeric(20, 8), nullable=False)
     buy_fee_rate = Column(Numeric(10, 6), nullable=False, default=0.001)
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 Base.metadata.create_all(engine)
 
@@ -164,7 +136,6 @@ class DB:
 def shutdown(*_):
     logger.info("Shutting down...")
     stop_ws()
-    for t in list(cancel_timers.values()): t.running = False
     sys.exit(0)
 signal.signal(signal.SIGINT,  shutdown)
 signal.signal(signal.SIGTERM, shutdown)
@@ -210,14 +181,30 @@ def get_tick_size(symbol: str) -> Decimal:
             _tick_size_cache[symbol] = Decimal('1e-8')
     return _tick_size_cache[symbol]
 
-def to_dec(v, symbol=None):
-    d = Decimal(str(v))
-    if symbol:
-        step = get_step_size(symbol)
-        d = d.quantize(step, rounding=ROUND_DOWN)
-    else:
-        d = d.quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
-    return d
+# ============================= REST API: SYMBOLS & PAIRS =============================
+def fetch_usdt_pairs():
+    global top_symbols
+    logger.info("Fetching USDT pairs via REST API...")
+    try:
+        info = client.get_exchange_info()
+        usdt_pairs = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+        tickers = client.get_ticker()
+        valid = []
+        for t in tickers:
+            sym = t['symbol']
+            if sym not in usdt_pairs: continue
+            price = float(t['lastPrice'])
+            vol = float(t['quoteVolume'])
+            low = float(t['lowPrice'])
+            if MIN_PRICE <= Decimal(str(price)) <= MAX_PRICE and vol >= MIN_24H_VOLUME_USDT:
+                valid.append((sym, vol, low))
+        top_symbols = [s[0] for s in sorted(valid, key=lambda x: x[1], reverse=True)[:MAX_KLINE_SYMBOLS]]
+        with open(SYMBOL_CACHE_FILE, 'w') as f:
+            json.dump({'ts': time.time(), 'symbols': top_symbols}, f)
+        logger.info(f"Fetched {len(top_symbols)} valid /USDT pairs")
+    except Exception as e:
+        logger.critical(f"Failed to fetch symbols: {e}")
+        sys.exit(1)
 
 # ============================= REST API: BALANCE & POSITIONS =============================
 def get_balance():
@@ -234,13 +221,6 @@ def get_balance():
         logger.error(f"get_balance error: {e}")
         return Decimal('0')
 
-def get_trade_fees(symbol):
-    try:
-        fee = client.get_trade_fee(symbol=symbol)
-        return float(fee[0]['makerCommission']), float(fee[0]['takerCommission'])
-    except:
-        return 0.001, 0.001
-
 def load_positions_from_rest():
     global positions
     positions.clear()
@@ -254,59 +234,50 @@ def load_positions_from_rest():
                 if qty <= 0 or asset in {'USDT', 'USDC'}: continue
                 symbol = f"{asset}USDT"
                 try:
-                    price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+                    ticker = client.get_symbol_ticker(symbol=symbol)
+                    price = Decimal(ticker['price'])
                     if price <= 0: continue
                     maker, _ = get_trade_fees(symbol)
-                    pos = Position(
-                        symbol=symbol,
-                        quantity=qty,
-                        avg_entry_price=price,
-                        buy_fee_rate=maker
-                    )
+                    pos = Position(symbol=symbol, quantity=qty, avg_entry_price=price, buy_fee_rate=maker)
                     s.add(pos)
                     positions[symbol] = {'qty': float(qty), 'entry': float(price)}
-                except: continue
+                    logger.info(f"Loaded position: {symbol} {qty} @ ${price}")
+                except Exception as e:
+                    logger.debug(f"Skip {symbol}: {e}")
     except Exception as e:
-        logger.error(f"load_positions_from_rest error: {e}")
+        logger.error(f"load_positions error: {e}")
 
-# ============================= SYMBOL CACHE =============================
-def load_symbol_cache():
-    global top_symbols
-    if os.path.exists(SYMBOL_CACHE_FILE):
-        try:
-            with open(SYMBOL_CACHE_FILE) as f:
-                data = json.load(f)
-                if time.time() - data.get('ts', 0) < SYMBOL_CACHE_TTL:
-                    top_symbols = data['symbols']
-                    logger.info(f"Loaded {len(top_symbols)} symbols from cache")
-                    return
-        except: pass
-
-    logger.info("Fetching symbol list...")
+def get_trade_fees(symbol):
     try:
-        info = client.get_exchange_info()
-        usdt_pairs = {s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'}
-        tickers = client.get_all_tickers()
-        valid = []
-        for t in tickers:
-            sym = t['symbol']
-            if sym not in usdt_pairs: continue
-            price = float(t['price'])
-            vol = float(t.get('quoteVolume', 0))
-            if MIN_PRICE <= Decimal(str(price)) <= MAX_PRICE and vol >= MIN_24H_VOLUME_USDT:
-                valid.append((sym, vol))
-        top_symbols = [s[0] for s in sorted(valid, key=lambda x: x[1], reverse=True)[:MAX_KLINE_SYMBOLS]]
-        with open(SYMBOL_CACHE_FILE, 'w') as f:
-            json.dump({'ts': time.time(), 'symbols': top_symbols}, f)
-        logger.info(f"Cached {len(top_symbols)} symbols")
-    except Exception as e:
-        logger.critical(f"Symbol load failed: {e}")
-        sys.exit(1)
+        fee = client.get_trade_fee(symbol=symbol)
+        return float(fee[0]['makerCommission']), float(fee[0]['takerCommission'])
+    except:
+        return 0.001, 0.001
 
-# ============================= WEBSOCKET =============================
+# ============================= LIVE ORDER EXECUTION (REST) =============================
+def place_market_buy(symbol, quote_qty):
+    try:
+        order = client.order_market_buy(symbol=symbol, quoteOrderQty=float(quote_qty))
+        logger.info(f"MARKET BUY: {symbol} ${quote_qty}")
+        send_whatsapp(f"BUY {symbol} ${quote_qty}")
+        return order
+    except Exception as e:
+        logger.error(f"Buy failed: {e}")
+        return None
+
+def place_market_sell(symbol, qty):
+    try:
+        order = client.order_market_sell(symbol=symbol, quantity=float(qty))
+        logger.info(f"MARKET SELL: {symbol} {qty}")
+        send_whatsapp(f"SELL {symbol} {qty}")
+        return order
+    except Exception as e:
+        logger.error(f"Sell failed: {e}")
+        return None
+
+# ============================= WEBSOCKET (PRICE ONLY) =============================
 def on_message(ws, msg):
     try:
-        if not msg.strip(): return
         data = json.loads(msg)
         stream = data.get('stream')
         payload = data.get('data', data)
@@ -317,7 +288,6 @@ def on_message(ws, msg):
                 if sym not in top_symbols: continue
                 price = float(t['c'])
                 price_cache[sym] = price
-                last_price_update[sym] = time.time()
                 low_24h_cache[sym] = min(low_24h_cache.get(sym, price), float(t['l']))
 
         elif stream == '!bookTicker':
@@ -334,7 +304,6 @@ def on_message(ws, msg):
                 'ts': time.time()
             }
             buy_pressure_hist[sym].append(pct_bid)
-            sell_pressure_hist[sym].append(pct_ask)
 
         elif stream and '@kline_1m' in stream:
             k = payload['k']
@@ -350,20 +319,13 @@ def on_message(ws, msg):
                     rsi_cache[sym] = float(rsi)
 
     except Exception as e:
-        logger.error(f"WS msg error: {e}", exc_info=True)
+        logger.error(f"WS error: {e}", exc_info=True)
 
-def on_error(ws, err):
-    logger.warning(f"WS error: {err}")
-    time.sleep(5)
-    start_websockets()
-
-def on_close(ws, code, msg):
-    logger.warning(f"WS closed: {code} {msg}")
-    time.sleep(5)
-    start_websockets()
+def on_error(ws, err): logger.warning(f"WS error: {err}"); time.sleep(5); start_websockets()
+def on_close(ws, code, msg): logger.warning(f"WS closed: {code}"); time.sleep(5); start_websockets()
 
 def on_open_market(ws):
-    logger.info("Market WS connected")
+    logger.info("WebSocket connected")
     def sub():
         streams = ["!miniTicker@arr", "!bookTicker"]
         for s in top_symbols:
@@ -380,45 +342,11 @@ def start_websockets():
     ws_market = websocket.WebSocketApp(url, on_open=on_open_market, on_message=on_message, on_error=on_error, on_close=on_close)
     threading.Thread(target=ws_market.run_forever, kwargs={'ping_interval': 20}, daemon=True).start()
     logger.info("WebSocket LIVE")
-    return True
 
 def stop_ws():
     global ws_market
     if ws_market: ws_market.close()
     time.sleep(1)
-
-# ============================= LIVE ORDER EXECUTION =============================
-def place_market_buy(symbol, quote_qty):
-    try:
-        order = client.order_market_buy(symbol=symbol, quoteOrderQty=float(quote_qty))
-        logger.info(f"MARKET BUY: {symbol} ${quote_qty}")
-        send_whatsapp(f"MARKET BUY {symbol} ${quote_qty}")
-        return order
-    except Exception as e:
-        logger.error(f"Buy failed: {e}")
-        return None
-
-def place_market_sell(symbol, qty):
-    try:
-        order = client.order_market_sell(symbol=symbol, quantity=float(qty))
-        logger.info(f"MARKET SELL: {symbol} {qty}")
-        send_whatsapp(f"MARKET SELL {symbol} {qty}")
-        return order
-    except Exception as e:
-        logger.error(f"Sell failed: {e}")
-        return None
-
-def start_cancel_timer(order_id, symbol):
-    def cancel():
-        time.sleep(ORDER_CANCEL_TIMEOUT)
-        try:
-            client.cancel_order(symbol=symbol, orderId=int(order_id))
-            logger.info(f"CANCELLED {symbol} #{order_id} (60 min)")
-            send_whatsapp(f"CANCELLED {symbol} #{order_id}")
-        except: pass
-    t = threading.Thread(target=cancel, daemon=True)
-    t.start()
-    return t
 
 # ============================= TRADING LOGIC =============================
 def check_buy_signals():
@@ -475,7 +403,6 @@ def calculate_portfolio_value():
     with DB() as s:
         for pos in s.query(Position).all():
             sym = pos.symbol
-            if not sym.endswith('USDT'): continue
             qty = float(pos.quantity)
             ob = book_cache.get(sym, {})
             price = float(ob.get('best_bid') or ob.get('best_ask', 0))
@@ -510,7 +437,6 @@ def print_professional_dashboard():
         print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(dyn_sell_active):>3}{RESET}")
         print(f"{NAVY}{YELLOW}{'-' * 120}{RESET}\n")
 
-        # === POSITIONS ===
         with DB() as s:
             db_positions = s.query(Position).all()
 
@@ -523,7 +449,6 @@ def print_professional_dashboard():
             total_unrealized = Decimal('0')
             for pos in db_positions:
                 sym = pos.symbol
-                if not sym.endswith('USDT'): continue
                 qty = float(pos.quantity)
                 entry = float(pos.avg_entry_price)
                 ob = book_cache.get(sym, {})
@@ -548,9 +473,6 @@ def print_professional_dashboard():
         else:
             print(f"{NAVY}{YELLOW} No open positions.{RESET}\n")
 
-        # === WATCHLISTS (same as before) ===
-        # ... [BUY & SELL WATCHLIST CODE FROM PREVIOUS] ...
-
         print(f"{NAVY}{'=' * 120}{RESET}")
 
     except Exception as e:
@@ -559,13 +481,16 @@ def print_professional_dashboard():
 # ============================= MAIN =============================
 def main():
     global top_symbols
-    load_symbol_cache()
-    if not top_symbols: return
+    fetch_usdt_pairs()
+    if not top_symbols:
+        logger.critical("No symbols loaded")
+        return
 
     load_positions_from_rest()
-    logger.info(f"Loaded {len(positions)} positions")
+    logger.info(f"Loaded {len(positions)} positions from REST")
 
-    if not start_websockets(): return
+    if not start_websockets():
+        return
 
     last_dash = 0
     while True:
