@@ -976,18 +976,17 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # ----------------------------------------------------------------------
-# FULL TEXT DASHBOARD – NO BACKGROUND COLOR, DOUBLE-LINE DIVIDERS
+# COIN TRADING BOT – 30s REFRESH, BUY LIST IN MARKET OVERVIEW
 # ----------------------------------------------------------------------
 def print_professional_dashboard(bot):
     """
     Professional dashboard:
-    - Top-left anchored
-    - Double-line ========== dividers
-    - NO BACKGROUND COLOR (uses terminal default)
+    - Title: COIN TRADING BOT
+    - Full page refresh every 30 seconds
+    - No background color
     - Green profit, red loss
     - FULL TEXT TITLES
-    - BUY WATCH: COIN(RSI)
-    - SELL WATCH: COIN(+%)
+    - BUY LIST in MARKET OVERVIEW: "Coin Buy List: BTC(32) | ..."
     - STATUS: "Trailing Sell" | "Trailing Buy" | "24/7 Monitoring"
     """
     try:
@@ -998,59 +997,13 @@ def print_professional_dashboard(bot):
         RESET  = "\033[0m"
         DIVIDER = "=" * 120
 
-        # First-time layout setup
-        if not hasattr(print_professional_dashboard, "initialized"):
-            os.system('cls' if os.name == 'nt' else 'clear')
-            print(DIVIDER)
-            print(f"{BOLD}{'CRYPTO TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
-            print(DIVIDER)
+        # Clear screen and print full dashboard
+        os.system('cls' if os.name == 'nt' else 'clear')
 
-            # Global Stats (4 lines)
-            for _ in range(4): print(" " * 120)
-            print(DIVIDER)
-
-            # Positions
-            print(f"{BOLD}{'CURRENT POSITIONS':^120}{RESET}")
-            print(f"{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}")
-            print(DIVIDER)
-            for _ in range(15): print(" " * 120)
-            print(DIVIDER)
-
-            # Market
-            print(f"{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
-            for _ in range(3): print(" " * 120)
-            print(DIVIDER)
-
-            # Buy Watch
-            print(f"{BOLD}{'BUY WATCHLIST – LIVE SIGNALS':^120}{RESET}")
-            print(f"{'WATCHLIST: ':<120}")
-            print(DIVIDER)
-
-            # Sell Watch
-            print(f"{BOLD}{'SELL WATCHLIST – PROFIT TARGETS':^120}{RESET}")
-            print(f"{'SELL SIGNALS:  ':<120}")
-            print(DIVIDER)
-
-            # Fixed line map (1-indexed)
-            print_professional_dashboard.line_map = {
-                "time":         4,
-                "usdt":         5,
-                "port":         6,
-                "trailing":     7,
-                "pos_start":    12,
-                "pnl_total":    26,
-                "market_start": 29,
-                "buy_watch":    33,
-                "sell_watch":   36,
-            }
-            print_professional_dashboard.initialized = True
-
-        # Helper: write to exact line
-        def _update(line_no, text):
-            text = str(text).ljust(120)[:120]
-            sys.stdout.write(f"\033[{line_no}H")
-            sys.stdout.write(text)
-            sys.stdout.flush()
+        # === HEADER ===
+        print(DIVIDER)
+        print(f"{BOLD}{'COIN TRADING BOT':^120}{RESET}")
+        print(DIVIDER)
 
         # === 1. GLOBAL STATS ===
         now_str = now_cst()
@@ -1059,17 +1012,21 @@ def print_professional_dashboard(bot):
         tbuy_cnt = len(trailing_buy_active)
         tsel_cnt = len(trailing_sell_active)
 
-        _update(print_professional_dashboard.line_map["time"], f"Current Time: {now_str}")
-        _update(print_professional_dashboard.line_map["usdt"], f"Available USDT: ${usdt_free:,.6f}")
-        _update(print_professional_dashboard.line_map["port"], f"Total Portfolio Value: ${total_port:,.6f}")
-        _update(print_professional_dashboard.line_map["trailing"], f"Active Trailing Orders: {tbuy_cnt} buys, {tsel_cnt} sells")
+        print(f"Current Time: {now_str}")
+        print(f"Available USDT: ${usdt_free:,.6f}")
+        print(f"Total Portfolio Value: ${total_port:,.6f}")
+        print(f"Active Trailing Orders: {tbuy_cnt} buys, {tsel_cnt} sells")
+        print(DIVIDER)
 
         # === 2. POSITIONS ===
+        print(f"{BOLD}{'CURRENT POSITIONS':^120}{RESET}")
+        print(f"{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}")
+
         with DBManager() as sess:
             positions_list = sess.query(Position).all()[:15]
 
         total_pnl = Decimal('0')
-        for i, pos in enumerate(positions_list):
+        for pos in positions_list:
             sym = pos.symbol
             qty = float(pos.quantity)
             entry = float(pos.avg_entry_price)
@@ -1085,38 +1042,37 @@ def print_professional_dashboard(bot):
             pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
             total_pnl += Decimal(str(net))
 
-            # FULL STATUS TEXT
-            if sym in trailing_sell_active:
-                status = "Trailing Sell"
-            elif sym in trailing_buy_active:
-                status = "Trailing Buy"
-            else:
-                status = "24/7 Monitoring"
+            status = ("Trailing Sell" if sym in trailing_sell_active
+                      else "Trailing Buy" if sym in trailing_buy_active
+                      else "24/7 Monitoring")
 
             pnl_color = GREEN if net > 0 else RED
             pct_color = GREEN if pnl_pct > 0 else RED
 
-            line = (f"{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur:>12.6f} "
-                    f"{rsi_str} {pct_color}{pnl_pct:>7.2f}%{RESET} {pnl_color}{net:>9.2f}{RESET} {status:<30}")
-            _update(print_professional_dashboard.line_map["pos_start"] + i, line)
+            print(f"{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur:>12.6f} "
+                  f"{rsi_str} {pct_color}{pnl_pct:>7.2f}%{RESET} {pnl_color}{net:>9.2f}{RESET} {status:<30}")
 
-        # Clear rest
-        for i in range(len(positions_list), 15):
-            _update(print_professional_dashboard.line_map["pos_start"] + i, "")
+        # Fill empty rows
+        for _ in range(len(positions_list), 15):
+            print(" " * 120)
 
         # Total P&L
         total_pnl_color = GREEN if total_pnl > 0 else RED
-        _update(print_professional_dashboard.line_map["pnl_total"],
-                f"TOTAL UNREALIZED PROFIT & LOSS: {total_pnl_color}${float(total_pnl):>12,.2f}{RESET}")
+        print(DIVIDER)
+        print(f"TOTAL UNREALIZED PROFIT & LOSS: {total_pnl_color}${float(total_pnl):>12,.2f}{RESET}")
+        print(DIVIDER)
 
-        # === 3. MARKET STATS ===
+        # === 3. MARKET OVERVIEW + BUY LIST ===
+        print(f"{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
+
         valid_cnt = len(valid_symbols_dict)
         avg_vol = sum(s['volume'] for s in valid_symbols_dict.values()) if valid_symbols_dict else 0
-        _update(print_professional_dashboard.line_map["market_start"], f"Number of Valid Symbols: {valid_cnt}")
-        _update(print_professional_dashboard.line_map["market_start"] + 1, f"Average 24h Volume: ${avg_vol:,.0f}")
-        _update(print_professional_dashboard.line_map["market_start"] + 2, f"Price Range: ${MIN_PRICE} to ${MAX_PRICE}")
 
-        # === 4. BUY WATCHLIST – COIN(RSI) ===
+        print(f"Number of Valid Symbols: {valid_cnt}")
+        print(f"Average 24h Volume: ${avg_vol:,.0f}")
+        print(f"Price Range: ${MIN_PRICE} to ${MAX_PRICE}")
+
+        # === BUY WATCHLIST INSIDE MARKET OVERVIEW ===
         watch_items = []
         for sym in valid_symbols_dict:
             ob = bot.get_order_book_analysis(sym)
@@ -1133,38 +1089,13 @@ def print_professional_dashboard(bot):
                 watch_items.append(f"{coin}({rsi:.0f})")
 
         watch_str = " | ".join(watch_items[:18]) if watch_items else "No active buy signals"
-        if len(watch_str) > 105: watch_str = watch_str[:102] + "..."
-        _update(print_professional_dashboard.line_map["buy_watch"], f"WATCHLIST: {watch_str}")
+        if len(watch_str) > 100: watch_str = watch_str[:97] + "..."
+        print(f"Coin Buy List: {watch_str}")
 
-        # === 5. SELL WATCHLIST – COIN(+% ) ===
-        sell_items = []
-        with DBManager() as sess:
-            for pos in sess.query(Position).all():
-                sym = pos.symbol
-                entry = Decimal(str(pos.avg_entry_price))
-                ob = bot.get_order_book_analysis(sym)
-                rsi, trend, _ = bot.get_rsi_and_trend(sym)
-                maker, taker = bot.get_trade_fees(sym)
-                net_ret = (ob['best_ask'] - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
-                strong_sell = (ob['depth_skew'] == 'strong_bid' and
-                               ob['imbalance_ratio'] >= DEPTH_IMBALANCE_THRESHOLD and
-                               ob['weighted_pressure'] > 0.002)
-                if (net_ret >= PROFIT_TARGET_NET and rsi and rsi >= RSI_OVERBOUGHT and
-                    strong_sell and trend == 'bearish'):
-                    coin = sym.replace('USDT', '')
-                    pct = float(net_ret) * 100
-                    sell_items.append(f"{coin}(+{pct:.1f}%)")
-
-        sell_str = " | ".join(sell_items[:18]) if sell_items else "No active sell signals"
-        if len(sell_str) > 105: sell_str = sell_str[:102] + "..."
-        _update(print_professional_dashboard.line_map["sell_watch"], f"SELL SIGNALS:  {sell_str}")
-
-        # Cursor to bottom
-        sys.stdout.write(f"\033[39H")
-        sys.stdout.flush()
+        print(DIVIDER)
 
     except Exception as e:
-        logger.error(f"Dashboard update failed: {e}")
+        logger.error(f"Dashboard print failed: {e}")
 
 # === THREAD FUNCTIONS =======================================================
 def buy_scanner(bot):
