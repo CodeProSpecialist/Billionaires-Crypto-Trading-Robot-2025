@@ -1282,13 +1282,14 @@ def main():
     print_professional_dashboard(bot)
     logger.info("Multi-threaded bot started.")
     last_dash = 0
+    DASHBOARD_INTERVAL = 3.0  # 3 seconds
 
     while True:
         try:
             bot.check_and_process_filled_orders()
 
             now = time.time()
-            if now - last_dash >= 3:
+            if now - last_dash >= DASHBOARD_INTERVAL:
                 print_professional_dashboard(bot)
                 last_dash = now
 
