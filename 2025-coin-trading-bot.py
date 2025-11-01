@@ -1208,8 +1208,8 @@ def main():
     logger.info("Multi-threaded bot started.")
     last_inplace = time.time()
     last_full    = time.time()
-    INPLACE_INTERVAL = 3.0                     # existing in-place update
-    FULL_INTERVAL    = 10.0                    # new full refresh
+    INPLACE_INTERVAL = 43200.0                     # existing in-place update
+    FULL_INTERVAL    = 45.0                    # new full refresh
 
     while True:
         try:
