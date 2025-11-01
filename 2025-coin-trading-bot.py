@@ -975,143 +975,205 @@ def set_terminal_background_and_title():
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# === PROFESSIONAL DASHBOARD =================================================
+# ----------------------------------------------------------------------
+# LIVE DASHBOARD – UPDATE EVERY 5 SECONDS (IN-PLACE, NO FLASH)
+# ----------------------------------------------------------------------
 def print_professional_dashboard(bot):
+    """
+    Renders a live dashboard that updates **every 5 seconds** by
+    overwriting the same lines in-place. No full-screen clear after first run.
+    """
     try:
-        set_terminal_background_and_title()
-        os.system('cls' if os.name == 'nt' else 'clear')
-        now = now_cst()
-        usdt_free = bot.get_balance('USDT')
-        total_portfolio, _ = bot.calculate_total_portfolio_value()
-
-        NAVY = "\033[48;5;17m"
+        # Colors
+        NAVY   = "\033[48;5;17m"
         YELLOW = "\033[38;5;226m"
-        GREEN = "\033[38;5;82m"
-        RED = "\033[38;5;196m"
-        RESET = "\033[0m"
-        BOLD = "\033[1m"
+        GREEN  = "\033[38;5;82m"
+        RED    = "\033[38;5;196m"
+        RESET  = "\033[0m"
+        BOLD   = "\033[1m"
 
-        print(f"{NAVY}{'='*120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
-        print(f"{NAVY}{'='*120}{RESET}\n")
+        # First-time layout setup
+        if not hasattr(print_professional_dashboard, "initialized"):
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print(f"{NAVY}{'='*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'CRYPTO TRADING BOT – LIVE DASHBOARD (5s UPDATE)':^120}{RESET}")
+            print(f"{NAVY}{'='*120}{RESET}\n")
 
-        print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(trailing_buy_active)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(trailing_sell_active)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+            # Global stats (5 lines)
+            for _ in range(5): print(f"{NAVY}{YELLOW}{'':<120}{RESET}")
 
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # Positions header + 15 empty rows
+            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'SYM':<10} {'QTY':>12} {'ENTRY':>12} {'CUR':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            for _ in range(15): print("")
+
+            # Market stats
+            print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            for _ in range(3): print(f"{NAVY}{YELLOW}{'':<120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # Buy Watchlist
+            print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (LIVE)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'WATCH: ':<120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            # Sell Watchlist
+            print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (LIVE)':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'SELL: ':<120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+            print(f"{NAVY}{'='*120}{RESET}\n")
+
+            # Store line numbers for in-place updates
+            print_professional_dashboard.line_map = {
+                "time": 4,
+                "usdt": 5,
+                "port": 6,
+                "tbuy": 7,
+                "tsel": 8,
+                "pos_header": 11,
+                "pos_start": 14,
+                "market_start": 31,
+                "buy_watch": 36,
+                "sell_watch": 40,
+            }
+            print_professional_dashboard.initialized = True
+
+        # Helper: move up N lines and overwrite
+        def _update(line_no, text):
+            sys.stdout.write(f"\033[{line_no}A")  # Move up to target line
+            sys.stdout.write("\r" + " " * 120 + "\r")  # Clear line
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+        # === 1. GLOBAL STATS ===
+        now_str = now_cst()
+        usdt_free = bot.get_balance('USDT')
+        total_port, _ = bot.calculate_total_portfolio_value()
+        tbuy_cnt = len(trailing_buy_active)
+        tsel_cnt = len(trailing_sell_active)
+
+        _update(print_professional_dashboard.line_map["time"],
+                f"{NAVY}{YELLOW}{'Time (CST)':<20} {now_str}{RESET}")
+        _update(print_professional_dashboard.line_map["usdt"],
+                f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
+        _update(print_professional_dashboard.line_map["port"],
+                f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_port:,.6f}{RESET}")
+        _update(print_professional_dashboard.line_map["tbuy"],
+                f"{NAVY}{YELLOW}{'Trailing Buys':<20} {tbuy_cnt}{RESET}")
+        _update(print_professional_dashboard.line_map["tsel"],
+                f"{NAVY}{YELLOW}{'Trailing Sells':<20} {tsel_cnt}{RESET}")
+
+        # === 2. POSITIONS (15 max) ===
         with DBManager() as sess:
-            db_positions = sess.query(Position).all()
+            positions = sess.query(Position).all()[:15]
 
-        if db_positions:
-            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            total_pnl = Decimal('0')
-            for pos in db_positions:
-                symbol = pos.symbol
-                qty = float(pos.quantity)
-                entry = float(pos.avg_entry_price)
-                ob = bot.get_order_book_analysis(symbol)
-                cur_price = float(ob['best_bid'] or ob['best_ask'])
-                rsi, _, _ = bot.get_rsi_and_trend(symbol)
-                rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+        total_pnl = Decimal('0')
+        for i, pos in enumerate(positions):
+            sym = pos.symbol
+            qty = float(pos.quantity)
+            entry = float(pos.avg_entry_price)
+            ob = bot.get_order_book_analysis(sym)
+            cur = float(ob['best_bid'] or ob['best_ask'])
+            rsi, _, _ = bot.get_rsi_and_trend(sym)
+            rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
 
-                maker, taker = bot.get_trade_fees(symbol)
-                gross = (cur_price - entry) * qty
-                fee_cost = (maker + taker) * cur_price * qty
-                net_profit = gross - fee_cost
-                pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
-                total_pnl += Decimal(str(net_profit))
+            maker, taker = bot.get_trade_fees(sym)
+            gross = (cur - entry) * qty
+            fee = (maker + taker) * cur * qty
+            net = gross - fee
+            pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
+            total_pnl += Decimal(str(net))
 
-                status = ("Trailing Sell Active" if symbol in trailing_sell_active
-                          else "Trailing Buy Active" if symbol in trailing_buy_active
-                          else "24/7 Monitoring")
-                color = GREEN if net_profit > 0 else RED
-                print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
+            status = ("Trailing Sell" if sym in trailing_sell_active
+                      else "Trailing Buy" if sym in trailing_buy_active
+                      else "Monitoring")
+            color = GREEN if net > 0 else RED
 
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            pnl_color = GREEN if total_pnl > 0 else RED
-            print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
-        else:
-            print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
+            line = (f"{NAVY}{YELLOW}{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur:>12.6f} "
+                    f"{rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net:>10.2f}{RESET}"
+                    f"{NAVY}{YELLOW} {status:<25}{RESET}")
+            _update(print_professional_dashboard.line_map["pos_start"] + i, line)
 
-        print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'AVG 24H VOLUME':<20} ${sum(s['volume'] for s in valid_symbols_dict.values()):,.0f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+        # Clear unused position rows
+        for i in range(len(positions), 15):
+            _update(print_professional_dashboard.line_map["pos_start"] + i, "")
 
-        print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI≤35 + DEPTH IMBALANCE)':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        watchlist = []
-        for symbol in valid_symbols_dict.keys():
-            ob = bot.get_order_book_analysis(symbol)
-            rsi, trend, low_24h = bot.get_rsi_and_trend(symbol)
+        # Total P&L
+        pnl_line = f"{NAVY}{YELLOW}{'TOTAL UNREALIZED':<50} {GREEN if total_pnl>0 else RED}${float(total_pnl):>12,.2f}{RESET}"
+        _update(print_professional_dashboard.line_map["pos_start"] + 15, pnl_line)
 
-            strong_buy = (
-                ob['depth_skew'] == 'strong_ask' and
-                ob['imbalance_ratio'] <= 0.5 and
-                ob['weighted_pressure'] < -0.002
-            )
+        # === 3. MARKET STATS ===
+        valid_cnt = len(valid_symbols_dict)
+        avg_vol = sum(s['volume'] for s in valid_symbols_dict.values()) if valid_symbols_dict else 0
+        _update(print_professional_dashboard.line_map["market_start"],
+                f"{NAVY}{YELLOW}{'Valid Symbols':<20} {valid_cnt}{RESET}")
+        _update(print_professional_dashboard.line_map["market_start"] + 1,
+                f"{NAVY}{YELLOW}{'Avg 24h Volume':<20} ${avg_vol:,.0f}{RESET}")
+        _update(print_professional_dashboard.line_map["market_start"] + 2,
+                f"{NAVY}{YELLOW}{'Price Range':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
 
-            if (rsi is not None and rsi <= RSI_OVERSOLD and
-                trend == 'bullish' and
-                low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01') and
-                strong_buy):
-                watchlist.append((symbol, rsi, ob['imbalance_ratio'], ob['weighted_pressure'], ob['best_bid']))
+        # === 4. BUY WATCHLIST (live scrolling names) ===
+        watch = []
+        for sym in valid_symbols_dict:
+            ob = bot.get_order_book_analysis(sym)
+            rsi, trend, _ = bot.get_rsi_and_trend(sym)
+            bid = ob['best_bid']
+            if not bid: continue
 
-        if watchlist:
-            print(f"{NAVY}{YELLOW}{'SYM':<10} {'RSI':>6} {'IMBAL':>8} {'PRESS':>8} {'PRICE':>12}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*50}{RESET}")
-            for sym, rsi_val, imb, press, price in sorted(watchlist, key=lambda x: x[1])[:10]:
-                press_str = f"{press:+.1%}"
-                color = GREEN if press < 0 else RED
-                print(f"{NAVY}{YELLOW}{sym:<10} {rsi_val:>6.1f} {imb:>7.2f}x {color}{press_str:>8}{RESET} ${price:>11.6f}{RESET}")
-        else:
-            print(f"{NAVY}{YELLOW} No strong dip + depth signals.{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+            custom_low, _, _ = bot.get_24h_price_stats(sym)
+            strong_buy = (ob['depth_skew'] == 'strong_ask' and
+                          ob['imbalance_ratio'] <= 0.5 and
+                          ob['weighted_pressure'] < -0.002)
 
-        print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + DEPTH IMBALANCE)':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        sell_watch = []
+            if (rsi and rsi <= RSI_OVERSOLD and trend == 'bullish' and
+                custom_low and bid <= Decimal(str(custom_low)) * Decimal('1.01') and strong_buy):
+                watch.append(f"{sym}(RSI{rsi:.0f})")
+
+        watch_str = " | ".join(watch[:15]) if watch else "No signals"
+        if len(watch_str) > 110:
+            watch_str = watch_str[:107] + "..."
+        _update(print_professional_dashboard.line_map["buy_watch"],
+                f"{NAVY}{YELLOW}{'WATCH: '}{watch_str}{RESET}")
+
+        # === 5. SELL WATCHLIST ===
+        sell = []
         with DBManager() as sess:
             for pos in sess.query(Position).all():
-                symbol = pos.symbol
+                sym = pos.symbol
                 entry = Decimal(str(pos.avg_entry_price))
-                ob = bot.get_order_book_analysis(symbol)
-                rsi, trend, _ = bot.get_rsi_and_trend(symbol)
-                maker, taker = bot.get_trade_fees(symbol)
-                net_return = (ob['best_ask'] - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
+                ob = bot.get_order_book_analysis(sym)
+                rsi, trend, _ = bot.get_rsi_and_trend(sym)
+                maker, taker = bot.get_trade_fees(sym)
+                net_ret = (ob['best_ask'] - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
 
-                strong_sell = (
-                    ob['depth_skew'] == 'strong_bid' and
-                    ob['imbalance_ratio'] >= DEPTH_IMBALANCE_THRESHOLD and
-                    ob['weighted_pressure'] > 0.002
-                )
+                strong_sell = (ob['depth_skew'] == 'strong_bid' and
+                               ob['imbalance_ratio'] >= DEPTH_IMBALANCE_THRESHOLD and
+                               ob['weighted_pressure'] > 0.002)
 
-                if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT and strong_sell and trend == 'bearish':
-                    sell_watch.append((symbol, float(net_return * 100), rsi, ob['imbalance_ratio'], ob['weighted_pressure']))
+                if (net_ret >= PROFIT_TARGET_NET and rsi and rsi >= RSI_OVERBOUGHT and
+                    strong_sell and trend == 'bearish'):
+                    sell.append(f"{sym}(+{float(net_ret)*100:.1f}%)")
 
-        if sell_watch:
-            print(f"{NAVY}{YELLOW}{'SYM':<10} {'NET%':>8} {'RSI':>6} {'IMBAL':>7} {'PRESS':>8}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*50}{RESET}")
-            for sym, ret_pct, rsi_val, imb, press in sorted(sell_watch, key=lambda x: x[1], reverse=True)[:10]:
-                press_str = f"{press:+.1%}"
-                color = GREEN if press > 0 else RED
-                print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f} {imb:>6.2f}x {color}{press_str:>8}{RESET}")
-        else:
-            print(f"{NAVY}{YELLOW} No profitable + depth sell signals.{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+        sell_str = " | ".join(sell[:15]) if sell else "No signals"
+        if len(sell_str) > 110:
+            sell_str = sell_str[:107] + "..."
+        _update(print_professional_dashboard.line_map["sell_watch"],
+                f"{NAVY}{YELLOW}{'SELL:  '}{sell_str}{RESET}")
 
-        print(f"{NAVY}{'='*120}{RESET}\n")
+        # === 6. Move cursor to bottom ===
+        sys.stdout.write(f"\033[{print_professional_dashboard.line_map['sell_watch'] + 3}B")
+        sys.stdout.flush()
 
     except Exception as e:
-        logger.error(f"Dashboard error: {e}")
+        logger.error(f"Dashboard update failed: {e}")
 
 # === THREAD FUNCTIONS =======================================================
 def buy_scanner(bot):
@@ -1226,7 +1288,7 @@ def main():
             bot.check_and_process_filled_orders()
 
             now = time.time()
-            if now - last_dash >= 30:
+            if now - last_dash >= 3:
                 print_professional_dashboard(bot)
                 last_dash = now
 
