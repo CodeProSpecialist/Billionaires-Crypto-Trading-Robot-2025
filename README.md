@@ -8,7 +8,7 @@ trading robot python code.
 Newest Python code updates were 
 finished by 2:00pm on 
 October 31, 2025. 
-This robot is still being designed and coded.I will try to have it ready in a few more days. I am still providing what code I have on here. 
+This robot is still being designed and coded. I will try to have it ready in a few more days. I am still providing what code I have on here. 
 *****
 
 ( Note: delete the file named 
