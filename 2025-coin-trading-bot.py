@@ -1279,19 +1279,37 @@ def main():
     threading.Thread(target=trailing_buy_processor, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_processor, args=(bot,), daemon=True).start()
 
-    print_professional_dashboard(bot)
+    # ------------------------------------------------------------------
+    # NEW: force a full clear-and-redraw every 10 seconds
+    # ------------------------------------------------------------------
+    print_professional_dashboard(bot)          # first draw
     logger.info("Multi-threaded bot started.")
-    last_dash = 0
-    DASHBOARD_INTERVAL = 3.0  # 3 seconds
+    last_inplace = time.time()
+    last_full    = time.time()
+    INPLACE_INTERVAL = 3.0                     # existing in-place update
+    FULL_INTERVAL    = 10.0                    # new full refresh
 
     while True:
         try:
             bot.check_and_process_filled_orders()
 
             now = time.time()
-            if now - last_dash >= DASHBOARD_INTERVAL:
+
+            # ---- 3-second in-place update (unchanged) ----
+            if now - last_inplace >= INPLACE_INTERVAL:
                 print_professional_dashboard(bot)
-                last_dash = now
+                last_inplace = now
+
+            # ---- 10-second FULL refresh (clear screen) ----
+            if now - last_full >= FULL_INTERVAL:
+                # Reset the static layout flag so the next call rebuilds everything
+                if hasattr(print_professional_dashboard, "initialized"):
+                    del print_professional_dashboard.initialized
+                    del print_professional_dashboard.line_map
+                # Clear screen and redraw from scratch
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print_professional_dashboard(bot)
+                last_full = now
 
             time.sleep(1.0)
         except KeyboardInterrupt:
@@ -1300,6 +1318,3 @@ def main():
         except Exception as e:
             logger.critical(f"Main loop error: {e}", exc_info=True)
             time.sleep(10)
-
-if __name__ == "__main__":
-    main()
