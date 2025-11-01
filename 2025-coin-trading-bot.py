@@ -1318,3 +1318,6 @@ def main():
         except Exception as e:
             logger.critical(f"Main loop error: {e}", exc_info=True)
             time.sleep(10)
+
+if __name__ == "__main__":
+    main()
