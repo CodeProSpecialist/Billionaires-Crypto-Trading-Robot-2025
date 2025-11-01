@@ -15,81 +15,128 @@ October 31, 2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-### Overview of the Binance.US Dynamic Trailing Bot
-
-**BINANCE.US DYNAMIC TRAILING BOT**  
-**THE 0.8% PROFIT MACHINE THAT NEVER SLEEPS**  
-*One Bot. One Thread. Unlimited Edge.*
+**BILLIONAIRES CRYPTO TRADING ROBOT 2025**  
+**THE MOST ADVANCED MULTI-THREADED BINANCE.US BOT ON EARTH**
 
 ---
 
-**TRAIL. STRIKE. REPEAT.**  
-**TRAILING BUY** → Hunts **oversold dips (RSI ≤ 35)** with **laser precision**  
-- Detects **60%+ sell pressure** in the order book  
-- Triggers on **1% flash crashes in 5 seconds** → **INSTANT MARKET BUY**  
-- Rides the bounce. No FOMO. No guesswork.
+## **ELITE FEATURES – ONLY IN THIS BOT**
 
-**TRAILING SELL** → Locks **0.8% NET PROFIT** like a vault  
-- Peaks at **RSI ≥ 65 + 65% buy pressure spike**  
-- **5% pullback = AUTO-SELL**  
-- **15-minute stall? MARKET DUMP. No mercy.**
-
----
-
-**LIVE WAR ROOM DASHBOARD**  
-**See. Decide. Dominate.**  
-- **Real-time P&L** in **blazing green/red**  
-- **Every position tracked**: Entry | Current | RSI | Unrealized $  
-- **Top 10 Dip & Profit Alerts** – updated every 30s  
-- **Portfolio value + USDT free** at a glance
+| Feature | What It Does | Why You Win |
+|--------|--------------|------------|
+| **4 Parallel Threads** | Buy scan + Sell scan + Trailing buys + Trailing sells | **Never miss a dip or profit** |
+| **20-Level Order Book Depth** | VWAP, Cumulative Volume, Imbalance Ratio, Skew, Pressure | **See what whales see** |
+| **Smart Depth Signals** | `strong_bid` / `strong_ask` imbalance > 2.0× | **Buy the dip before it bounces** |
+| **RSI + Depth + 24h Low** | Only enters on **triple confirmation** | **No fakeouts** |
+| **Dynamic Trailing Logic** | Tracks peak price, detects stalls, cancels & re-places | **Sells at the absolute top** |
+| **Flash Dip Detection** | 1% drop in 5 seconds → **instant market buy** | **Catch the knife safely** |
+| **15-Min Stall Killer** | No movement? → **market sell** | **No more stuck bags** |
+| **Thread-Safe State** | `api_lock` + `state_lock` | **Zero race conditions** |
+| **Rate-Limit Intelligence** | Auto-backoff on 429/418, header monitoring | **Never banned** |
+| **Professional Live Dashboard** | Real-time P&L, depth, RSI, imbalance | **Trade like a hedge fund** |
+| **WhatsApp Alerts** | Every buy/sell/trailing start | **Never miss a move** |
+| **SQLite Persistence** | All trades & positions saved | **Survives crashes** |
+| **Auto-Import Holdings** | Scans your wallet → adds positions | **Zero setup** |
 
 ---
 
-**BUILT LIKE A TANK. RUNS LIKE A CHEETAH.**  
-- **Single-threaded** → Zero crashes. Zero conflicts.  
-- **Rate-limit GENIUS**: Auto-backs off **before** Binance bans you  
-- **429? 418? We laugh. Retry. Win.**  
-- **SQLite fortress**: Every trade logged, audited, immortal  
-- **WhatsApp PINGS**: “BUY EXECUTED BTCUSDT @ 62,420.69” — **you’re always in the loop**
+## **BUY STRATEGY (ONLY THE BEST DIPS)**
 
----
-
-**CAPITAL ON LOCKDOWN**  
-- **10% risk per trade** → Survive. Thrive. Compound.  
-- **$2 USDT floor** → Never over-extend  
-- **Fee-smart math** → You keep **what you earn**
-
----
-
-**PLUG. PROFIT. REPEAT.**  
-1. Drop in your **Binance.US API keys**  
-2. Auto-imports your bags  
-3. **Watch it hunt** while you sleep, shower, or flex
-
-
----
-
-**STOP HOPING. START TRAILING.**  
-**Deploy the bot that turns volatility into your paycheck.**  
-
----  
-**OPEN-SOURCE. BATTLE-PROVEN. PROFIT-OBSESSED.**  
-*One command. Lifetime gains.*  
-
----  
-**YOUR NEXT 0.8% STARTS NOW.**  
-*Python 3 | Binance.US | Zero Excuses*
-
-## How to Run
-
-```bash
-python3 2025-coin-trading-bot.py
+```text
+RSI ≤ 35
++ 24h low within 1%
++ Ask-side depth > 60%
++ Imbalance ≤ 0.5× (strong ask pressure)
++ VWAP pressure < -0.2%
+→ TRAILING BUY ACTIVATED
 ```
 
-> Press **Ctrl+C** to shut down gracefully.
+---
+
+## **SELL STRATEGY (ONLY THE BEST TOPS)**
+
+```text
+Net Profit ≥ 0.8%
++ RSI ≥ 65
++ Bid-side depth spike → drop
++ Imbalance ≥ 2.0× (strong bid)
++ VWAP pressure > +0.2%
+→ TRAILING SELL ACTIVATED
+```
 
 ---
 
+## **LIVE DASHBOARD (REAL-TIME)**
+
+```
+TRADING BOT – LIVE DASHBOARD
+══════════════════════════════════════════════════════════════════════════════
+Time (CST)           2025-11-01 03:15:22 CST
+Available USDT       $1,247.892100
+Portfolio Value      $12,847.33
+Trailing Buys        3
+Trailing Sells       1
+
+POSITIONS IN DATABASE
+────────────────────────────────────────────────────────────────────────────────
+SYMBOL      QTY         ENTRY       CURRENT     RSI   P&L%     PROFIT      STATUS
+BTCUSDT   0.012300    67420.00    68950.00   68.2  +2.10%    +$188.40   Trailing Sell Active
+ETHUSDT   0.450000     2450.00     2380.00   32.1  -2.70%     -$31.50   Trailing Buy Active
+
+BUY WATCHLIST (RSI≤35 + DEPTH IMBALANCE)
+────────────────────────────────────────────────────────────────────────────────
+SYM         RSI    IMBAL     PRESS       PRICE
+SOLUSDT    31.2    0.41x    -0.3%     $178.320000
+ADAUSDT    33.8    0.38x    -0.4%       $0.421000
+
+SELL WATCHLIST (PROFIT + DEPTH IMBALANCE)
+────────────────────────────────────────────────────────────────────────────────
+SYM        NET%     RSI    IMBAL    PRESS
+BTCUSDT    +2.10%   68.2    2.8x    +0.3%
+```
+
+---
+
+## **WHY THIS BOT WINS**
+
+| Others | **THIS BOT** |
+|-------|-------------|
+| Single-threaded | **4x faster** |
+| Top 5 order book | **20-level depth** |
+| Simple RSI | **RSI + Depth + VWAP** |
+| Fixed trailing | **Dynamic + stall kill** |
+| No alerts | **WhatsApp + log** |
+| Crashes lose state | **SQLite DB** |
+
+---
+
+## **PLUG & PLAY – 60 SECONDS TO LIVE**
+
+```bash
+# 1. Install
+pip install python-binance sqlalchemy talib numpy requests
+
+# 2. Set env
+export BINANCE_API_KEY="your_key"
+export BINANCE_API_SECRET="your_secret"
+export CALLMEBOT_API_KEY="123456"
+export CALLMEBOT_PHONE="15551234567"
+
+# 3. Run
+python3 2025-coin-trading-bot.py
+```
+ 
+**NO SUBSCRIPTION • NO CLOUD • FULL CONTROL**
+
+---
+
+**BILLIONAIRES CRYPTO TRADING ROBOT 2025**  
+*Built for speed. Built for profit. Built for you.*
+
+--- 
+
+**Tagline:**  
+> **"Trade like a billionaire."**
 
 ### **Setup Requirements**
 
