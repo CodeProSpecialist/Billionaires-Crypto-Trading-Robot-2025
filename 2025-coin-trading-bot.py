@@ -976,82 +976,82 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # ----------------------------------------------------------------------
-# LIVE DASHBOARD – UPDATE EVERY 3 SECONDS (IN-PLACE), FULL REFRESH EVERY 10s
+# FULL TEXT DASHBOARD – NO ABBREVIATIONS, DOUBLE-LINE DIVIDERS
 # ----------------------------------------------------------------------
 def print_professional_dashboard(bot):
     """
-    Renders a live dashboard that updates **every 3 seconds** in-place.
-    Full clear + redraw is triggered externally every 10 seconds.
-    All content is confined to fixed line numbers via `line_map`.
+    Professional dashboard:
+    - Top-left anchored
+    - Double-line ========== dividers
+    - Black text, white background
+    - Green profit, red loss
+    - FULL TEXT TITLES (no abbreviations)
+    - BUY WATCH: COIN(RSI)
+    - SELL WATCH: COIN(+%)
+    - STATUS: "Trailing Sell" | "Trailing Buy" | "24/7 Monitoring"
     """
     try:
         # ANSI Colors
-        NAVY   = "\033[48;5;17m"
-        YELLOW = "\033[38;5;226m"
-        GREEN  = "\033[38;5;82m"
-        RED    = "\033[38;5;196m"
-        RESET  = "\033[0m"
-        BOLD   = "\033[1m"
+        WHITE_BG = "\033[47m"
+        BLACK    = "\033[30m"
+        GREEN    = "\033[32m"
+        RED      = "\033[31m"
+        BOLD     = "\033[1m"
+        RESET    = "\033[0m"
+        DIVIDER  = f"{WHITE_BG}{'='*120}{RESET}"
 
         # First-time layout setup
         if not hasattr(print_professional_dashboard, "initialized"):
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{NAVY}{'='*120}{RESET}")
-            print(f"{NAVY}{BOLD}{YELLOW}{'CRYPTO TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
-            print(f"{NAVY}{'='*120}{RESET}\n")
+            print(DIVIDER)
+            print(f"{WHITE_BG}{BLACK}{BOLD}{'CRYPTO TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
+            print(DIVIDER)
 
-            # Global Stats (5 lines)
-            for _ in range(5): print(f"{NAVY}{' '*120}{RESET}")
+            # Global Stats (4 lines)
+            for _ in range(4): print(f"{WHITE_BG}{' '*120}{RESET}")
+            print(DIVIDER)
 
-            print(f"{NAVY}{'-'*120}{RESET}\n")
+            # Positions
+            print(f"{WHITE_BG}{BLACK}{BOLD}{'CURRENT POSITIONS':^120}{RESET}")
+            print(f"{WHITE_BG}{BLACK}{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}{RESET}")
+            print(DIVIDER)
+            for _ in range(15): print(f"{WHITE_BG}{' '*120}{RESET}")
+            print(DIVIDER)
 
-            # Positions Header + 15 rows
-            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS':^120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}")
-            print(f"{NAVY}{'SYM':<10} {'QTY':>12} {'ENTRY':>12} {'CUR':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}")
-            for _ in range(15): print(f"{NAVY}{' '*120}{RESET}")
+            # Market
+            print(f"{WHITE_BG}{BLACK}{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
+            for _ in range(3): print(f"{WHITE_BG}{' '*120}{RESET}")
+            print(DIVIDER)
 
-            # Market Stats
-            print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}")
-            for _ in range(3): print(f"{NAVY}{' '*120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}\n")
+            # Buy Watch
+            print(f"{WHITE_BG}{BLACK}{BOLD}{'BUY WATCHLIST – LIVE SIGNALS':^120}{RESET}")
+            print(f"{WHITE_BG}{'WATCHLIST: ':<120}{RESET}")
+            print(DIVIDER)
 
-            # Buy Watchlist
-            print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (LIVE)':^120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}")
-            print(f"{NAVY}{'WATCH: ':<120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}\n")
+            # Sell Watch
+            print(f"{WHITE_BG}{BLACK}{BOLD}{'SELL WATCHLIST – PROFIT TARGETS':^120}{RESET}")
+            print(f"{WHITE_BG}{'SELL SIGNALS:  ':<120}{RESET}")
+            print(DIVIDER)
 
-            # Sell Watchlist
-            print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (LIVE)':^120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}")
-            print(f"{NAVY}{'SELL: ':<120}{RESET}")
-            print(f"{NAVY}{'-'*120}{RESET}\n")
-
-            print(f"{NAVY}{'='*120}{RESET}\n")
-
-            # Define exact line numbers for in-place updates
+            # Fixed line map (1-indexed)
             print_professional_dashboard.line_map = {
                 "time":         4,
                 "usdt":         5,
                 "port":         6,
-                "tbuy":         7,
-                "tsel":         8,
-                "pos_start":    14,   # First position row
-                "pnl_total":    29,   # After 15 positions
-                "market_start": 31,
-                "buy_watch":    36,
-                "sell_watch":   40,
+                "trailing":     7,
+                "pos_start":    12,
+                "pnl_total":    26,
+                "market_start": 29,
+                "buy_watch":    33,
+                "sell_watch":   36,
             }
             print_professional_dashboard.initialized = True
 
-        # Helper: overwrite specific line
+        # Helper: write to exact line
         def _update(line_no, text):
-            text = text.ljust(120)[:120]  # Enforce 120-char width
-            sys.stdout.write(f"\033[{line_no}H")  # Move to exact line
-            sys.stdout.write(f"{NAVY}{text}{RESET}")
+            text = str(text).ljust(120)[:120]
+            sys.stdout.write(f"\033[{line_no}H")
+            sys.stdout.write(f"{WHITE_BG}{BLACK}{text}{RESET}")
             sys.stdout.flush()
 
         # === 1. GLOBAL STATS ===
@@ -1061,18 +1061,12 @@ def print_professional_dashboard(bot):
         tbuy_cnt = len(trailing_buy_active)
         tsel_cnt = len(trailing_sell_active)
 
-        _update(print_professional_dashboard.line_map["time"],
-                f"Time (CST): {now_str}")
-        _update(print_professional_dashboard.line_map["usdt"],
-                f"Available USDT: ${usdt_free:,.6f}")
-        _update(print_professional_dashboard.line_map["port"],
-                f"Portfolio Value: ${total_port:,.6f}")
-        _update(print_professional_dashboard.line_map["tbuy"],
-                f"Trailing Buys: {tbuy_cnt}")
-        _update(print_professional_dashboard.line_map["tsel"],
-                f"Trailing Sells: {tsel_cnt}")
+        _update(print_professional_dashboard.line_map["time"], f"Current Time: {now_str}")
+        _update(print_professional_dashboard.line_map["usdt"], f"Available USDT: ${usdt_free:,.6f}")
+        _update(print_professional_dashboard.line_map["port"], f"Total Portfolio Value: ${total_port:,.6f}")
+        _update(print_professional_dashboard.line_map["trailing"], f"Active Trailing Orders: {tbuy_cnt} buys, {tsel_cnt} sells")
 
-        # === 2. POSITIONS (15 max) ===
+        # === 2. POSITIONS ===
         with DBManager() as sess:
             positions_list = sess.query(Position).all()[:15]
 
@@ -1093,36 +1087,39 @@ def print_professional_dashboard(bot):
             pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
             total_pnl += Decimal(str(net))
 
-            status = ("Trailing Sell" if sym in trailing_sell_active
-                      else "Trailing Buy" if sym in trailing_buy_active
-                      else "Monitoring")
-            color = GREEN if net > 0 else RED
+            # FULL STATUS TEXT
+            if sym in trailing_sell_active:
+                status = "Trailing Sell"
+            elif sym in trailing_buy_active:
+                status = "Trailing Buy"
+            else:
+                status = "24/7 Monitoring"
+
+            pnl_color = GREEN if net > 0 else RED
+            pct_color = GREEN if pnl_pct > 0 else RED
 
             line = (f"{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur:>12.6f} "
-                    f"{rsi_str} {color}{pnl_pct:>7.2f}%{RESET} {color}{net:>9.2f}{RESET} {status:<25}")
+                    f"{rsi_str} {pct_color}{pnl_pct:>7.2f}%{RESET} {pnl_color}{net:>9.2f}{RESET} {status:<30}")
             _update(print_professional_dashboard.line_map["pos_start"] + i, line)
 
-        # Clear remaining position rows
+        # Clear rest
         for i in range(len(positions_list), 15):
             _update(print_professional_dashboard.line_map["pos_start"] + i, "")
 
         # Total P&L
-        pnl_color = GREEN if total_pnl > 0 else RED
+        total_pnl_color = GREEN if total_pnl > 0 else RED
         _update(print_professional_dashboard.line_map["pnl_total"],
-                f"TOTAL UNREALIZED P&L: {pnl_color}${float(total_pnl):>12,.2f}{RESET}")
+                f"TOTAL UNREALIZED PROFIT & LOSS: {total_pnl_color}${float(total_pnl):>12,.2f}{RESET}")
 
         # === 3. MARKET STATS ===
         valid_cnt = len(valid_symbols_dict)
         avg_vol = sum(s['volume'] for s in valid_symbols_dict.values()) if valid_symbols_dict else 0
-        _update(print_professional_dashboard.line_map["market_start"],
-                f"Valid Symbols: {valid_cnt}")
-        _update(print_professional_dashboard.line_map["market_start"] + 1,
-                f"Avg 24h Volume: ${avg_vol:,.0f}")
-        _update(print_professional_dashboard.line_map["market_start"] + 2,
-                f"Price Range: ${MIN_PRICE} to ${MAX_PRICE}")
+        _update(print_professional_dashboard.line_map["market_start"], f"Number of Valid Symbols: {valid_cnt}")
+        _update(print_professional_dashboard.line_map["market_start"] + 1, f"Average 24h Volume: ${avg_vol:,.0f}")
+        _update(print_professional_dashboard.line_map["market_start"] + 2, f"Price Range: ${MIN_PRICE} to ${MAX_PRICE}")
 
-        # === 4. BUY WATCHLIST ===
-        watch = []
+        # === 4. BUY WATCHLIST – COIN(RSI) ===
+        watch_items = []
         for sym in valid_symbols_dict:
             ob = bot.get_order_book_analysis(sym)
             rsi, trend, _ = bot.get_rsi_and_trend(sym)
@@ -1134,14 +1131,15 @@ def print_professional_dashboard(bot):
                           ob['weighted_pressure'] < -0.002)
             if (rsi and rsi <= RSI_OVERSOLD and trend == 'bullish' and
                 custom_low and bid <= Decimal(str(custom_low)) * Decimal('1.01') and strong_buy):
-                watch.append(f"{sym}(RSI{rsi:.0f})")
-        watch_str = " | ".join(watch[:15]) if watch else "No signals"
-        if len(watch_str) > 105: watch_str = watch_str[:102] + "..."
-        _update(print_professional_dashboard.line_map["buy_watch"],
-                f"WATCH: {watch_str}")
+                coin = sym.replace('USDT', '')
+                watch_items.append(f"{coin}({rsi:.0f})")
 
-        # === 5. SELL WATCHLIST ===
-        sell = []
+        watch_str = " | ".join(watch_items[:18]) if watch_items else "No active buy signals"
+        if len(watch_str) > 105: watch_str = watch_str[:102] + "..."
+        _update(print_professional_dashboard.line_map["buy_watch"], f"WATCHLIST: {watch_str}")
+
+        # === 5. SELL WATCHLIST – COIN(+% ) ===
+        sell_items = []
         with DBManager() as sess:
             for pos in sess.query(Position).all():
                 sym = pos.symbol
@@ -1155,14 +1153,16 @@ def print_professional_dashboard(bot):
                                ob['weighted_pressure'] > 0.002)
                 if (net_ret >= PROFIT_TARGET_NET and rsi and rsi >= RSI_OVERBOUGHT and
                     strong_sell and trend == 'bearish'):
-                    sell.append(f"{sym}(+{float(net_ret)*100:.1f}%)")
-        sell_str = " | ".join(sell[:15]) if sell else "No signals"
-        if len(sell_str) > 105: sell_str = sell_str[:102] + "..."
-        _update(print_professional_dashboard.line_map["sell_watch"],
-                f"SELL:  {sell_str}")
+                    coin = sym.replace('USDT', '')
+                    pct = float(net_ret) * 100
+                    sell_items.append(f"{coin}(+{pct:.1f}%)")
 
-        # Cursor reset (optional, for safety)
-        sys.stdout.write(f"\033[{print_professional_dashboard.line_map['sell_watch'] + 3}H")
+        sell_str = " | ".join(sell_items[:18]) if sell_items else "No active sell signals"
+        if len(sell_str) > 105: sell_str = sell_str[:102] + "..."
+        _update(print_professional_dashboard.line_map["sell_watch"], f"SELL SIGNALS:  {sell_str}")
+
+        # Cursor to bottom
+        sys.stdout.write(f"\033[39H")
         sys.stdout.flush()
 
     except Exception as e:
