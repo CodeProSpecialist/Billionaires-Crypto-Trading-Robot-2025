@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Binance.US Dynamic Trailing Bot – MULTI-THREADED (Rate-Limit Aware)
+Binance.US Dynamic Trailing Bot – MULTI-THREADED (Rate-Limit & Depth Aware)
 - 1 extra thread for buy scanning
 - 1 extra thread for sell scanning
 - 1 thread for all trailing buys
 - 1 thread for all trailing sells
-- Thread-safe with locks for API and state
-- No custom limiter – only react to 429/418
-- RateManager stores current limits & backs off when close
-- Fixed: valid symbols were zero (missing numpy + client order)
-- Full dashboard, helpers, alerts
+- Full 20-level order book depth analysis (VWAP, imbalance, skew, pressure)
+- Thread-safe, rate-limit aware, professional dashboard
 """
 
 import os
@@ -59,6 +56,8 @@ ORDERBOOK_BUY_PRESSURE_DROP = 0.55
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 ORDER_BOOK_LIMIT = 20
+ORDER_BOOK_LEVELS = 20
+DEPTH_IMBALANCE_THRESHOLD = 2.0
 POLL_INTERVAL = 1.0
 STALL_THRESHOLD_SECONDS = 15 * 60  # 15 minutes
 RAPID_DROP_THRESHOLD = 0.01  # 1.0%
@@ -256,163 +255,6 @@ class RateManager:
             return max(60 - now.second + 0.1, 1.0)
         return max(10 - (now.second % 10) + 0.1, 1.0)
 
-# === HELPER FUNCTIONS =======================================================
-def validate_and_adjust_order(bot, symbol, side, order_type, quantity, price):
-    try:
-        with bot.api_lock:
-            bot.rate_manager.wait_if_needed('REQUEST_WEIGHT')
-            info = bot.client.get_symbol_info(symbol)
-            bot.rate_manager.update_current()
-        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
-        step = Decimal(lot['stepSize'])
-        tick = Decimal(price_f['tickSize'])
-        qty = (quantity // step) * step
-        price = (price // tick) * tick
-        return {'quantity': float(qty), 'price': float(price)}, None
-    except Exception as e:
-        logger.error(f"Filter error {symbol}: {e}")
-        return None, "Filter error"
-
-def send_whatsapp_alert(message: str):
-    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
-        try:
-            url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
-            requests.get(url, timeout=5)
-        except Exception as e:
-            logger.debug(f"WhatsApp failed: {e}")
-
-def set_terminal_background_and_title():
-    try:
-        print("\033]0;TRADING BOT – LIVE\007", end='')
-        print("\033[48;5;17m", end='')
-        print("\033[2J\033[H", end='')
-    except:
-        pass
-
-def now_cst():
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-# === PROFESSIONAL DASHBOARD =================================================
-def print_professional_dashboard(bot):
-    try:
-        set_terminal_background_and_title()
-        os.system('cls' if os.name == 'nt' else 'clear')
-        now = now_cst()
-        usdt_free = bot.get_balance('USDT')
-        total_portfolio, _ = bot.calculate_total_portfolio_value()
-
-        NAVY = "\033[48;5;17m"
-        YELLOW = "\033[38;5;226m"
-        GREEN = "\033[38;5;82m"
-        RED = "\033[38;5;196m"
-        RESET = "\033[0m"
-        BOLD = "\033[1m"
-
-        print(f"{NAVY}{'='*120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
-        print(f"{NAVY}{'='*120}{RESET}\n")
-
-        print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(trailing_buy_active)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(trailing_sell_active)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
-
-        with DBManager() as sess:
-            db_positions = sess.query(Position).all()
-
-        if db_positions:
-            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            total_pnl = Decimal('0')
-            for pos in db_positions:
-                symbol = pos.symbol
-                qty = float(pos.quantity)
-                entry = float(pos.avg_entry_price)
-                ob = bot.get_order_book_analysis(symbol)
-                cur_price = float(ob['best_bid'] or ob['best_ask'])
-                rsi, _, _ = bot.get_rsi_and_trend(symbol)
-                rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
-
-                maker, taker = bot.get_trade_fees(symbol)
-                gross = (cur_price - entry) * qty
-                fee_cost = (maker + taker) * cur_price * qty
-                net_profit = gross - fee_cost
-                pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
-                total_pnl += Decimal(str(net_profit))
-
-                status = ("Trailing Sell Active" if symbol in trailing_sell_active
-                          else "Trailing Buy Active" if symbol in trailing_buy_active
-                          else "24/7 Monitoring")
-                color = GREEN if net_profit > 0 else RED
-                print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
-
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            pnl_color = GREEN if total_pnl > 0 else RED
-            print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
-        else:
-            print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
-
-        print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'AVG 24H VOLUME':<20} ${sum(s['volume'] for s in valid_symbols_dict.values()):,.0f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
-
-        print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        watchlist = []
-        for symbol in valid_symbols_dict.keys():
-            ob = bot.get_order_book_analysis(symbol)
-            rsi, trend, low_24h = bot.get_rsi_and_trend(symbol)
-            if (rsi is not None and rsi <= RSI_OVERSOLD and
-                ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
-                low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01')):
-                watchlist.append((symbol, rsi, ob['pct_ask'], ob['best_bid']))
-
-        if watchlist:
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'RSI':>6} {'SELL %':>8} {'PRICE':>12}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*40}{RESET}")
-            for sym, rsi_val, sell_pct, price in sorted(watchlist, key=lambda x: x[1])[:10]:
-                print(f"{NAVY}{YELLOW}{sym:<10} {rsi_val:>6.1f} {sell_pct:>7.1f}% ${price:>11.6f}{RESET}")
-        else:
-            print(f"{NAVY}{YELLOW} No strong dip signals.{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
-
-        print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        sell_watch = []
-        with DBManager() as sess:
-            for pos in sess.query(Position).all():
-                symbol = pos.symbol
-                entry = Decimal(str(pos.avg_entry_price))
-                ob = bot.get_order_book_analysis(symbol)
-                sell_price = ob['best_ask']
-                rsi, _, _ = bot.get_rsi_and_trend(symbol)
-                maker, taker = bot.get_trade_fees(symbol)
-                net_return = (sell_price - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
-                if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
-                    sell_watch.append((symbol, float(net_return * 100), rsi))
-
-        if sell_watch:
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'NET %':>8} {'RSI':>6}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*30}{RESET}")
-            for sym, ret_pct, rsi_val in sorted(sell_watch, key=lambda x: x[1], reverse=True)[:10]:
-                print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f}{RESET}")
-        else:
-            print(f"{NAVY}{YELLOW} No profitable sell signals.{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
-
-        print(f"{NAVY}{'='*120}{RESET}\n")
-
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
@@ -473,26 +315,69 @@ class BinanceTradingBot:
         now = time.time()
         with self.state_lock:
             cached = order_book_cache.get(symbol)
-            if cached and now - cached.get('ts', 0) < 1:
+            if cached and now - cached.get('ts', 0) < 1.0:
                 return cached
 
         with self.api_lock:
             self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
-            depth = self.client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LIMIT)
+            depth = self.client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LEVELS)
             self.rate_manager.update_current()
-        bids = depth.get('bids', [])[:5]
-        asks = depth.get('asks', [])[:5]
-        bid_vol = sum(Decimal(b[1]) for b in bids)
-        ask_vol = sum(Decimal(a[1]) for a in asks)
-        total = bid_vol + ask_vol or Decimal('1')
+
+        bids = depth.get('bids', [])[:ORDER_BOOK_LEVELS]
+        asks = depth.get('asks', [])[:ORDER_BOOK_LEVELS]
+
+        top5_bids = bids[:5]
+        top5_asks = asks[:5]
+        top5_bid_vol = sum(Decimal(b[1]) for b in top5_bids)
+        top5_ask_vol = sum(Decimal(a[1]) for a in top5_asks)
+        top5_total = top5_bid_vol + top5_ask_vol or Decimal('1')
+
+        cum_bid_vol = Decimal('0')
+        cum_ask_vol = Decimal('0')
+        bid_weighted = Decimal('0')
+        ask_weighted = Decimal('0')
+
+        for price_str, qty_str in bids:
+            price = Decimal(price_str)
+            qty   = Decimal(qty_str)
+            cum_bid_vol   += qty
+            bid_weighted  += price * qty
+
+        for price_str, qty_str in asks:
+            price = Decimal(price_str)
+            qty   = Decimal(qty_str)
+            cum_ask_vol   += qty
+            ask_weighted  += price * qty
+
+        bid_vwap = (bid_weighted / cum_bid_vol) if cum_bid_vol else ZERO
+        ask_vwap = (ask_weighted / cum_ask_vol) if cum_ask_vol else ZERO
+        mid_price = (bid_vwap + ask_vwap) / Decimal('2') if (bid_vwap and ask_vwap) else ZERO
+
+        imbalance_ratio = float(cum_bid_vol / cum_ask_vol) if cum_ask_vol else 999.0
+        depth_skew = (
+            'strong_bid' if imbalance_ratio >= DEPTH_IMBALANCE_THRESHOLD else
+            'strong_ask' if (1.0 / imbalance_ratio) >= DEPTH_IMBALANCE_THRESHOLD else
+            'balanced'
+        )
+
+        weighted_pressure = float((bid_vwap - ask_vwap) / mid_price) if mid_price else 0.0
 
         result = {
-            'pct_bid': float(bid_vol / total * 100),
-            'pct_ask': float(ask_vol / total * 100),
-            'best_bid': Decimal(bids[0][0]) if bids else ZERO,
-            'best_ask': Decimal(asks[0][0]) if asks else ZERO,
-            'ts': now
+            'pct_bid':      float(top5_bid_vol / top5_total * 100),
+            'pct_ask':      float(top5_ask_vol / top5_total * 100),
+            'best_bid':     Decimal(bids[0][0]) if bids else ZERO,
+            'best_ask':     Decimal(asks[0][0]) if asks else ZERO,
+            'cum_bid_vol':  float(cum_bid_vol),
+            'cum_ask_vol':  float(cum_ask_vol),
+            'bid_vwap':     float(bid_vwap),
+            'ask_vwap':     float(ask_vwap),
+            'imbalance_ratio': imbalance_ratio,
+            'depth_skew':   depth_skew,
+            'weighted_pressure': weighted_pressure,
+            'mid_price':    float(mid_price),
+            'ts':           now
         }
+
         with self.state_lock:
             order_book_cache[symbol] = result
         return result
@@ -624,7 +509,8 @@ class BinanceTradingBot:
                                       symbol=symbol, side='buy',
                                       price=Decimal(price), quantity=Decimal(str(qty))))
             return order
-        except:
+        except Exception as e:
+            logger.error(f"Buy order failed: {e}")
             return None
 
     def place_limit_sell_with_tracking(self, symbol, price: str, qty: float):
@@ -638,7 +524,8 @@ class BinanceTradingBot:
                                       symbol=symbol, side='sell',
                                       price=Decimal(price), quantity=Decimal(str(qty))))
             return order
-        except:
+        except Exception as e:
+            logger.error(f"Sell order failed: {e}")
             return None
 
     def check_and_process_filled_orders(self):
@@ -662,10 +549,10 @@ class BinanceTradingBot:
                                     del trailing_buy_active[po.symbol]
                                 if po.side == 'sell' and po.symbol in trailing_sell_active:
                                     del trailing_sell_active[po.symbol]
-                    except:
-                        pass
-        except:
-            pass
+                    except Exception as e:
+                        logger.debug(f"Order check error: {e}")
+        except Exception as e:
+            logger.error(f"Process filled orders error: {e}")
 
     def record_trade(self, sess, symbol, side, price, qty, binance_id, pending):
         trade = Trade(symbol=symbol, side=side, price=price, quantity=qty,
@@ -689,6 +576,14 @@ class BinanceTradingBot:
                     sess.delete(pos)
                     with self.state_lock:
                         positions.pop(symbol, None)
+
+    def can_place_buy_order(self, symbol: str) -> bool:
+        with self.state_lock:
+            return time.time() - buy_cooldown.get(symbol, 0) >= 15 * 60
+
+    def record_buy_placed(self, symbol: str):
+        with self.state_lock:
+            buy_cooldown[symbol] = time.time()
 
     def is_trailing_buy_active(self, symbol):
         with self.state_lock:
@@ -822,7 +717,7 @@ class BinanceTradingBot:
                 fill = Decimal(adj['price'])
 
             if order:
-                record_buy_placed(symbol)
+                self.record_buy_placed(symbol)
                 send_whatsapp_alert(f"BUY EXECUTED {symbol} @ {fill:.6f}")
                 logger.info(f"DYNAMIC BUY {symbol} @ {fill}")
 
@@ -961,14 +856,179 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Sell failed: {e}")
 
-# === BUY COOLDOWN ===========================================================
-def can_place_buy_order(symbol: str) -> bool:
-    with state_lock:
-        return time.time() - buy_cooldown.get(symbol, 0) >= 15 * 60
+# === HELPER FUNCTIONS =======================================================
+def validate_and_adjust_order(bot, symbol, side, order_type, quantity, price):
+    try:
+        with bot.api_lock:
+            bot.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            info = bot.client.get_symbol_info(symbol)
+            bot.rate_manager.update_current()
+        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
+        step = Decimal(lot['stepSize'])
+        tick = Decimal(price_f['tickSize'])
+        qty = (quantity // step) * step
+        price = (price // tick) * tick
+        return {'quantity': float(qty), 'price': float(price)}, None
+    except Exception as e:
+        logger.error(f"Filter error {symbol}: {e}")
+        return None, "Filter error"
 
-def record_buy_placed(symbol: str):
-    with state_lock:
-        buy_cooldown[symbol] = time.time()
+def send_whatsapp_alert(message: str):
+    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
+        try:
+            url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
+            requests.get(url, timeout=5)
+        except Exception as e:
+            logger.debug(f"WhatsApp failed: {e}")
+
+def set_terminal_background_and_title():
+    try:
+        print("\033]0;TRADING BOT – LIVE\007", end='')
+        print("\033[48;5;17m", end='')
+        print("\033[2J\033[H", end='')
+    except:
+        pass
+
+def now_cst():
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# === PROFESSIONAL DASHBOARD =================================================
+def print_professional_dashboard(bot):
+    try:
+        set_terminal_background_and_title()
+        os.system('cls' if os.name == 'nt' else 'clear')
+        now = now_cst()
+        usdt_free = bot.get_balance('USDT')
+        total_portfolio, _ = bot.calculate_total_portfolio_value()
+
+        NAVY = "\033[48;5;17m"
+        YELLOW = "\033[38;5;226m"
+        GREEN = "\033[38;5;82m"
+        RED = "\033[38;5;196m"
+        RESET = "\033[0m"
+        BOLD = "\033[1m"
+
+        print(f"{NAVY}{'='*120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
+        print(f"{NAVY}{'='*120}{RESET}\n")
+
+        print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(trailing_buy_active)}{RESET}")
+        print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(trailing_sell_active)}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+        with DBManager() as sess:
+            db_positions = sess.query(Position).all()
+
+        if db_positions:
+            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            total_pnl = Decimal('0')
+            for pos in db_positions:
+                symbol = pos.symbol
+                qty = float(pos.quantity)
+                entry = float(pos.avg_entry_price)
+                ob = bot.get_order_book_analysis(symbol)
+                cur_price = float(ob['best_bid'] or ob['best_ask'])
+                rsi, _, _ = bot.get_rsi_and_trend(symbol)
+                rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+
+                maker, taker = bot.get_trade_fees(symbol)
+                gross = (cur_price - entry) * qty
+                fee_cost = (maker + taker) * cur_price * qty
+                net_profit = gross - fee_cost
+                pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+                total_pnl += Decimal(str(net_profit))
+
+                status = ("Trailing Sell Active" if symbol in trailing_sell_active
+                          else "Trailing Buy Active" if symbol in trailing_buy_active
+                          else "24/7 Monitoring")
+                color = GREEN if net_profit > 0 else RED
+                print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
+
+            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            pnl_color = GREEN if total_pnl > 0 else RED
+            print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
+        else:
+            print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
+
+        print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
+        print(f"{NAVY}{YELLOW}{'AVG 24H VOLUME':<20} ${sum(s['volume'] for s in valid_symbols_dict.values()):,.0f}{RESET}")
+        print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+        print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI≤35 + DEPTH IMBALANCE)':^120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+        watchlist = []
+        for symbol in valid_symbols_dict.keys():
+            ob = bot.get_order_book_analysis(symbol)
+            rsi, trend, low_24h = bot.get_rsi_and_trend(symbol)
+
+            strong_buy = (
+                ob['depth_skew'] == 'strong_ask' and
+                ob['imbalance_ratio'] <= 0.5 and
+                ob['weighted_pressure'] < -0.002
+            )
+
+            if (rsi is not None and rsi <= RSI_OVERSOLD and
+                low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01') and
+                strong_buy):
+                watchlist.append((symbol, rsi, ob['imbalance_ratio'], ob['weighted_pressure'], ob['best_bid']))
+
+        if watchlist:
+            print(f"{NAVY}{YELLOW}{'SYM':<10} {'RSI':>6} {'IMBAL':>8} {'PRESS':>8} {'PRICE':>12}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*50}{RESET}")
+            for sym, rsi_val, imb, press, price in sorted(watchlist, key=lambda x: x[1])[:10]:
+                press_str = f"{press:+.1%}"
+                color = GREEN if press < 0 else RED
+                print(f"{NAVY}{YELLOW}{sym:<10} {rsi_val:>6.1f} {imb:>7.2f}x {color}{press_str:>8}{RESET} ${price:>11.6f}{RESET}")
+        else:
+            print(f"{NAVY}{YELLOW} No strong dip + depth signals.{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+        print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + DEPTH IMBALANCE)':^120}{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+        sell_watch = []
+        with DBManager() as sess:
+            for pos in sess.query(Position).all():
+                symbol = pos.symbol
+                entry = Decimal(str(pos.avg_entry_price))
+                ob = bot.get_order_book_analysis(symbol)
+                rsi, _, _ = bot.get_rsi_and_trend(symbol)
+                maker, taker = bot.get_trade_fees(symbol)
+                net_return = (ob['best_ask'] - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
+
+                strong_sell = (
+                    ob['depth_skew'] == 'strong_bid' and
+                    ob['imbalance_ratio'] >= DEPTH_IMBALANCE_THRESHOLD and
+                    ob['weighted_pressure'] > 0.002
+                )
+
+                if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT and strong_sell:
+                    sell_watch.append((symbol, float(net_return * 100), rsi, ob['imbalance_ratio'], ob['weighted_pressure']))
+
+        if sell_watch:
+            print(f"{NAVY}{YELLOW}{'SYM':<10} {'NET%':>8} {'RSI':>6} {'IMBAL':>7} {'PRESS':>8}{RESET}")
+            print(f"{NAVY}{YELLOW}{'-'*50}{RESET}")
+            for sym, ret_pct, rsi_val, imb, press in sorted(sell_watch, key=lambda x: x[1], reverse=True)[:10]:
+                press_str = f"{press:+.1%}"
+                color = GREEN if press > 0 else RED
+                print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f} {imb:>6.2f}x {color}{press_str:>8}{RESET}")
+        else:
+            print(f"{NAVY}{YELLOW} No profitable + depth sell signals.{RESET}")
+        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+
+        print(f"{NAVY}{'='*120}{RESET}\n")
+
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
 
 # === THREAD FUNCTIONS =======================================================
 def buy_scanner(bot):
@@ -988,7 +1048,7 @@ def buy_scanner(bot):
                             low24 and bid <= Decimal(str(low24)) * Decimal('1.01') and
                             ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
                             not bot.is_trailing_buy_active(sym)):
-                            if can_place_buy_order(sym):
+                            if bot.can_place_buy_order(sym):
                                 bot.start_trailing_buy(sym)
                 time.sleep(POLL_INTERVAL / max(1, len(valid_symbols_dict)))
         except Exception as e:
@@ -1054,7 +1114,7 @@ def main():
 
     bot = BinanceTradingBot()
 
-    # Fetch symbols after client is ready
+    # Fetch symbols
     for attempt in range(2):
         if bot.fetch_and_validate_usdt_pairs():
             break
@@ -1068,10 +1128,10 @@ def main():
         bot.import_owned_assets_to_db(sess)
         sess.commit()
 
-    threading.Thread(target=buy_scanner, args=(bot,)).start()
-    threading.Thread(target=sell_scanner, args=(bot,)).start()
-    threading.Thread(target=trailing_buy_processor, args=(bot,)).start()
-    threading.Thread(target=trailing_sell_processor, args=(bot,)).start()
+    threading.Thread(target=buy_scanner, args=(bot,), daemon=True).start()
+    threading.Thread(target=sell_scanner, args=(bot,), daemon=True).start()
+    threading.Thread(target=trailing_buy_processor, args=(bot,), daemon=True).start()
+    threading.Thread(target=trailing_sell_processor, args=(bot,), daemon=True).start()
 
     print_professional_dashboard(bot)
     logger.info("Multi-threaded bot started.")
@@ -1088,6 +1148,7 @@ def main():
 
             time.sleep(1.0)
         except KeyboardInterrupt:
+            print("\nShutting down...")
             break
         except Exception as e:
             logger.critical(f"Main loop error: {e}", exc_info=True)
