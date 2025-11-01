@@ -976,61 +976,59 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # ----------------------------------------------------------------------
-# FULL TEXT DASHBOARD – NO ABBREVIATIONS, DOUBLE-LINE DIVIDERS
+# FULL TEXT DASHBOARD – NO BACKGROUND COLOR, DOUBLE-LINE DIVIDERS
 # ----------------------------------------------------------------------
 def print_professional_dashboard(bot):
     """
     Professional dashboard:
     - Top-left anchored
     - Double-line ========== dividers
-    - Black text, white background
+    - NO BACKGROUND COLOR (uses terminal default)
     - Green profit, red loss
-    - FULL TEXT TITLES (no abbreviations)
+    - FULL TEXT TITLES
     - BUY WATCH: COIN(RSI)
     - SELL WATCH: COIN(+%)
     - STATUS: "Trailing Sell" | "Trailing Buy" | "24/7 Monitoring"
     """
     try:
-        # ANSI Colors
-        WHITE_BG = "\033[47m"
-        BLACK    = "\033[30m"
-        GREEN    = "\033[32m"
-        RED      = "\033[31m"
-        BOLD     = "\033[1m"
-        RESET    = "\033[0m"
-        DIVIDER  = f"{WHITE_BG}{'='*120}{RESET}"
+        # ANSI Colors (text only)
+        GREEN  = "\033[32m"
+        RED    = "\033[31m"
+        BOLD   = "\033[1m"
+        RESET  = "\033[0m"
+        DIVIDER = "=" * 120
 
         # First-time layout setup
         if not hasattr(print_professional_dashboard, "initialized"):
             os.system('cls' if os.name == 'nt' else 'clear')
             print(DIVIDER)
-            print(f"{WHITE_BG}{BLACK}{BOLD}{'CRYPTO TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
+            print(f"{BOLD}{'CRYPTO TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
             print(DIVIDER)
 
             # Global Stats (4 lines)
-            for _ in range(4): print(f"{WHITE_BG}{' '*120}{RESET}")
+            for _ in range(4): print(" " * 120)
             print(DIVIDER)
 
             # Positions
-            print(f"{WHITE_BG}{BLACK}{BOLD}{'CURRENT POSITIONS':^120}{RESET}")
-            print(f"{WHITE_BG}{BLACK}{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}{RESET}")
+            print(f"{BOLD}{'CURRENT POSITIONS':^120}{RESET}")
+            print(f"{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}")
             print(DIVIDER)
-            for _ in range(15): print(f"{WHITE_BG}{' '*120}{RESET}")
+            for _ in range(15): print(" " * 120)
             print(DIVIDER)
 
             # Market
-            print(f"{WHITE_BG}{BLACK}{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
-            for _ in range(3): print(f"{WHITE_BG}{' '*120}{RESET}")
+            print(f"{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
+            for _ in range(3): print(" " * 120)
             print(DIVIDER)
 
             # Buy Watch
-            print(f"{WHITE_BG}{BLACK}{BOLD}{'BUY WATCHLIST – LIVE SIGNALS':^120}{RESET}")
-            print(f"{WHITE_BG}{'WATCHLIST: ':<120}{RESET}")
+            print(f"{BOLD}{'BUY WATCHLIST – LIVE SIGNALS':^120}{RESET}")
+            print(f"{'WATCHLIST: ':<120}")
             print(DIVIDER)
 
             # Sell Watch
-            print(f"{WHITE_BG}{BLACK}{BOLD}{'SELL WATCHLIST – PROFIT TARGETS':^120}{RESET}")
-            print(f"{WHITE_BG}{'SELL SIGNALS:  ':<120}{RESET}")
+            print(f"{BOLD}{'SELL WATCHLIST – PROFIT TARGETS':^120}{RESET}")
+            print(f"{'SELL SIGNALS:  ':<120}")
             print(DIVIDER)
 
             # Fixed line map (1-indexed)
@@ -1051,7 +1049,7 @@ def print_professional_dashboard(bot):
         def _update(line_no, text):
             text = str(text).ljust(120)[:120]
             sys.stdout.write(f"\033[{line_no}H")
-            sys.stdout.write(f"{WHITE_BG}{BLACK}{text}{RESET}")
+            sys.stdout.write(text)
             sys.stdout.flush()
 
         # === 1. GLOBAL STATS ===
