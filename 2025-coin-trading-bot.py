@@ -7,6 +7,8 @@ Binance.US Dynamic Trailing Bot – MULTI-THREADED (Rate-Limit & Depth Aware)
 - 1 thread for all trailing sells
 - Full 20-level order book depth analysis (VWAP, imbalance, skew, pressure)
 - Thread-safe, rate-limit aware, professional dashboard
+- Integrated candlestick pattern detection for enhanced trend analysis
+- Price history tracking for custom 24h high/low/avg calculations
 """
 
 import os
@@ -101,6 +103,7 @@ last_price_cache: Dict[str, Tuple[float, float]] = {}
 trailing_buy_active: Dict[str, dict] = {}
 trailing_sell_active: Dict[str, dict] = {}
 buy_cooldown: Dict[str, float] = {}
+price_history: Dict[str, deque] = {}  # symbol: deque of (timestamp, close_price) for 24h tracking, maxlen=1440 for 1m data
 
 # === SAFE MATH ==============================================================
 def safe_float(value, default=0.0) -> float:
@@ -399,19 +402,65 @@ class BinanceTradingBot:
             self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             klines = self.client.get_klines(symbol=symbol, interval='1m', limit=100)
             self.rate_manager.update_current()
+        opens = np.array([safe_float(k[1]) for k in klines[-100:]])
+        highs = np.array([safe_float(k[2]) for k in klines[-100:]])
+        lows = np.array([safe_float(k[3]) for k in klines[-100:]])
         closes = np.array([safe_float(k[4]) for k in klines[-100:]])
+
+        # Update price history
+        now = time.time()
+        with self.state_lock:
+            if symbol not in price_history:
+                price_history[symbol] = deque(maxlen=1440)  # 24 hours of 1m data
+            price_history[symbol].append((now, closes[-1]))
+
+            # Clean old data
+            while price_history[symbol] and now - price_history[symbol][0][0] > 86400:
+                price_history[symbol].popleft()
+
         if len(closes) < RSI_PERIOD:
             return None, "unknown", None
         rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
         if not np.isfinite(rsi):
             return None, "unknown", None
-        upper, middle, _ = talib.BBANDS(closes, timeperiod=BB_PERIOD, nbdevup=BB_DEV, nbdevdn=BB_DEV)
+        upper, middle, lower = talib.BBANDS(closes, timeperiod=BB_PERIOD, nbdevup=BB_DEV, nbdevdn=BB_DEV)
         macd, sig, _ = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
-        trend = ("bullish" if closes[-1] > middle[-1] and macd[-1] > sig[-1]
-                 else "bearish" if closes[-1] < middle[-1] and macd[-1] < sig[-1] else "sideways")
+
+        # Candlestick pattern detection
+        pattern_score = 0
+        # Bullish patterns
+        pattern_score += talib.CDLHAMMER(opens, highs, lows, closes)[-1]
+        pattern_score += talib.CDLENGULFING(opens, highs, lows, closes)[-1] if talib.CDLENGULFING(opens, highs, lows, closes)[-1] > 0 else 0
+        pattern_score += talib.CDLMORNINGSTAR(opens, highs, lows, closes)[-1]
+        # Bearish patterns
+        pattern_score -= abs(talib.CDLSHOOTINGSTAR(opens, highs, lows, closes)[-1])
+        pattern_score -= abs(talib.CDLENGULFING(opens, highs, lows, closes)[-1]) if talib.CDLENGULFING(opens, highs, lows, closes)[-1] < 0 else 0
+        pattern_score -= abs(talib.CDLEVENINGSTAR(opens, highs, lows, closes)[-1])
+        # Sideways/doji
+        if talib.CDLDOJI(opens, highs, lows, closes)[-1] != 0:
+            pattern_score = 0
+
+        trend_base = ("bullish" if closes[-1] > middle[-1] and macd[-1] > sig[-1]
+                      else "bearish" if closes[-1] < middle[-1] and macd[-1] < sig[-1] else "sideways")
+        # Adjust trend with pattern score
+        if pattern_score > 0:
+            trend = "bullish"
+        elif pattern_score < 0:
+            trend = "bearish"
+        else:
+            trend = trend_base
+
         with self.state_lock:
             low_24h = valid_symbols_dict.get(symbol, {}).get('low_24h')
         return float(rsi), trend, float(low_24h) if low_24h else None
+
+    def get_24h_price_stats(self, symbol):
+        with self.state_lock:
+            hist = price_history.get(symbol, deque())
+            if not hist:
+                return None, None, None
+            prices = [p[1] for p in hist]
+            return min(prices), max(prices), sum(prices) / len(prices)
 
     @retry_custom
     def get_balance(self, asset='USDT') -> float:
@@ -639,13 +688,27 @@ class BinanceTradingBot:
                             return
                     last_price_cache[symbol] = (float(bid), now)
 
+            # Detect fast upward rebound → market buy
+            if is_fast_move(float(bid), lp, lt, direction='up', threshold_pct=0.5):
+                self.place_buy_at_price(symbol, None, force_market=True)
+                with self.state_lock:
+                    trailing_buy_active.pop(symbol, None)
+                return
+
+            # Detect flash crash → market buy
+            if is_fast_move(float(bid), lp, lt, direction='down', threshold_pct=1.5):
+                self.place_buy_at_price(symbol, None, force_market=True)
+                with self.state_lock:
+                    trailing_buy_active.pop(symbol, None)
+                return
+
             with self.state_lock:
                 if bid < state['lowest_price']:
                     state['lowest_price'] = bid
                 trailing_buy_active[symbol] = state
 
-            rsi, _, low24 = self.get_rsi_and_trend(symbol)
-            if rsi is None or rsi > RSI_OVERSOLD:
+            rsi, trend, low24 = self.get_rsi_and_trend(symbol)
+            if rsi is None or rsi > RSI_OVERSOLD or trend != 'bullish':
                 return
 
             with self.state_lock:
@@ -654,7 +717,8 @@ class BinanceTradingBot:
                 sell_pressure_history[symbol].append(ob['pct_ask'])
                 hist = list(sell_pressure_history[symbol])
 
-            if low24 and bid > Decimal(str(low24)) * Decimal('1.02'):
+            custom_low, _, _ = self.get_24h_price_stats(symbol)
+            if custom_low and bid > Decimal(str(custom_low)) * Decimal('1.02'):
                 return
 
             if len(hist) >= 3:
@@ -756,13 +820,20 @@ class BinanceTradingBot:
                     state['peak_price'] = bid
                 trailing_sell_active[symbol] = state
 
+            # Detect fast drop from peak → market sell
+            if is_fast_move(float(bid), float(state['peak_price']), state['start_time'], direction='down', threshold_pct=0.5):
+                self.place_sell_at_price(symbol, None, force_market=True)
+                with self.state_lock:
+                    trailing_sell_active.pop(symbol, None)
+                return
+
             maker, taker = self.get_trade_fees(symbol)
             net = (bid - state['entry_price']) / state['entry_price'] - Decimal(str(maker)) - Decimal(str(taker))
             if net < PROFIT_TARGET_NET:
                 return
 
-            rsi, _, _ = self.get_rsi_and_trend(symbol)
-            if rsi is None or rsi < RSI_OVERBOUGHT:
+            rsi, trend, _ = self.get_rsi_and_trend(symbol)
+            if rsi is None or rsi < RSI_OVERBOUGHT or trend != 'bearish':
                 return
 
             with self.state_lock:
@@ -857,6 +928,17 @@ class BinanceTradingBot:
             logger.error(f"Sell failed: {e}")
 
 # === HELPER FUNCTIONS =======================================================
+def is_fast_move(current_price, last_price, last_time, direction='up', threshold_pct=0.5, window_sec=30):
+    now = time.time()
+    if now - last_time > window_sec:
+        return False
+    change = (current_price - last_price) / last_price * 100
+    if direction == 'up' and change >= threshold_pct:
+        return True
+    if direction == 'down' and change <= -threshold_pct:
+        return True
+    return False
+
 def validate_and_adjust_order(bot, symbol, side, order_type, quantity, price):
     try:
         with bot.api_lock:
@@ -978,6 +1060,7 @@ def print_professional_dashboard(bot):
             )
 
             if (rsi is not None and rsi <= RSI_OVERSOLD and
+                trend == 'bullish' and
                 low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01') and
                 strong_buy):
                 watchlist.append((symbol, rsi, ob['imbalance_ratio'], ob['weighted_pressure'], ob['best_bid']))
@@ -1001,7 +1084,7 @@ def print_professional_dashboard(bot):
                 symbol = pos.symbol
                 entry = Decimal(str(pos.avg_entry_price))
                 ob = bot.get_order_book_analysis(symbol)
-                rsi, _, _ = bot.get_rsi_and_trend(symbol)
+                rsi, trend, _ = bot.get_rsi_and_trend(symbol)
                 maker, taker = bot.get_trade_fees(symbol)
                 net_return = (ob['best_ask'] - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
 
@@ -1011,7 +1094,7 @@ def print_professional_dashboard(bot):
                     ob['weighted_pressure'] > 0.002
                 )
 
-                if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT and strong_sell:
+                if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT and strong_sell and trend == 'bearish':
                     sell_watch.append((symbol, float(net_return * 100), rsi, ob['imbalance_ratio'], ob['weighted_pressure']))
 
         if sell_watch:
@@ -1043,9 +1126,10 @@ def buy_scanner(bot):
                     continue
                 with DBManager() as sess:
                     if not sess.query(Position).filter_by(symbol=sym).first():
+                        custom_low, _, _ = bot.get_24h_price_stats(sym)
                         if (rsi is not None and rsi <= RSI_OVERSOLD and
                             trend == 'bullish' and
-                            low24 and bid <= Decimal(str(low24)) * Decimal('1.01') and
+                            custom_low and bid <= Decimal(str(custom_low)) * Decimal('1.01') and
                             ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
                             not bot.is_trailing_buy_active(sym)):
                             if bot.can_place_buy_order(sym):
@@ -1071,7 +1155,7 @@ def sell_scanner(bot):
                         entry = Decimal(str(pos.avg_entry_price))
                         maker, taker = bot.get_trade_fees(sym)
                         net = (ask - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
-                        if net >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
+                        if net >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT and trend == 'bearish':
                             with bot.state_lock:
                                 if sym not in buy_pressure_history:
                                     buy_pressure_history[sym] = deque(maxlen=5)
