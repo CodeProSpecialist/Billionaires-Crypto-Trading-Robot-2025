@@ -695,8 +695,9 @@ def smart_sell_scanner(bot):
                 ob = bot.get_order_book_analysis(sym)
                 if ob['best_ask'] <= 0: continue
 
-                entry = to_decimal(pos.avg_entry_price)
-                current = ob['best_ask']
+                entry = to_decimal(pos.avg_entry_price)  # Decimal
+                current = to_decimal(ob['best_ask'])     # Convert to Decimal
+                if entry <= 0: continue
                 profit_pct = float((current - entry) / entry)
 
                 rsi, _, _ = bot.get_rsi_and_trend(sym)
@@ -705,8 +706,11 @@ def smart_sell_scanner(bot):
                 trend = bot.get_short_term_trend(sym)
                 macd, signal, _ = bot.get_macd(sym)
 
-                _, low_1h = get_1h_high_low(bot, sym)
-                rise_pct = (current - low_1h) / low_1h if low_1h > 0 else 0
+                # FIX: Convert low_1h to Decimal
+                _, low_1h_float = get_1h_high_low(bot, sym)
+                low_1h = to_decimal(low_1h_float)
+                if low_1h <= 0: continue
+                rise_pct = float((current - low_1h) / low_1h)
 
                 conditions = [
                     rsi and rsi >= RSI_OVERBOUGHT,
@@ -722,12 +726,12 @@ def smart_sell_scanner(bot):
                 if all(conditions):
                     with bot.state_lock:
                         trailing_sell_active[sym] = {'last_price': current}
-                    logger.info(f"SELL SIGNAL {sym} | +{profit_pct:.2%} RSI:{rsi:.1f}")
+                    logger.info(f"SELL SIGNAL {sym} | +{profit_pct:.2%} RSI:{rsi:.1f} MFI:{mfi:.1f}")
                     send_whatsapp_alert(f"SELL {sym} @ {current}")
 
             time.sleep(5)
         except Exception as e:
-            logger.error(f"Smart sell error: {e}")
+            logger.error(f"Smart sell error: {e}", exc_info=True)
             time.sleep(10)
 
 # === TRAILING SCANNERS (UNCHANGED LOGIC) ====================================
