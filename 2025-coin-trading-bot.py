@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Binance.US Dynamic Trailing Bot – SINGLE-THREADED (Rate-Limit Aware)
-- No threads
-- No custom limiter – only react to 429/418
-- RateManager stores current limits & backs off when close
-- Fixed: valid symbols were zero (missing numpy + client order)
-- Full dashboard, helpers, alerts
+BINANCE.US LIVE TRADING BOT – MACD + 6MO MOMENTUM + PROFESSIONAL DASHBOARD
+- Real market orders
+- SQLAlchemy DB
+- MACD + RSI + Order Book + 6mo Trend
+- Exact dashboard format
+- Green/red P&L
 """
 
 import os
@@ -13,103 +13,74 @@ import sys
 import time
 import logging
 import numpy as np
-from logging.handlers import TimedRotatingFileHandler
-from binance.client import Client
-from binance.enums import *
-from binance.exceptions import BinanceAPIException
 import talib
-from datetime import datetime
-import pytz
 import requests
 from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
 from collections import deque
+import threading
+import pytz
+from logging.handlers import TimedRotatingFileHandler
 
-# === SQLALCHEMY ==============================================================
-from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, ForeignKey, func
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
+from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
 # === CONFIGURATION ===========================================================
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_API_SECRET')
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
+
 MAX_PRICE = 1000.00
 MIN_PRICE = 0.01
 MIN_24H_VOLUME_USDT = 100000
 LOG_FILE = "crypto_trading_bot.log"
-RSI_PERIOD = 14
-BB_PERIOD = 20
-BB_DEV = 2
+DEBUG_LOG_FILE = "crypto_trading_bot_debug.log"
+PROFIT_TARGET_NET = Decimal('0.008')
+RISK_PER_TRADE = 0.10
+MIN_BALANCE = 5.0
+RSI_OVERSOLD = 35
+RSI_OVERBOUGHT = 65
+ORDERBOOK_SELL_PRESSURE_THRESHOLD = 0.60
+ORDER_BOOK_LIMIT = 20
+POLL_INTERVAL = 2.0
+
+# MACD
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-PROFIT_TARGET_NET = Decimal('0.008')  # 0.8%
-RISK_PER_TRADE = 0.10
-MIN_BALANCE = 2.0
 
-# Strategy
-ORDERBOOK_SELL_PRESSURE_THRESHOLD = 0.60
-ORDERBOOK_BUY_PRESSURE_SPIKE = 0.65
-ORDERBOOK_BUY_PRESSURE_DROP = 0.55
-RSI_OVERSOLD = 35
-RSI_OVERBOUGHT = 65
-ORDER_BOOK_LIMIT = 20
-POLL_INTERVAL = 1.0
-STALL_THRESHOLD_SECONDS = 15 * 60  # 15 minutes
-RAPID_DROP_THRESHOLD = 0.01  # 1.0%
-RAPID_DROP_WINDOW = 5.0      # seconds
-
-# API Keys
-API_KEY = os.getenv('BINANCE_API_KEY')
-API_SECRET = os.getenv('BINANCE_API_SECRET')
-
-# === CONSTANTS ==============================================================
-HUNDRED = Decimal('100')
-ZERO = Decimal('0')
+# 6-MONTH MOMENTUM
+MOMENTUM_LOOKBACK_DAYS = 180
+MIN_MOMENTUM_GAIN = 0.25
 
 # === LOGGING ================================================================
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+main_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=7)
+main_handler.setLevel(logging.INFO)
+main_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s'))
+
+debug_handler = TimedRotatingFileHandler(DEBUG_LOG_FILE, when="midnight", interval=1, backupCount=14)
+debug_handler.setLevel(logging.DEBUG)
+debug_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s'))
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
+
 if not logger.handlers:
-    file_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=7)
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s')
-    file_handler.setFormatter(file_formatter)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
-    console_handler.setFormatter(console_formatter)
-
-    logger.addHandler(file_handler)
+    logger.addHandler(main_handler)
+    logger.addHandler(debug_handler)
     logger.addHandler(console_handler)
 
 CST_TZ = pytz.timezone('America/Chicago')
-
-# === GLOBAL STATE ===========================================================
-valid_symbols_dict: Dict[str, dict] = {}
-order_book_cache: Dict[str, dict] = {}
-positions: Dict[str, dict] = {}
-buy_pressure_history: Dict[str, deque] = {}
-sell_pressure_history: Dict[str, deque] = {}
-last_price_cache: Dict[str, Tuple[float, float]] = {}
-trailing_buy_active: Dict[str, dict] = {}
-trailing_sell_active: Dict[str, dict] = {}
-buy_cooldown: Dict[str, float] = {}
-
-# === SAFE MATH ==============================================================
-def safe_float(value, default=0.0) -> float:
-    try:
-        return float(value) if value is not None and np.isfinite(float(value)) else default
-    except:
-        return default
-
-def to_decimal(value) -> Decimal:
-    try:
-        return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
-    except:
-        return ZERO
 
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
@@ -126,19 +97,6 @@ class Trade(Base):
     quantity = Column(Numeric(20, 8), nullable=False)
     executed_at = Column(DateTime, nullable=False, default=func.now())
     binance_order_id = Column(String(64), nullable=False, index=True)
-    pending_order_id = Column(Integer, ForeignKey("pending_orders.id"), nullable=True)
-    pending_order = relationship("PendingOrder", back_populates="filled_trades")
-
-class PendingOrder(Base):
-    __tablename__ = "pending_orders"
-    id = Column(Integer, primary_key=True)
-    binance_order_id = Column(String(64), unique=True, nullable=False, index=True)
-    symbol = Column(String(20), nullable=False)
-    side = Column(String(4), nullable=False)
-    price = Column(Numeric(20, 8), nullable=False)
-    quantity = Column(Numeric(20, 8), nullable=False)
-    placed_at = Column(DateTime, nullable=False, default=func.now())
-    filled_trades = relationship("Trade", back_populates="pending_order")
 
 class Position(Base):
     __tablename__ = "positions"
@@ -146,7 +104,6 @@ class Position(Base):
     symbol = Column(String(20), unique=True, nullable=False, index=True)
     quantity = Column(Numeric(20, 8), nullable=False)
     avg_entry_price = Column(Numeric(20, 8), nullable=False)
-    buy_fee_rate = Column(Numeric(10, 6), nullable=False, default=0.001)
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
 Base.metadata.create_all(engine)
@@ -159,332 +116,386 @@ class DBManager:
         if exc_type is not None:
             self.session.rollback()
         else:
-            try:
-                self.session.commit()
-            except SQLAlchemyError:
-                self.session.rollback()
+            try: self.session.commit()
+            except SQLAlchemyError: self.session.rollback()
         self.session.close()
 
-# === RETRY DECORATOR (handles 429/418) ======================================
-def retry_custom(func):
-    def wrapper(*args, **kwargs):
-        max_retries = 5
-        base_delay = 2.0
-        for i in range(max_retries):
-            try:
-                return func(*args, **kwargs)
-            except BinanceAPIException as e:
-                if e.status_code in (429, 418):
-                    retry_after = int(e.response.headers.get('Retry-After', 60))
-                    logger.warning(f"Rate limit {e.status_code}: sleeping {retry_after}s")
-                    time.sleep(retry_after)
-                else:
-                    if i == max_retries - 1:
-                        raise
-                    delay = base_delay * (2 ** i)
-                    logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e}")
-                    time.sleep(delay)
-            except Exception as e:
-                if i == max_retries - 1:
-                    raise
-                delay = base_delay * (2 ** i)
-                logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e}")
-                time.sleep(delay)
-    return wrapper
+# === GLOBAL STATE ===========================================================
+valid_symbols_dict: Dict[str, dict] = {}
+order_book_cache: Dict[str, dict] = {}
+price_history_1m: Dict[str, deque] = {}
+price_history_6mo: Dict[str, Tuple[float, float]] = {}
+macd_cache: Dict[str, Tuple[float, float, float]] = {}  # macd, signal, hist
+momentum_cache: Dict[str, bool] = {}
+trailing_buy_active: Dict[str, dict] = {}
+trailing_sell_active: Dict[str, dict] = {}
+last_fill_check = 0
+
+# === HELPERS ================================================================
+def safe_float(v, default=0.0): return float(v) if v and np.isfinite(float(v)) else default
+def to_decimal(v): return Decimal(str(v)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN) if v else Decimal('0')
+def now_cst(): return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # === RATE MANAGER ===========================================================
 class RateManager:
     def __init__(self, client):
         self.client = client
-        self.limits = self._fetch_limits()
-        self.current = {'request_weight': 0, 'orders_10s': 0, 'orders_1d': 0}
-        self.last_update = 0
+        self.current = {'weight': 0, 'orders': 0}
 
-    @retry_custom
-    def _fetch_limits(self):
-        info = self.client.get_exchange_info()
-        limits = {}
-        for rl in info.get('rateLimits', []):
-            key = rl['rateLimitType']
-            interval = f"{rl['interval']}_{rl['intervalNum']}"
-            limits.setdefault(key, {})[interval] = rl['limit']
-        return limits
-
-    def update_current(self):
-        if getattr(self.client, 'response', None) is None:
-            return
+    def update(self):
+        if not hasattr(self.client, 'response') or not self.client.response: return
         hdr = self.client.response.headers
-        updated = False
-        if 'x-mbx-used-weight-1m' in hdr:
-            self.current['request_weight'] = int(hdr['x-mbx-used-weight-1m'])
-            updated = True
-        if 'x-mbx-order-count-10s' in hdr:
-            self.current['orders_10s'] = int(hdr['x-mbx-order-count-10s'])
-            updated = True
-        if 'x-mbx-order-count-1d' in hdr:
-            self.current['orders_1d'] = int(hdr['x-mbx-order-count-1d'])
-            updated = True
-        if updated:
-            self.last_update = time.time()
+        self.current['weight'] = int(hdr.get('x-mbx-used-weight-1m', 0))
+        self.current['orders'] = int(hdr.get('x-mbx-order-count-10s', 0))
 
-    def is_close(self, typ, margin=0.95):
-        if typ == 'REQUEST_WEIGHT':
-            lim = self.limits.get('REQUEST_WEIGHT', {}).get('MINUTE_1', 6000)
-            return self.current['request_weight'] >= lim * margin
-        if typ == 'ORDERS':
-            lim10 = self.limits.get('ORDERS', {}).get('SECOND_10', 50)
-            lim1d = self.limits.get('ORDERS', {}).get('DAY_1', 160000)
-            return (self.current['orders_10s'] >= lim10 * margin or
-                    self.current['orders_1d'] >= lim1d * margin)
-        return False
+    def wait(self):
+        self.update()
+        if self.current['weight'] > 1100: time.sleep(10)
+        if self.current['orders'] > 45: time.sleep(5)
 
-    def wait_if_needed(self, typ='REQUEST_WEIGHT'):
-        self.update_current()
-        if self.is_close(typ):
-            wait = self._calc_wait(typ)
-            logger.debug(f"Close to {typ} limit – sleeping {wait:.1f}s")
-            time.sleep(wait)
+# === BOT CLASS ==============================================================
+class BinanceTradingBot:
+    def __init__(self):
+        self.client = Client(API_KEY, API_SECRET, tld='us')
+        self.client.API_URL = 'https://api.binance.us/api'
+        self.rate_manager = RateManager(self.client)
+        self.api_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.sync_positions_from_binance()
+        self.warmup_data()
 
-    def _calc_wait(self, typ):
-        now = datetime.now()
-        if typ == 'REQUEST_WEIGHT':
-            return max(60 - now.second + 0.1, 1.0)
-        return max(10 - (now.second % 10) + 0.1, 1.0)
-
-# === FETCH SYMBOLS ==========================================================
-@retry_custom
-def fetch_and_validate_usdt_pairs(client) -> Dict[str, dict]:
-    global valid_symbols_dict
-    info = client.get_exchange_info()
-    raw = [
-        s['symbol'] for s in info['symbols']
-        if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
-    ]
-    raw = [s for s in raw if s not in {'USDCUSDT', 'USDTUSDT'}]
-
-    valid = {}
-    for sym in raw:
+    def sync_positions_from_binance(self):
+        logger.info("Syncing positions...")
         try:
-            ticker = client.get_ticker(symbol=sym)
-            price = safe_float(ticker.get('lastPrice'))
-            vol   = safe_float(ticker.get('quoteVolume'))
-            low   = safe_float(ticker.get('lowPrice'))
-            if MIN_PRICE <= price <= MAX_PRICE and vol >= MIN_24H_VOLUME_USDT and low > 0:
-                valid[sym] = {'price': price, 'volume': vol, 'low_24h': low}
-        except Exception:
-            continue
-
-    valid_symbols_dict = valid
-    logger.info(f"Valid symbols fetched: {len(valid)}")
-    return valid
-
-# === ORDER BOOK =============================================================
-@retry_custom
-def get_order_book_analysis(client, symbol: str) -> dict:
-    now = time.time()
-    cached = order_book_cache.get(symbol)
-    if cached and now - cached.get('ts', 0) < 1:
-        return cached
-
-    depth = client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LIMIT)
-    bids = depth.get('bids', [])[:5]
-    asks = depth.get('asks', [])[:5]
-    bid_vol = sum(Decimal(b[1]) for b in bids)
-    ask_vol = sum(Decimal(a[1]) for a in asks)
-    total = bid_vol + ask_vol or Decimal('1')
-
-    result = {
-        'pct_bid': float(bid_vol / total * 100),
-        'pct_ask': float(ask_vol / total * 100),
-        'best_bid': Decimal(bids[0][0]) if bids else ZERO,
-        'best_ask': Decimal(asks[0][0]) if asks else ZERO,
-        'ts': now
-    }
-    order_book_cache[symbol] = result
-    return result
-
-# === TICK SIZE ==============================================================
-@retry_custom
-def get_tick_size(client, symbol):
-    info = client.get_symbol_info(symbol)
-    for f in info['filters']:
-        if f['filterType'] == 'PRICE_FILTER':
-            return Decimal(f['tickSize'])
-    return Decimal('0.00000001')
-
-# === METRICS ================================================================
-@retry_custom
-def get_rsi_and_trend(client, symbol) -> Tuple[Optional[float], str, Optional[float]]:
-    klines = client.get_klines(symbol=symbol, interval='1m', limit=100)
-    closes = np.array([safe_float(k[4]) for k in klines[-100:]])
-    if len(closes) < RSI_PERIOD:
-        return None, "unknown", None
-    rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
-    if not np.isfinite(rsi):
-        return None, "unknown", None
-    upper, middle, _ = talib.BBANDS(closes, timeperiod=BB_PERIOD, nbdevup=BB_DEV, nbdevdn=BB_DEV)
-    macd, sig, _ = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
-    trend = ("bullish" if closes[-1] > middle[-1] and macd[-1] > sig[-1]
-             else "bearish" if closes[-1] < middle[-1] and macd[-1] < sig[-1] else "sideways")
-    low_24h = valid_symbols_dict.get(symbol, {}).get('low_24h')
-    return float(rsi), trend, float(low_24h) if low_24h else None
-
-# === BUY COOLDOWN ===========================================================
-def can_place_buy_order(symbol: str) -> bool:
-    return time.time() - buy_cooldown.get(symbol, 0) >= 15 * 60
-
-def record_buy_placed(symbol: str):
-    buy_cooldown[symbol] = time.time()
-
-# === HELPER FUNCTIONS =======================================================
-@retry_custom
-def get_balance(client, asset='USDT') -> float:
-    for bal in client.get_account()['balances']:
-        if bal['asset'] == asset:
-            return safe_float(bal['free'])
-    return 0.0
-
-@retry_custom
-def get_trade_fees(client, symbol):
-    fee = client.get_trade_fee(symbol=symbol)
-    return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
-
-def validate_and_adjust_order(client, symbol, side, order_type, quantity, price):
-    try:
-        info = client.get_symbol_info(symbol)
-        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
-        step = Decimal(lot['stepSize'])
-        tick = Decimal(price_f['tickSize'])
-        qty = (quantity // step) * step
-        price = (price // tick) * tick
-        return {'quantity': float(qty), 'price': float(price)}, None
-    except Exception as e:
-        logger.error(f"Filter error {symbol}: {e}")
-        return None, "Filter error"
-
-def send_whatsapp_alert(message: str):
-    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
-        try:
-            url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
-            requests.get(url, timeout=5)
+            with self.api_lock:
+                self.rate_manager.wait()
+                account = self.client.get_account()
+                self.rate_manager.update()
+            with DBManager() as sess:
+                for bal in account['balances']:
+                    asset = bal['asset']
+                    qty = safe_float(bal['free'])
+                    if qty <= 0 or asset == 'USDT': continue
+                    sym = f"{asset}USDT"
+                    if not self.is_valid_symbol(sym): continue
+                    with self.api_lock:
+                        self.rate_manager.wait()
+                        ticker = self.client.get_symbol_ticker(symbol=sym)
+                        self.rate_manager.update()
+                    price = to_decimal(ticker['price'])
+                    pos = sess.query(Position).filter_by(symbol=sym).one_or_none()
+                    if not pos:
+                        pos = Position(symbol=sym, quantity=to_decimal(qty), avg_entry_price=price)
+                        sess.add(pos)
+                    else:
+                        pos.quantity = to_decimal(qty)
+                        pos.avg_entry_price = price
+                sess.commit()
         except Exception as e:
-            logger.debug(f"WhatsApp failed: {e}")
+            logger.error(f"Sync failed: {e}")
 
-def import_owned_assets_to_db(client, sess):
-    try:
-        acct = client.get_account()
-        for bal in acct['balances']:
-            asset = bal['asset']
-            qty = safe_float(bal['free'])
-            if qty <= 0 or asset in {'USDT', 'USDC'}:
-                continue
-            sym = f"{asset}USDT"
-            if sess.query(Position).filter_by(symbol=sym).first():
-                continue
-            price = get_price_usdt(client, asset)
-            if price <= ZERO:
-                continue
-            maker, _ = get_trade_fees(client, sym)
-            pos = Position(symbol=sym,
-                           quantity=Decimal(str(qty)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN),
-                           avg_entry_price=price,
-                           buy_fee_rate=Decimal(str(maker)))
-            sess.add(pos)
-            logger.info(f"Imported {sym}: {qty} @ {price}")
-    except Exception as e:
-        logger.error(f"Import failed: {e}")
+    def is_valid_symbol(self, sym):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                info = self.client.get_exchange_info()
+                self.rate_manager.update()
+            return any(s['symbol'] == sym and s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT' for s in info['symbols'])
+        except: return False
 
-@retry_custom
-def get_price_usdt(client, asset: str) -> Decimal:
-    if asset == 'USDT':
-        return Decimal('1')
-    sym = asset + 'USDT'
-    try:
-        return Decimal(client.get_symbol_ticker(symbol=sym)['price'])
-    except:
-        return ZERO
+    def warmup_data(self):
+        logger.info("Warming up data...")
+        symbols = [p.symbol for p in self.get_db_positions()]
+        for sym in symbols:
+            self.warmup_24h(sym)
+            self.warmup_macd(sym)
+            self.warmup_6mo(sym)
+        logger.info("Data ready.")
 
-def set_terminal_background_and_title():
-    try:
-        print("\033]0;TRADING BOT – LIVE\007", end='')
-        print("\033[48;5;17m", end='')
-        print("\033[2J\033[H", end='')
-    except:
-        pass
+    def warmup_24h(self, sym):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=sym, interval='1m', limit=1440)
+                self.rate_manager.update()
+            with self.state_lock:
+                if sym not in price_history_1m:
+                    price_history_1m[sym] = deque(maxlen=1440)
+                for k in klines:
+                    price_history_1m[sym].append((float(k[0])/1000, safe_float(k[4])))
+        except: pass
 
-@retry_custom
-def calculate_total_portfolio_value(client):
-    try:
-        account = client.get_account()
+    def warmup_macd(self, sym):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=sym, interval='1h', limit=100)
+                self.rate_manager.update()
+            closes = np.array([safe_float(k[4]) for k in klines])
+            macd, signal, hist = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
+            if len(macd) > 0:
+                with self.state_lock:
+                    macd_cache[sym] = (float(macd[-1]), float(signal[-1]), float(hist[-1]))
+        except: pass
+
+    def warmup_6mo(self, sym):
+        try:
+            end_time = int(time.time() * 1000)
+            start_time = end_time - (MOMENTUM_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=sym, interval='1d', startTime=start_time, endTime=end_time, limit=2)
+                self.rate_manager.update()
+            if len(klines) >= 2:
+                old = safe_float(klines[0][4])
+                cur = safe_float(klines[-1][4])
+                if old > 0:
+                    gain = (cur - old) / old
+                    with self.state_lock:
+                        price_history_6mo[sym] = (old, cur)
+                        momentum_cache[sym] = gain >= MIN_MOMENTUM_GAIN
+        except: pass
+
+    def get_db_positions(self):
+        with DBManager() as sess:
+            return sess.query(Position).all()
+
+    def get_order_book_analysis(self, symbol):
+        now = time.time()
+        with self.state_lock:
+            cached = order_book_cache.get(symbol)
+            if cached and now - cached['ts'] < 1.0: return cached
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                depth = self.client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LIMIT)
+                self.rate_manager.update()
+            bids = depth['bids'][:10]
+            asks = depth['asks'][:10]
+            bid_vol = sum(Decimal(b[1]) for b in bids)
+            ask_vol = sum(Decimal(a[1]) for a in asks)
+            result = {
+                'best_bid': to_decimal(bids[0][0]) if bids else to_decimal('0'),
+                'best_ask': to_decimal(asks[0][0]) if asks else to_decimal('0'),
+                'pct_ask': float(ask_vol/(bid_vol+ask_vol)*100) if (bid_vol+ask_vol) else 50.0,
+                'ts': now
+            }
+            with self.state_lock: order_book_cache[symbol] = result
+            return result
+        except: return {'best_bid':0, 'best_ask':0, 'pct_ask':50.0}
+
+    def get_rsi_and_trend(self, symbol):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=symbol, interval='1m', limit=100)
+                self.rate_manager.update()
+            closes = np.array([safe_float(k[4]) for k in klines])
+            rsi = talib.RSI(closes, timeperiod=14)
+            rsi_val = float(rsi[-1]) if len(rsi) > 0 and np.isfinite(rsi[-1]) else None
+            trend = "bullish" if closes[-1] > closes[-10] else "bearish"
+            low_24h = min(closes[-1440:]) if len(closes) >= 1440 else closes[-1]
+            return rsi_val, trend, float(low_24h)
+        except: return None, "unknown", None
+
+    def get_macd(self, symbol):
+        with self.state_lock:
+            cached = macd_cache.get(symbol)
+            if cached: return cached
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=symbol, interval='1h', limit=100)
+                self.rate_manager.update()
+            closes = np.array([safe_float(k[4]) for k in klines])
+            macd, signal, hist = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
+            if len(macd) > 0:
+                result = (float(macd[-1]), float(signal[-1]), float(hist[-1]))
+                with self.state_lock: macd_cache[symbol] = result
+                return result
+        except: pass
+        return 0.0, 0.0, 0.0
+
+    def get_trade_fees(self, symbol):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                fee = self.client.get_trade_fee(symbol=symbol)
+                self.rate_manager.update()
+            return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
+        except: return 0.001, 0.001
+
+    def get_balance(self, asset='USDT'):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                bal = self.client.get_asset_balance(asset=asset)
+                self.rate_manager.update()
+            return safe_float(bal['free'])
+        except: return 0.0
+
+    def calculate_total_portfolio_value(self):
         total = Decimal('0')
-        values = {}
-        for b in account['balances']:
-            qty = Decimal(str(safe_float(b['free'])))
-            if qty <= 0: continue
-            if b['asset'] == 'USDT':
-                total += qty
-                values['USDT'] = float(qty)
-            else:
-                price = get_price_usdt(client, b['asset'])
-                if price > 0:
-                    val = qty * price
-                    total += val
-                    values[b['asset']] = float(val)
-        return float(total), values
-    except Exception as e:
-        logger.warning(f"Portfolio value error: {e}")
-        return 0.0, {}
+        usdt = self.get_balance('USDT')
+        with DBManager() as sess:
+            for pos in sess.query(Position).all():
+                ob = self.get_order_book_analysis(pos.symbol)
+                price = ob['best_bid'] or ob['best_ask']
+                total += to_decimal(price) * pos.quantity
+        return float(total + usdt), float(usdt)
 
-def now_cst():
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+    def place_market_buy(self, symbol, usdt_amount):
+        if usdt_amount < MIN_BALANCE: return False
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                order = self.client.order_market_buy(symbol=symbol, quoteOrderQty=float(usdt_amount))
+                self.rate_manager.update()
+            logger.info(f"BUY {symbol} ${usdt_amount:.2f}")
+            send_whatsapp_alert(f"BUY {symbol} ${usdt_amount:.2f}")
+            return order
+        except Exception as e:
+            logger.error(f"BUY FAILED {symbol}: {e}")
+            return None
+
+    def place_market_sell(self, symbol, qty):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                order = self.client.order_market_sell(symbol=symbol, quantity=float(qty))
+                self.rate_manager.update()
+            logger.info(f"SELL {symbol} {qty:.6f}")
+            send_whatsapp_alert(f"SELL {symbol} {qty:.6f}")
+            return order
+        except Exception as e:
+            logger.error(f"SELL FAILED {symbol}: {e}")
+            return None
+
+    def check_fills_and_update_db(self):
+        global last_fill_check
+        if time.time() - last_fill_check < 5: return
+        last_fill_check = time.time()
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                orders = self.client.get_all_orders(limit=100)
+                self.rate_manager.update()
+            with DBManager() as sess:
+                for o in orders:
+                    if o['status'] != 'FILLED' or o['side'] not in ('BUY', 'SELL'): continue
+                    sym = o['symbol']
+                    price = to_decimal(o['cummulativeQuoteQty']) / to_decimal(o['executedQty'])
+                    qty = to_decimal(o['executedQty'])
+                    if sess.query(Trade).filter_by(binance_order_id=str(o['orderId'])).first(): continue
+                    sess.add(Trade(symbol=sym, side=o['side'], price=price, quantity=qty, binance_order_id=str(o['orderId'])))
+                    pos = sess.query(Position).filter_by(symbol=sym).one_or_none()
+                    if o['side'] == 'BUY':
+                        if not pos:
+                            pos = Position(symbol=sym, quantity=qty, avg_entry_price=price)
+                            sess.add(pos)
+                        else:
+                            total = pos.quantity * pos.avg_entry_price + qty * price
+                            pos.quantity += qty
+                            pos.avg_entry_price = total / pos.quantity
+                    else:
+                        if pos:
+                            pos.quantity -= qty
+                            if pos.quantity <= 0:
+                                sess.delete(pos)
+        except Exception as e:
+            logger.debug(f"Fill check error: {e}")
+
+# === SCANNERS ===============================================================
+def buy_scanner(bot):
+    while True:
+        try:
+            usdt = bot.get_balance('USDT')
+            if usdt < MIN_BALANCE * 2: time.sleep(10); continue
+            for pos in bot.get_db_positions():
+                sym = pos.symbol
+                ob = bot.get_order_book_analysis(sym)
+                rsi, trend, low_24h = bot.get_rsi_and_trend(sym)
+                macd_val, signal, hist = bot.get_macd(sym)
+                is_bullish_6mo = momentum_cache.get(sym, False)
+
+                if (rsi and rsi <= RSI_OVERSOLD and
+                    ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
+                    low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01') and
+                    macd_val > signal and hist > 0 and  # MACD bullish
+                    is_bullish_6mo and
+                    sym not in trailing_buy_active):
+                    with bot.state_lock:
+                        trailing_buy_active[sym] = {}
+                    amount = usdt * RISK_PER_TRADE
+                    bot.place_market_buy(sym, amount)
+            time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            logger.critical(f"Buy scanner error: {e}", exc_info=True)
+            time.sleep(10)
+
+def sell_scanner(bot):
+    while True:
+        try:
+            for pos in bot.get_db_positions():
+                sym = pos.symbol
+                ob = bot.get_order_book_analysis(sym)
+                ask = ob['best_ask']
+                if ask <= 0: continue
+                entry = to_decimal(pos.avg_entry_price)
+                net = (ask - entry) / entry
+                rsi, _, _ = bot.get_rsi_and_trend(sym)
+                if net >= PROFIT_TARGET_NET and rsi and rsi >= RSI_OVERBOUGHT and sym not in trailing_sell_active:
+                    with bot.state_lock:
+                        trailing_sell_active[sym] = {}
+                    bot.place_market_sell(sym, float(pos.quantity))
+            time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            logger.critical(f"Sell scanner error: {e}", exc_info=True)
+            time.sleep(10)
 
 # === PROFESSIONAL DASHBOARD =================================================
 def print_professional_dashboard(client, bot):
     try:
-        set_terminal_background_and_title()
         os.system('cls' if os.name == 'nt' else 'clear')
         now = now_cst()
-        usdt_free = get_balance(client, 'USDT')
-        total_portfolio, _ = calculate_total_portfolio_value(client)
+        usdt_free = bot.get_balance('USDT')
+        total_portfolio, _ = bot.calculate_total_portfolio_value()
 
-        NAVY = "\033[48;5;17m"
-        YELLOW = "\033[38;5;226m"
-        GREEN = "\033[38;5;82m"
-        RED = "\033[38;5;196m"
-        RESET = "\033[0m"
+        GREEN = "\033[32m"
+        RED = "\033[31m"
         BOLD = "\033[1m"
+        RESET = "\033[0m"
 
-        print(f"{NAVY}{'='*120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
-        print(f"{NAVY}{'='*120}{RESET}\n")
+        print(f"{'='*120}")
+        print(f"{BOLD}{'TRADING BOT – LIVE DASHBOARD ':^120}{RESET}")
+        print(f"{'='*120}\n")
 
-        print(f"{NAVY}{YELLOW}{'Time (CST)':<20} {now}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Available USDT':<20} ${usdt_free:,.6f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Portfolio Value':<20} ${total_portfolio:,.6f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Trailing Buys':<20} {len(trailing_buy_active)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'Trailing Sells':<20} {len(trailing_sell_active)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+        print(f"{'Time (CST)':<20} {now}")
+        print(f"{'Available USDT':<20} ${usdt_free:,.6f}")
+        print(f"{'Portfolio Value':<20} ${total_portfolio:,.6f}")
+        print(f"{'Trailing Buys':<20} {len(trailing_buy_active)}")
+        print(f"{'Trailing Sells':<20} {len(trailing_sell_active)}")
+        print(f"{'-'*120}\n")
 
         with DBManager() as sess:
             db_positions = sess.query(Position).all()
 
         if db_positions:
-            print(f"{NAVY}{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{BOLD}{'POSITIONS IN DATABASE':^120}{RESET}")
+            print(f"{'-'*120}")
+            print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS':<25}")
+            print(f"{'-'*120}")
             total_pnl = Decimal('0')
             for pos in db_positions:
                 symbol = pos.symbol
                 qty = float(pos.quantity)
                 entry = float(pos.avg_entry_price)
-                ob = get_order_book_analysis(client, symbol)
+                ob = bot.get_order_book_analysis(symbol)
                 cur_price = float(ob['best_bid'] or ob['best_ask'])
-                rsi, _, _ = get_rsi_and_trend(client, symbol)
+                rsi, _, _ = bot.get_rsi_and_trend(symbol)
                 rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
 
-                maker, taker = get_trade_fees(client, symbol)
+                maker, taker = bot.get_trade_fees(symbol)
                 gross = (cur_price - entry) * qty
                 fee_cost = (maker + taker) * cur_price * qty
                 net_profit = gross - fee_cost
@@ -495,454 +506,92 @@ def print_professional_dashboard(client, bot):
                           else "Trailing Buy Active" if symbol in trailing_buy_active
                           else "24/7 Monitoring")
                 color = GREEN if net_profit > 0 else RED
-                print(f"{NAVY}{YELLOW}{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET}{NAVY}{YELLOW} {color}{net_profit:>10.2f}{RESET}{NAVY}{YELLOW} {status:<25}{RESET}")
+                print(f"{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>7.2f}%{RESET} {color}{net_profit:>10.2f}{RESET} {status:<25}")
 
-            print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+            print(f"{'-'*120}")
             pnl_color = GREEN if total_pnl > 0 else RED
-            print(f"{NAVY}{YELLOW}{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
+            print(f"{'TOTAL UNREALIZED P&L':<50} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
         else:
-            print(f"{NAVY}{YELLOW} No active positions.{RESET}\n")
+            print(f" No active positions.\n")
 
-        print(f"{NAVY}{BOLD}{YELLOW}{'MARKET UNIVERSE':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}{RESET}")
-        print(f"{NAVY}{YELLOW}{'AVG 24H VOLUME':<20} ${sum(s['volume'] for s in valid_symbols_dict.values()):,.0f}{RESET}")
-        print(f"{NAVY}{YELLOW}{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+        print(f"{BOLD}{'MARKET UNIVERSE':^120}{RESET}")
+        print(f"{'-'*120}")
+        print(f"{'VALID SYMBOLS':<20} {len(valid_symbols_dict)}")
+        print(f"{'AVG 24H VOLUME':<20} ${sum(s.get('volume',0) for s in valid_symbols_dict.values()):,.0f}")
+        print(f"{'PRICE RANGE':<20} ${MIN_PRICE} → ${MAX_PRICE}")
+        print(f"{'-'*120}\n")
 
-        print(f"{NAVY}{BOLD}{YELLOW}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+        print(f"{BOLD}{'BUY WATCHLIST (RSI ≤ 35 + SELL PRESSURE)':^120}{RESET}")
+        print(f"{'-'*120}")
         watchlist = []
         for symbol in valid_symbols_dict.keys():
-            ob = get_order_book_analysis(client, symbol)
-            rsi, trend, low_24h = get_rsi_and_trend(client, symbol)
+            ob = bot.get_order_book_analysis(symbol)
+            rsi, trend, low_24h = bot.get_rsi_and_trend(symbol)
             if (rsi is not None and rsi <= RSI_OVERSOLD and
                 ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
                 low_24h and ob['best_bid'] <= Decimal(str(low_24h)) * Decimal('1.01')):
                 watchlist.append((symbol, rsi, ob['pct_ask'], ob['best_bid']))
 
         if watchlist:
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'RSI':>6} {'SELL %':>8} {'PRICE':>12}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*40}{RESET}")
+            print(f"{'SYMBOL':<10} {'RSI':>6} {'SELL %':>8} {'PRICE':>12}")
+            print(f"{'-'*40}")
             for sym, rsi_val, sell_pct, price in sorted(watchlist, key=lambda x: x[1])[:10]:
-                print(f"{NAVY}{YELLOW}{sym:<10} {rsi_val:>6.1f} {sell_pct:>7.1f}% ${price:>11.6f}{RESET}")
+                print(f"{sym:<10} {rsi_val:>6.1f} {sell_pct:>7.1f}% ${price:>11.6f}")
         else:
-            print(f"{NAVY}{YELLOW} No strong dip signals.{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+            print(f" No strong dip signals.")
+        print(f"{'-'*120}\n")
 
-        print(f"{NAVY}{BOLD}{YELLOW}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}")
+        print(f"{BOLD}{'SELL WATCHLIST (PROFIT + RSI ≥ 65)':^120}{RESET}")
+        print(f"{'-'*120}")
         sell_watch = []
         with DBManager() as sess:
             for pos in sess.query(Position).all():
                 symbol = pos.symbol
                 entry = Decimal(str(pos.avg_entry_price))
-                ob = get_order_book_analysis(client, symbol)
+                ob = bot.get_order_book_analysis(symbol)
                 sell_price = ob['best_ask']
-                rsi, _, _ = get_rsi_and_trend(client, symbol)
-                maker, taker = get_trade_fees(client, symbol)
+                rsi, _, _ = bot.get_rsi_and_trend(symbol)
+                maker, taker = bot.get_trade_fees(symbol)
                 net_return = (sell_price - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
                 if net_return >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
                     sell_watch.append((symbol, float(net_return * 100), rsi))
 
         if sell_watch:
-            print(f"{NAVY}{YELLOW}{'SYMBOL':<10} {'NET %':>8} {'RSI':>6}{RESET}")
-            print(f"{NAVY}{YELLOW}{'-'*30}{RESET}")
+            print(f"{'SYMBOL':<10} {'NET %':>8} {'RSI':>6}")
+            print(f"{'-'*30}")
             for sym, ret_pct, rsi_val in sorted(sell_watch, key=lambda x: x[1], reverse=True)[:10]:
-                print(f"{NAVY}{YELLOW}{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f}{RESET}")
+                print(f"{sym:<10} {GREEN}{ret_pct:>7.2f}%{RESET} {rsi_val:>6.1f}")
         else:
-            print(f"{NAVY}{YELLOW} No profitable sell signals.{RESET}")
-        print(f"{NAVY}{YELLOW}{'-'*120}{RESET}\n")
+            print(f" No profitable sell signals.")
+        print(f"{'-'*120}\n")
 
-        print(f"{NAVY}{'='*120}{RESET}\n")
+        print(f"{'='*120}\n")
 
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
-# === BOT CLASS ==============================================================
-class BinanceTradingBot:
-    def __init__(self):
-        self.client = Client(API_KEY, API_SECRET, tld='us')
-        self.rate_manager = RateManager(self.client)
-        with DBManager() as sess:
-            import_owned_assets_to_db(self.client, sess)
-            sess.commit()
-        self.load_state_from_db()
-
-    def load_state_from_db(self):
-        global positions
-        with DBManager() as sess:
-            for p in sess.query(Position).all():
-                positions[p.symbol] = {
-                    'qty': float(p.quantity),
-                    'entry_price': float(p.avg_entry_price),
-                    'buy_fee': float(p.buy_fee_rate)
-                }
-
-    def place_limit_buy_with_tracking(self, symbol, price: str, qty: float):
+# === ALERTS =================================================================
+def send_whatsapp_alert(msg):
+    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
         try:
-            order = self.client.order_limit_buy(symbol=symbol, quantity=qty, price=price)
-            with DBManager() as sess:
-                sess.add(PendingOrder(binance_order_id=str(order['orderId']),
-                                      symbol=symbol, side='buy',
-                                      price=Decimal(price), quantity=Decimal(str(qty))))
-            return order
-        except:
-            return None
-
-    def place_limit_sell_with_tracking(self, symbol, price: str, qty: float):
-        try:
-            order = self.client.order_limit_sell(symbol=symbol, quantity=qty, price=price)
-            with DBManager() as sess:
-                sess.add(PendingOrder(binance_order_id=str(order['orderId']),
-                                      symbol=symbol, side='sell',
-                                      price=Decimal(price), quantity=Decimal(str(qty))))
-            return order
-        except:
-            return None
-
-    def check_and_process_filled_orders(self):
-        try:
-            with DBManager() as sess:
-                for po in sess.query(PendingOrder).all():
-                    try:
-                        o = self.client.get_order(symbol=po.symbol, orderId=int(po.binance_order_id))
-                        if o['status'] == 'FILLED':
-                            fill_price = Decimal(o['cummulativeQuoteQty']) / Decimal(o['executedQty'])
-                            self.record_trade(sess, po.symbol, po.side, fill_price,
-                                              Decimal(o['executedQty']), po.binance_order_id, po)
-                            sess.delete(po)
-                            action = "BUY" if po.side == 'buy' else "SELL"
-                            logger.info(f"{action} FILLED: {po.symbol} @ {fill_price}")
-                            if po.side == 'buy' and po.symbol in trailing_buy_active:
-                                del trailing_buy_active[po.symbol]
-                            if po.side == 'sell' and po.symbol in trailing_sell_active:
-                                del trailing_sell_active[po.symbol]
-                    except:
-                        pass
-        except:
-            pass
-
-    def record_trade(self, sess, symbol, side, price, qty, binance_id, pending):
-        trade = Trade(symbol=symbol, side=side, price=price, quantity=qty,
-                      binance_order_id=binance_id, pending_order=pending)
-        sess.add(trade)
-        pos = sess.query(Position).filter_by(symbol=symbol).one_or_none()
-        if side == "buy":
-            if not pos:
-                maker, _ = get_trade_fees(self.client, symbol)
-                pos = Position(symbol=symbol, quantity=qty, avg_entry_price=price,
-                               buy_fee_rate=maker)
-                sess.add(pos)
-            else:
-                total = pos.quantity * pos.avg_entry_price + qty * price
-                pos.quantity += qty
-                pos.avg_entry_price = total / pos.quantity
-        else:
-            if pos:
-                pos.quantity -= qty
-                if pos.quantity <= 0:
-                    sess.delete(pos)
-                    positions.pop(symbol, None)
-
-    def start_trailing_buy(self, symbol):
-        if symbol in trailing_buy_active:
-            return
-        trailing_buy_active[symbol] = {
-            'lowest_price': Decimal('inf'),
-            'last_buy_order_id': None,
-            'start_time': time.time()
-        }
-        logger.info(f"Trailing BUY started for {symbol}")
-        send_whatsapp_alert(f"TRAILING BUY ACTIVE: {symbol}")
-
-    def process_trailing_buy(self, symbol):
-        state = trailing_buy_active[symbol]
-        try:
-            ob = get_order_book_analysis(self.client, symbol)
-            bid = ob['best_bid']
-            if bid <= ZERO:
-                return
-
-            now = time.time()
-            if symbol not in last_price_cache:
-                last_price_cache[symbol] = (float(bid), now)
-            else:
-                lp, lt = last_price_cache[symbol]
-                if now - lt < RAPID_DROP_WINDOW:
-                    drop = (lp - float(bid)) / lp
-                    if drop >= RAPID_DROP_THRESHOLD:
-                        self.place_buy_at_price(symbol, None, force_market=True)
-                        del trailing_buy_active[symbol]
-                        return
-                last_price_cache[symbol] = (float(bid), now)
-
-            if bid < state['lowest_price']:
-                state['lowest_price'] = bid
-
-            rsi, _, low24 = get_rsi_and_trend(self.client, symbol)
-            if rsi is None or rsi > RSI_OVERSOLD:
-                return
-
-            hist = sell_pressure_history.get(symbol, deque(maxlen=5))
-            hist.append(ob['pct_ask'])
-            sell_pressure_history[symbol] = hist
-
-            if low24 and bid > Decimal(str(low24)) * Decimal('1.02'):
-                return
-
-            if len(hist) >= 3:
-                peak = max(hist)
-                cur = hist[-1]
-                if peak >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and cur <= peak * 0.9:
-                    self.place_buy_at_price(symbol, bid)
-                    del trailing_buy_active[symbol]
-                    return
-
-            if bid > state['lowest_price'] * Decimal('1.003'):
-                self.place_buy_at_price(symbol, bid)
-                del trailing_buy_active[symbol]
-                return
-
-        except Exception as e:
-            logger.debug(f"Trailing buy error [{symbol}]: {e}")
-
-    def place_buy_at_price(self, symbol, price: Optional[Decimal], force_market=False):
-        state = trailing_buy_active.get(symbol, {})
-        try:
-            if state.get('last_buy_order_id') and not force_market:
-                try:
-                    self.client.cancel_order(symbol=symbol, orderId=int(state['last_buy_order_id']))
-                except:
-                    pass
-
-            bal = get_balance(self.client)
-            if bal <= MIN_BALANCE:
-                return
-            alloc = min(Decimal(str(bal - MIN_BALANCE)) * Decimal(str(RISK_PER_TRADE)),
-                        Decimal(str(bal - MIN_BALANCE)))
-
-            if force_market or price is None:
-                self.rate_manager.wait_if_needed('ORDERS')
-                order = self.client.order_market_buy(symbol=symbol, quoteOrderQty=float(alloc))
-                self.rate_manager.update_current()
-                fill = Decimal(order['fills'][0]['price']) if order['fills'] else Decimal('0')
-                logger.info(f"MARKET BUY {symbol} @ {fill}")
-                send_whatsapp_alert(f"MARKET BUY {symbol} @ {fill:.6f} (flash dip)")
-            else:
-                qty = alloc / price
-                adj, err = validate_and_adjust_order(self.client, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price)
-                if not adj or err:
-                    return
-                self.rate_manager.wait_if_needed('ORDERS')
-                order = self.place_limit_buy_with_tracking(symbol, str(adj['price']), adj['quantity'])
-                self.rate_manager.update_current()
-                if order:
-                    state['last_buy_order_id'] = str(order['orderId'])
-                fill = Decimal(adj['price'])
-
-            if order:
-                record_buy_placed(symbol)
-                send_whatsapp_alert(f"BUY EXECUTED {symbol} @ {fill:.6f}")
-                logger.info(f"DYNAMIC BUY {symbol} @ {fill}")
-
-        except Exception as e:
-            logger.error(f"Buy failed: {e}")
-
-    def start_trailing_sell(self, symbol, pos):
-        if symbol in trailing_sell_active:
-            return
-        entry = Decimal(str(pos.avg_entry_price))
-        trailing_sell_active[symbol] = {
-            'entry_price': entry,
-            'qty': pos.quantity,
-            'peak_price': entry,
-            'last_sell_order_id': None,
-            'price_peaks_history': [],
-            'start_time': time.time()
-        }
-        logger.info(f"Trailing SELL started for {symbol} @ {entry:.6f}")
-        send_whatsapp_alert(f"TRAILING SELL ACTIVE: {symbol} @ {entry:.6f}")
-
-    def process_trailing_sell(self, symbol):
-        state = trailing_sell_active[symbol]
-        try:
-            ob = get_order_book_analysis(self.client, symbol)
-            bid = ob['best_bid']
-            if bid <= ZERO:
-                return
-
-            if bid > state['peak_price']:
-                state['peak_price'] = bid
-
-            maker, taker = get_trade_fees(self.client, symbol)
-            net = (bid - state['entry_price']) / state['entry_price'] - Decimal(str(maker)) - Decimal(str(taker))
-            if net < PROFIT_TARGET_NET:
-                return
-
-            rsi, _, _ = get_rsi_and_trend(self.client, symbol)
-            if rsi is None or rsi < RSI_OVERBOUGHT:
-                return
-
-            hist = buy_pressure_history.get(symbol, deque(maxlen=5))
-            hist.append(ob['pct_bid'])
-            buy_pressure_history[symbol] = hist
-
-            if len(hist) >= 3:
-                peak = max(hist)
-                cur = hist[-1]
-                if peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and cur <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
-                    self.place_sell_at_price(symbol, bid)
-                    del trailing_sell_active[symbol]
-                    return
-
-            if bid < state['peak_price'] * Decimal('0.995'):
-                self.place_sell_at_price(symbol, bid)
-                del trailing_sell_active[symbol]
-                return
-
-            if self._detect_stall(symbol, bid):
-                logger.info(f"STALLED 15 min {symbol} @ {bid:.6f} → MARKET SELL")
-                send_whatsapp_alert(f"STALLED 15 MIN {symbol} @ {bid:.6f} → MARKET SELL")
-                self.place_sell_at_price(symbol, None, force_market=True)
-                del trailing_sell_active[symbol]
-                return
-
-        except Exception as e:
-            logger.debug(f"Trailing sell error [{symbol}]: {e}")
-
-    def _detect_stall(self, symbol, cur_price):
-        state = trailing_sell_active[symbol]
-        now = time.time()
-        hist = state['price_peaks_history']
-        if not hist or cur_price > hist[-1][1]:
-            hist.append((now, cur_price))
-        cutoff = now - STALL_THRESHOLD_SECONDS
-        state['price_peaks_history'] = [(t, p) for t, p in hist if t > cutoff]
-        return bool(state['price_peaks_history']) and now - state['price_peaks_history'][-1][0] >= STALL_THRESHOLD_SECONDS
-
-    def place_sell_at_price(self, symbol, price: Optional[Decimal], force_market=False):
-        state = trailing_sell_active.get(symbol, {})
-        try:
-            if state.get('last_sell_order_id') and not force_market:
-                try:
-                    self.client.cancel_order(symbol=symbol, orderId=int(state['last_sell_order_id']))
-                except:
-                    pass
-
-            qty = state['qty']
-            if force_market or price is None:
-                self.rate_manager.wait_if_needed('ORDERS')
-                order = self.client.order_market_sell(symbol=symbol, quantity=float(qty))
-                self.rate_manager.update_current()
-                fill = Decimal(order['fills'][0]['price']) if order['fills'] else state['peak_price']
-                logger.info(f"MARKET SELL {symbol} @ {fill}")
-                send_whatsapp_alert(f"MARKET SELL {symbol} @ {fill:.6f} (stall)")
-            else:
-                tick = get_tick_size(self.client, symbol)
-                price = ((price // tick) + 1) * tick
-                adj, _ = validate_and_adjust_order(self.client, symbol, 'SELL', ORDER_TYPE_LIMIT, qty, price)
-                if not adj:
-                    return
-                self.rate_manager.wait_if_needed('ORDERS')
-                order = self.place_limit_sell_with_tracking(symbol, str(adj['price']), adj['quantity'])
-                self.rate_manager.update_current()
-                if order:
-                    state['last_sell_order_id'] = str(order['orderId'])
-                fill = Decimal(adj['price'])
-
-            if order:
-                send_whatsapp_alert(f"SELL EXECUTED {symbol} @ {fill:.6f}")
-                logger.info(f"DYNAMIC SELL {symbol} @ {fill}")
-
-        except Exception as e:
-            logger.error(f"Sell failed: {e}")
+            requests.get(f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}", timeout=5)
+        except: pass
 
 # === MAIN ===================================================================
 def main():
     if not API_KEY or not API_SECRET:
-        logger.critical("API keys missing.")
+        logger.critical("API keys missing")
         sys.exit(1)
-
     bot = BinanceTradingBot()
-
-    # Fetch symbols after client is ready
-    for attempt in range(2):
-        if fetch_and_validate_usdt_pairs(bot.client):
-            break
-        logger.warning("No symbols fetched – retrying in 5s...")
-        time.sleep(5)
-    else:
-        logger.critical("Failed to fetch any valid symbols.")
-        sys.exit(1)
-
-    with DBManager() as sess:
-        import_owned_assets_to_db(bot.client, sess)
-        sess.commit()
-
-    print_professional_dashboard(bot.client, bot)
-    logger.info("Single-threaded loop started.")
-    last_dash = 0
-
+    threading.Thread(target=buy_scanner, args=(bot,), daemon=True).start()
+    threading.Thread(target=sell_scanner, args=(bot,), daemon=True).start()
+    last_dash = time.time()
     while True:
-        try:
-            for sym in list(valid_symbols_dict.keys()):
-                bot.rate_manager.wait_if_needed('REQUEST_WEIGHT')
-                ob = get_order_book_analysis(bot.client, sym)
-                bot.rate_manager.update_current()
-                rsi, trend, low24 = get_rsi_and_trend(bot.client, sym)
-                bot.rate_manager.update_current()
-
-                bid = ob['best_bid']
-                ask = ob['best_ask']
-                if bid <= ZERO or ask <= ZERO:
-                    continue
-
-                # BUY LOGIC
-                with DBManager() as sess:
-                    if not sess.query(Position).filter_by(symbol=sym).first():
-                        if (rsi is not None and rsi <= RSI_OVERSOLD and
-                            trend == 'bullish' and
-                            low24 and bid <= Decimal(str(low24)) * Decimal('1.01') and
-                            ob['pct_ask'] >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and
-                            sym not in trailing_buy_active):
-                            if can_place_buy_order(sym):
-                                bot.start_trailing_buy(sym)
-
-                if sym in trailing_buy_active:
-                    bot.process_trailing_buy(sym)
-
-                # SELL LOGIC
-                with DBManager() as sess:
-                    pos = sess.query(Position).filter_by(symbol=sym).one_or_none()
-                    if pos and sym not in trailing_sell_active:
-                        entry = Decimal(str(pos.avg_entry_price))
-                        maker, taker = get_trade_fees(bot.client, sym)
-                        net = (ask - entry) / entry - Decimal(str(maker)) - Decimal(str(taker))
-                        if net >= PROFIT_TARGET_NET and rsi is not None and rsi >= RSI_OVERBOUGHT:
-                            hist = buy_pressure_history.get(sym, deque(maxlen=5))
-                            hist.append(ob['pct_bid'])
-                            buy_pressure_history[sym] = hist
-                            if len(hist) >= 3 and max(hist) >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and hist[-1] <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
-                                bot.start_trailing_sell(sym, pos)
-
-                if sym in trailing_sell_active:
-                    bot.process_trailing_sell(sym)
-
-            bot.check_and_process_filled_orders()
-
-            now = time.time()
-            if now - last_dash >= 30:
-                print_professional_dashboard(bot.client, bot)
-                last_dash = now
-
-            time.sleep(POLL_INTERVAL / max(1, len(valid_symbols_dict)))
-
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.critical(f"Main loop error: {e}", exc_info=True)
-            time.sleep(10)
+        bot.check_fills_and_update_db()
+        if time.time() - last_dash >= 30:
+            print_professional_dashboard(bot.client, bot)
+            last_dash = time.time()
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
