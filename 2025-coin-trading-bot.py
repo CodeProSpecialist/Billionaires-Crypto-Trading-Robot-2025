@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-BINANCE.US TRADING BOT – PROFIT & SIZE GUARANTEED
-- 1.0% NET profit + $0.25 min profit
-- No sell if < $5.00 value or <1 coin
-- No buy if < $5.00 USDT cash
-- PRICE_FILTER & LOT_SIZE safe
-- Auto-cancel >2h
-- Full dashboard + WhatsApp
+BINANCE.US SMART TRADING BOT – ORDER BOOK + INDICATORS
+- Buy at lowest: order book sell pressure + MFI/RSI + volume dip
+- Sell at highest: order book buy pressure + MFI/RSI + volume climax
+- Trailing buy/sell with smart activation
+- Full dashboard + WhatsApp alerts
 """
 
 import os
@@ -44,28 +42,41 @@ LOG_FILE = "crypto_trading_bot.log"
 DEBUG_LOG_FILE = "crypto_trading_bot_debug.log"
 
 # === HARD-CODED MINIMUMS ====================================================
-SELL_ORDER_MINIMUM_USDT_COIN_VALUE = 5.00   # Min $5 value to sell
-BUY_ORDER_MINIMUM_USDT = 5.00               # Min $5 USDT to buy
-MIN_PROFIT_USDT = Decimal('0.25')           # Min $0.25 NET profit per trade after fees 
-
-PROFIT_TARGET_NET = Decimal('0.010')        # 1.0% NET profit
+SELL_ORDER_MINIMUM_USDT_COIN_VALUE = 5.00
+BUY_ORDER_MINIMUM_USDT = 5.00
+MIN_PROFIT_USDT = Decimal('0.25')
+PROFIT_TARGET_NET = Decimal('0.010')
 RISK_PER_TRADE = 0.10
+
+# === INDICATOR THRESHOLDS ===================================================
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
-ORDERBOOK_SELL_PRESSURE_THRESHOLD = 0.60
-ORDER_BOOK_LIMIT = 20
+MFI_OVERSOLD = 25
+MFI_OVERBOUGHT = 75
+VOLUME_SURGE_MULTIPLIER = 2.5
+SHORT_TREND_WINDOW = 15
+
+# === ORDER BOOK & TRAILING ==================================================
+ORDER_BOOK_DEPTH = 50
+ORDER_BOOK_IMBALANCE_BUY = 0.65   # >65% ask vol → sell pressure → buy
+ORDER_BOOK_IMBALANCE_SELL = 0.35  # <35% ask vol → buy pressure → sell
+TRAILING_BUY_STEP_PCT = 0.002
+TRAILING_SELL_STEP_PCT = 0.002
+CANCEL_AFTER_HOURS = 2.0
+CANCEL_CHECK_INTERVAL = 300
 POLL_INTERVAL = 2.0
 
+# === TRAILING ACTIVATION ====================================================
+MIN_DIP_FOR_TRAIL_BUY = 0.015      # 1.5% drop from 1h high
+MIN_PROFIT_FOR_TRAIL_SELL = 0.012  # 1.2% gross
+MIN_RISE_FOR_TRAIL_SELL = 0.02     # 2.0% rise from 1h low
+
+# === TECHNICAL INDICATORS ===================================================
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 MOMENTUM_LOOKBACK_DAYS = 180
 MIN_MOMENTUM_GAIN = 0.25
-
-TRAILING_BUY_STEP_PCT = 0.002
-TRAILING_SELL_STEP_PCT = 0.002
-CANCEL_AFTER_HOURS = 2.0
-CANCEL_CHECK_INTERVAL = 300
 
 # === LOGGING ================================================================
 logger = logging.getLogger(__name__)
@@ -138,6 +149,7 @@ momentum_cache: Dict[str, bool] = {}
 trailing_buy_active: Dict[str, dict] = {}
 trailing_sell_active: Dict[str, dict] = {}
 symbol_info_cache: Dict[str, dict] = {}
+price_1h_extremes: Dict[str, Dict[str, float]] = {}
 last_fill_check = 0
 last_trade_timestamp = 0
 last_cancel_check = 0
@@ -163,6 +175,27 @@ class RateManager:
         self.update()
         if self.current['weight'] > 1100: time.sleep(10)
         if self.current['orders'] > 45: time.sleep(5)
+
+# === 1-HOUR HIGH/LOW CACHE ==================================================
+def get_1h_high_low(bot, symbol) -> Tuple[float, float]:
+    now = time.time()
+    with bot.state_lock:
+        cached = price_1h_extremes.get(symbol)
+        if cached and now - cached['ts'] < 60:
+            return cached['high'], cached['low']
+    try:
+        with bot.api_lock:
+            bot.rate_manager.wait()
+            klines = bot.client.get_klines(symbol=symbol, interval='1m', limit=60)
+            bot.rate_manager.update()
+        highs = [safe_float(k[2]) for k in klines]
+        lows  = [safe_float(k[3]) for k in klines]
+        high, low = max(highs), min(lows)
+        with bot.state_lock:
+            price_1h_extremes[symbol] = {'high': high, 'low': low, 'ts': now}
+        return high, low
+    except:
+        return 0.0, 0.0
 
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
@@ -213,6 +246,22 @@ class BinanceTradingBot:
                 self.rate_manager.update()
             return any(s['symbol'] == sym and s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT' for s in info['symbols'])
         except: return False
+
+    def get_valid_symbols(self):
+        now = time.time()
+        with self.state_lock:
+            if hasattr(self, '_valid_cache') and now - self._valid_cache[1] < 300:
+                return self._valid_cache[0]
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                info = self.client.get_exchange_info()
+                self.rate_manager.update()
+            syms = [s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT']
+            with self.state_lock:
+                self._valid_cache = (syms, now)
+            return syms
+        except: return []
 
     def warmup_data(self):
         logger.info("Warming up data...")
@@ -271,29 +320,51 @@ class BinanceTradingBot:
         with DBManager() as sess:
             return sess.query(Position).all()
 
-    def get_order_book_analysis(self, symbol):
+    def get_order_book_analysis(self, symbol, depth=ORDER_BOOK_DEPTH):
         now = time.time()
         with self.state_lock:
             cached = order_book_cache.get(symbol)
-            if cached and now - cached['ts'] < 1.0: return cached
+            if cached and now - cached['ts'] < 1.0:
+                return cached
+
         try:
             with self.api_lock:
                 self.rate_manager.wait()
-                depth = self.client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LIMIT)
+                depth_data = self.client.get_order_book(symbol=symbol, limit=depth)
                 self.rate_manager.update()
-            bids = depth['bids'][:10]
-            asks = depth['asks'][:10]
+
+            bids = depth_data['bids']
+            asks = depth_data['asks']
+
             bid_vol = sum(Decimal(b[1]) for b in bids)
             ask_vol = sum(Decimal(a[1]) for a in asks)
+            total_vol = bid_vol + ask_vol
+            ask_pct = float(ask_vol / total_vol) if total_vol > 0 else 0.5
+
+            bid_wall = max(bids[:10], key=lambda x: Decimal(x[1]))[0] if bids else '0'
+            ask_wall = min(asks[:10], key=lambda x: Decimal(x[1]))[0] if asks else '0'
+
             result = {
-                'best_bid': to_decimal(bids[0][0]) if bids else to_decimal('0'),
-                'best_ask': to_decimal(asks[0][0]) if asks else to_decimal('0'),
-                'pct_ask': float(ask_vol/(bid_vol+ask_vol)*100) if (bid_vol+ask_vol) else 50.0,
+                'best_bid': to_decimal(bids[0][0]) if bids else Decimal('0'),
+                'best_ask': to_decimal(asks[0][0]) if asks else Decimal('0'),
+                'bid_vol': float(bid_vol),
+                'ask_vol': float(ask_vol),
+                'ask_pct': ask_pct,
+                'bid_wall_price': to_decimal(bid_wall),
+                'ask_wall_price': to_decimal(ask_wall),
+                'imbalance': (
+                    'buy_pressure' if ask_pct < ORDER_BOOK_IMBALANCE_SELL else
+                    'sell_pressure' if ask_pct > ORDER_BOOK_IMBALANCE_BUY else
+                    'balanced'
+                ),
                 'ts': now
             }
-            with self.state_lock: order_book_cache[symbol] = result
+            with self.state_lock:
+                order_book_cache[symbol] = result
             return result
-        except: return {'best_bid':0, 'best_ask':0, 'pct_ask':50.0}
+        except Exception as e:
+            logger.error(f"Order book failed {symbol}: {e}")
+            return {'best_bid':0, 'best_ask':0, 'ask_pct':0.5, 'imbalance':'unknown', 'ts':now}
 
     def get_rsi_and_trend(self, symbol):
         try:
@@ -326,6 +397,42 @@ class BinanceTradingBot:
                 return result
         except: pass
         return 0.0, 0.0, 0.0
+
+    def get_mfi(self, symbol, period=14, length=100):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=symbol, interval='1m', limit=length)
+                self.rate_manager.update()
+            typical = [(float(k[2]) + float(k[3]) + float(k[4])) / 3 for k in klines]
+            volume = [float(k[5]) for k in klines]
+            money_flow = [typical[i] * volume[i] for i in range(len(typical))]
+            pos = sum(mf for i, mf in enumerate(money_flow[1:]) if typical[i+1] > typical[i] and i >= length-period-1)
+            neg = sum(mf for i, mf in enumerate(money_flow[1:]) if typical[i+1] < typical[i] and i >= length-period-1)
+            if neg == 0: return 100.0
+            mfr = pos / neg
+            return 100 - (100 / (1 + mfr))
+        except: return None
+
+    def get_volume_surge(self, symbol):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=symbol, interval='1m', limit=21)
+                self.rate_manager.update()
+            volumes = [float(k[5]) for k in klines]
+            return volumes[-1] > np.mean(volumes[:-1]) * VOLUME_SURGE_MULTIPLIER
+        except: return False
+
+    def get_short_term_trend(self, symbol, window=SHORT_TREND_WINDOW):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait()
+                klines = self.client.get_klines(symbol=symbol, interval='1m', limit=window+1)
+                self.rate_manager.update()
+            prices = [float(k[4]) for k in klines]
+            return "bullish" if prices[-1] > prices[0] else "bearish"
+        except: return "unknown"
 
     def get_trade_fees(self, symbol):
         try:
@@ -530,12 +637,104 @@ def round_quantity(qty: Decimal, symbol: str, bot) -> Decimal:
         return (qty // step_size) * step_size
     except: return qty
 
+# === SMART BUY SCANNER (Lowest Price) =======================================
+def smart_buy_scanner(bot):
+    while True:
+        try:
+            usdt = float(bot.get_balance('USDT'))
+            if usdt < BUY_ORDER_MINIMUM_USDT * 3:
+                time.sleep(10)
+                continue
 
-# === TRAILING SCANNERS (FIXED) ==============================================
+            for sym in bot.get_valid_symbols():
+                if sym in trailing_buy_active or any(p.symbol == sym for p in bot.get_db_positions()):
+                    continue
+
+                ob = bot.get_order_book_analysis(sym)
+                if ob['best_bid'] <= 0: continue
+
+                rsi, _, _ = bot.get_rsi_and_trend(sym)
+                mfi = bot.get_mfi(sym)
+                volume_surge = bot.get_volume_surge(sym)
+                trend = bot.get_short_term_trend(sym)
+                macd, signal, _ = bot.get_macd(sym)
+                current = ob['best_bid']
+
+                high_1h, _ = get_1h_high_low(bot, sym)
+                dip_pct = (high_1h - current) / high_1h if high_1h > 0 else 0
+
+                conditions = [
+                    rsi and rsi <= RSI_OVERSOLD,
+                    mfi and mfi <= MFI_OVERSOLD,
+                    ob['imbalance'] == 'sell_pressure',
+                    volume_surge,
+                    trend == "bearish",
+                    macd < signal,
+                    dip_pct >= MIN_DIP_FOR_TRAIL_BUY
+                ]
+
+                if all(conditions):
+                    with bot.state_lock:
+                        trailing_buy_active[sym] = {'last_price': current}
+                    logger.info(f"BUY SIGNAL {sym} | RSI:{rsi:.1f} MFI:{mfi:.1f} Dip:{dip_pct:.1%}")
+                    send_whatsapp_alert(f"BUY {sym} @ {current}")
+
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Smart buy error: {e}")
+            time.sleep(10)
+
+# === SMART SELL SCANNER (Highest Price) =====================================
+def smart_sell_scanner(bot):
+    while True:
+        try:
+            for pos in bot.get_db_positions():
+                sym = pos.symbol
+                if sym in trailing_sell_active: continue
+
+                ob = bot.get_order_book_analysis(sym)
+                if ob['best_ask'] <= 0: continue
+
+                entry = to_decimal(pos.avg_entry_price)
+                current = ob['best_ask']
+                profit_pct = float((current - entry) / entry)
+
+                rsi, _, _ = bot.get_rsi_and_trend(sym)
+                mfi = bot.get_mfi(sym)
+                volume_surge = bot.get_volume_surge(sym)
+                trend = bot.get_short_term_trend(sym)
+                macd, signal, _ = bot.get_macd(sym)
+
+                _, low_1h = get_1h_high_low(bot, sym)
+                rise_pct = (current - low_1h) / low_1h if low_1h > 0 else 0
+
+                conditions = [
+                    rsi and rsi >= RSI_OVERBOUGHT,
+                    mfi and mfi >= MFI_OVERBOUGHT,
+                    ob['imbalance'] == 'buy_pressure',
+                    volume_surge,
+                    trend == "bullish",
+                    macd > signal,
+                    profit_pct >= MIN_PROFIT_FOR_TRAIL_SELL,
+                    rise_pct >= MIN_RISE_FOR_TRAIL_SELL
+                ]
+
+                if all(conditions):
+                    with bot.state_lock:
+                        trailing_sell_active[sym] = {'last_price': current}
+                    logger.info(f"SELL SIGNAL {sym} | +{profit_pct:.2%} RSI:{rsi:.1f}")
+                    send_whatsapp_alert(f"SELL {sym} @ {current}")
+
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Smart sell error: {e}")
+            time.sleep(10)
+
+# === TRAILING SCANNERS (UNCHANGED LOGIC) ====================================
 def trailing_buy_scanner(bot):
     while True:
         try:
-            for sym, data in list(trailing_buy_active.items()):  # FIXED: removed 'obviously'
+            for sym, data in list(trailing_buy_active.items()):
                 ob = bot.get_order_book_analysis(sym)
                 best_bid = ob['best_bid']
                 if best_bid <= 0: continue
@@ -552,7 +751,6 @@ def trailing_buy_scanner(bot):
                             bot.rate_manager.wait()
                             bot.client.cancel_order(symbol=sym, orderId=old_id)
                             bot.rate_manager.update()
-                        logger.info(f"CANCELED trailing buy {sym} @ {last_price}")
                     except: pass
 
                 usdt = float(bot.get_balance('USDT')) * RISK_PER_TRADE
@@ -580,7 +778,6 @@ def trailing_buy_scanner(bot):
                             'last_price': target_price_rounded
                         }
                     logger.info(f"TRAILING BUY {sym} {qty} @ {target_price_rounded}")
-                    send_whatsapp_alert(f"TRAIL BUY {sym} {qty} @ {target_price_rounded}")
                 except BinanceAPIException as e:
                     if e.code == -1013:
                         logger.warning(f"BUY PRICE_FILTER {sym}, skipping")
@@ -594,11 +791,10 @@ def trailing_buy_scanner(bot):
             logger.critical(f"Trailing buy crash: {e}", exc_info=True)
             time.sleep(10)
 
-
 def trailing_sell_scanner(bot):
     while True:
         try:
-            for sym, data in list(trailing_sell_active.items()):  # FIXED: removed 'obviously'
+            for sym, data in list(trailing_sell_active.items()):
                 ob = bot.get_order_book_analysis(sym)
                 best_ask = ob['best_ask']
                 if best_ask <= 0: continue
@@ -615,7 +811,6 @@ def trailing_sell_scanner(bot):
                             bot.rate_manager.wait()
                             bot.client.cancel_order(symbol=sym, orderId=old_id)
                             bot.rate_manager.update()
-                        logger.info(f"CANCELED trailing sell {sym} @ {last_price}")
                     except: pass
 
                 with DBManager() as sess:
@@ -628,12 +823,10 @@ def trailing_sell_scanner(bot):
 
                 qty = round_quantity(raw_qty, sym, bot)
                 if qty <= 0 or qty < 1:
-                    logger.info(f"TRAIL SELL SKIP {sym}: Qty {qty} < 1")
                     continue
 
                 value = best_ask * qty
                 if value < SELL_ORDER_MINIMUM_USDT_COIN_VALUE:
-                    logger.info(f"TRAIL SELL SKIP {sym}: Value ${value:.2f} < ${SELL_ORDER_MINIMUM_USDT_COIN_VALUE}")
                     continue
 
                 target_price_rounded = round_price(target_price, sym, bot)
@@ -654,10 +847,9 @@ def trailing_sell_scanner(bot):
                             'last_price': target_price_rounded
                         }
                     logger.info(f"TRAILING SELL {sym} {qty} @ {target_price_rounded}")
-                    send_whatsapp_alert(f"TRAIL SELL {sym} {qty} @ {target_price_rounded}")
                 except BinanceAPIException as e:
                     if e.code == -1013:
-                        logger.warning(f"TRAIL SELL PRICE_FILTER {sym}, using market")
+                        logger.warning(f"SELL PRICE_FILTER {sym}, using market")
                         bot.place_market_sell(sym, float(qty))
                         with bot.state_lock:
                             if sym in trailing_sell_active: del trailing_sell_active[sym]
@@ -670,52 +862,6 @@ def trailing_sell_scanner(bot):
         except Exception as e:
             logger.critical(f"Trailing sell crash: {e}", exc_info=True)
             time.sleep(10)
-
-
-# === FEE & SIZE AWARE SELL TRIGGER ==========================================
-def sell_trigger_scanner(bot):
-    while True:
-        try:
-            for pos in bot.get_db_positions():
-                sym = pos.symbol
-                if sym in trailing_sell_active: continue
-                ob = bot.get_order_book_analysis(sym)
-                ask = ob['best_ask']
-                if ask <= 0: continue
-                entry = to_decimal(pos.avg_entry_price)
-                qty = to_decimal(pos.quantity)
-
-                if qty < 1:
-                    logger.info(f"SELL SKIP {sym}: Qty {qty} < 1")
-                    continue
-                value = ask * qty
-                if value < SELL_ORDER_MINIMUM_USDT_COIN_VALUE:
-                    logger.info(f"SELL SKIP {sym}: Value ${value:.2f} < ${SELL_ORDER_MINIMUM_USDT_COIN_VALUE}")
-                    continue
-
-                maker, taker = bot.get_trade_fees(sym)
-                gross_profit = (ask - entry) * qty
-                fee_cost = (maker + taker) * ask * qty
-                net_profit = gross_profit - fee_cost
-                if net_profit < MIN_PROFIT_USDT:
-                    continue
-
-                gross_pct = (ask - entry) / entry
-                required_gross = PROFIT_TARGET_NET + maker + taker
-                if gross_pct < required_gross:
-                    continue
-
-                rsi, _, _ = bot.get_rsi_and_trend(sym)
-                if rsi and rsi >= RSI_OVERBOUGHT:
-                    with bot.state_lock:
-                        trailing_sell_active[sym] = {'last_price': ask}
-                    bot.place_market_sell(sym, float(qty))
-                    logger.info(f"SELL TRIGGERED {sym} | Net ${net_profit:.2f} | {gross_pct*100:.2f}%")
-            time.sleep(POLL_INTERVAL)
-        except Exception as e:
-            logger.critical(f"Sell trigger error: {e}", exc_info=True)
-            time.sleep(10)
-
 
 # === DASHBOARD ==============================================================
 def print_professional_dashboard(client, bot):
@@ -734,7 +880,7 @@ def print_professional_dashboard(client, bot):
         RESET = "\033[0m"
 
         print(f"{'='*120}")
-        print(f"{BOLD}{'COIN TRADING BOT':^120}{RESET}")
+        print(f"{BOLD}{'SMART ORDER BOOK BOT':^120}{RESET}")
         print(f"{'='*120}\n")
 
         print(f"{BOLD}{'Time (CST)':<20}{RESET} {now}")
@@ -750,7 +896,7 @@ def print_professional_dashboard(client, bot):
         if db_positions:
             print(f"{BOLD}{'POSITIONS IN DATABASE':^120}{RESET}")
             print(f"{'-'*120}")
-            print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'NET P&L%':>10} {'PROFIT':>10} {'STATUS':<25}")
+            print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'MFI':>6} {'NET P&L%':>10} {'PROFIT':>10} {'STATUS':<25}")
             print(f"{'-'*120}")
             total_pnl = Decimal('0')
             for pos in db_positions:
@@ -760,7 +906,9 @@ def print_professional_dashboard(client, bot):
                 ob = bot.get_order_book_analysis(symbol)
                 cur_price = float(ob['best_bid'] or ob['best_ask'])
                 rsi, _, _ = bot.get_rsi_and_trend(symbol)
+                mfi = bot.get_mfi(symbol)
                 rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+                mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
 
                 maker, taker = bot.get_trade_fees(symbol)
                 gross = (cur_price - entry) * qty
@@ -771,9 +919,9 @@ def print_professional_dashboard(client, bot):
 
                 status = ("Trailing Sell Active" if symbol in trailing_sell_active
                           else "Trailing Buy Active" if symbol in trailing_buy_active
-                          else "24/7 Monitoring")
+                          else "Monitoring")
                 color = GREEN if net_profit > 0 else RED
-                print(f"{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {color}{pnl_pct:>9.2f}%{RESET} {color}{float(net_profit):>10.2f}{RESET} {status:<25}")
+                print(f"{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {mfi_str} {color}{pnl_pct:>9.2f}%{RESET} {color}{float(net_profit):>10.2f}{RESET} {status:<25}")
 
             print(f"{'-'*120}")
             pnl_color = GREEN if total_pnl > 0 else RED
@@ -786,7 +934,6 @@ def print_professional_dashboard(client, bot):
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
-
 # === ALERTS & MAIN ==========================================================
 def send_whatsapp_alert(msg):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
@@ -794,21 +941,14 @@ def send_whatsapp_alert(msg):
             requests.get(f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}", timeout=5)
         except: pass
 
-
-def buy_trigger_scanner(bot):
-    # Placeholder — implement your buy logic here
-    while True:
-        time.sleep(60)  # Prevent empty loop crash
-
-
 def main():
     if not API_KEY or not API_SECRET:
         logger.critical("API keys missing")
         sys.exit(1)
     bot = BinanceTradingBot()
 
-    threading.Thread(target=buy_trigger_scanner, args=(bot,), daemon=True).start()
-    threading.Thread(target=sell_trigger_scanner, args=(bot,), daemon=True).start()
+    threading.Thread(target=smart_buy_scanner, args=(bot,), daemon=True).start()
+    threading.Thread(target=smart_sell_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
@@ -820,7 +960,6 @@ def main():
             print_professional_dashboard(bot.client, bot)
             last_dash = time.time()
         time.sleep(1)
-
 
 if __name__ == "__main__":
     main()
