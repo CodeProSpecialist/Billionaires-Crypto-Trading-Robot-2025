@@ -39,7 +39,7 @@ CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
 
 MAX_PRICE = 1000.00
 MIN_PRICE = 0.01
-MIN_24H_VOLUME_USDT = 100000
+MIN_24H_VOLUME_USDT = 8000
 LOG_FILE = "crypto_trading_bot.log"
 DEBUG_LOG_FILE = "crypto_trading_bot_debug.log"
 
