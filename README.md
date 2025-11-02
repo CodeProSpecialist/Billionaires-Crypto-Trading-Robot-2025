@@ -6,8 +6,7 @@ Update to the newest version
 for the best working 
 trading robot python code. 
 Newest Python code updates were 
-finished by 2:00pm on 
-October 31, 2025. 
+finished on 11-2-2025. 
 
 *****
 
