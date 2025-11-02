@@ -734,7 +734,7 @@ def print_professional_dashboard(client, bot):
         RESET = "\033[0m"
 
         print(f"{'='*120}")
-        print(f"{BOLD}{CYAN}{'BINANCE.US TRADING BOT – PROFIT GUARANTEED':^120}{RESET}")
+        print(f"{BOLD}{'COIN TRADING BOT':^120}{RESET}")
         print(f"{'='*120}\n")
 
         print(f"{BOLD}{'Time (CST)':<20}{RESET} {now}")
@@ -748,7 +748,7 @@ def print_professional_dashboard(client, bot):
             db_positions = sess.query(Position).all()
 
         if db_positions:
-            print(f"{BOLD}{YELLOW}{'POSITIONS IN DATABASE':^120}{RESET}")
+            print(f"{BOLD}{'POSITIONS IN DATABASE':^120}{RESET}")
             print(f"{'-'*120}")
             print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'NET P&L%':>10} {'PROFIT':>10} {'STATUS':<25}")
             print(f"{'-'*120}")
