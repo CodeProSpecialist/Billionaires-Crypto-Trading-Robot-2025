@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BINANCE.US TRADING BOT – PROFIT & SIZE GUARANTEED
-- 1.0% NET profit + $1.00 min profit
+- 1.0% NET profit + $0.25 min profit
 - No sell if < $5.00 value or <1 coin
 - No buy if < $5.00 USDT cash
 - PRICE_FILTER & LOT_SIZE safe
@@ -817,4 +817,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
