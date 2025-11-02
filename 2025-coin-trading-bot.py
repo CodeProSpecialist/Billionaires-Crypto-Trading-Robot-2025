@@ -653,15 +653,18 @@ def smart_buy_scanner(bot):
                 ob = bot.get_order_book_analysis(sym)
                 if ob['best_bid'] <= 0: continue
 
+                current = to_decimal(ob['best_bid'])  # Convert to Decimal
                 rsi, _, _ = bot.get_rsi_and_trend(sym)
                 mfi = bot.get_mfi(sym)
                 volume_surge = bot.get_volume_surge(sym)
                 trend = bot.get_short_term_trend(sym)
                 macd, signal, _ = bot.get_macd(sym)
-                current = ob['best_bid']
 
-                high_1h, _ = get_1h_high_low(bot, sym)
-                dip_pct = (high_1h - current) / high_1h if high_1h > 0 else 0
+                # FIX: Convert high_1h to Decimal
+                high_1h_float, _ = get_1h_high_low(bot, sym)
+                high_1h = to_decimal(high_1h_float)
+                if high_1h <= 0: continue
+                dip_pct = float((high_1h - current) / high_1h)
 
                 conditions = [
                     rsi and rsi <= RSI_OVERSOLD,
@@ -681,7 +684,7 @@ def smart_buy_scanner(bot):
 
             time.sleep(5)
         except Exception as e:
-            logger.error(f"Smart buy error: {e}")
+            logger.error(f"Smart buy error: {e}", exc_info=True)
             time.sleep(10)
 
 # === SMART SELL SCANNER (Highest Price) =====================================
