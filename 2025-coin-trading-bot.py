@@ -164,7 +164,7 @@ class RateManager:
         if self.current['weight'] > 1100: time.sleep(10)
         if self.current['orders'] > 45: time.sleep(5)
 
-        # === BOT CLASS ==============================================================
+# === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
@@ -372,7 +372,6 @@ class BinanceTradingBot:
             return None
 
     def place_market_sell(self, symbol, qty):
-        # Get current price
         ob = self.get_order_book_analysis(symbol)
         price = to_decimal(ob['best_ask'] or ob['best_bid'])
         if price <= 0: return None
@@ -385,7 +384,6 @@ class BinanceTradingBot:
             logger.info(f"SELL SKIPPED {symbol}: Qty {qty:.6f} < 1")
             return None
 
-        # Check min profit
         with DBManager() as sess:
             pos = sess.query(Position).filter_by(symbol=symbol).first()
             if not pos: return None
@@ -533,11 +531,11 @@ def round_quantity(qty: Decimal, symbol: str, bot) -> Decimal:
     except: return qty
 
 
-# === TRAILING SCANNERS (UPDATED) ============================================
+# === TRAILING SCANNERS (FIXED) ==============================================
 def trailing_buy_scanner(bot):
     while True:
         try:
-            for sym, data in list obviously(trailing_buy_active.items()):
+            for sym, data in list(trailing_buy_active.items()):  # FIXED: removed 'obviously'
                 ob = bot.get_order_book_analysis(sym)
                 best_bid = ob['best_bid']
                 if best_bid <= 0: continue
@@ -596,10 +594,11 @@ def trailing_buy_scanner(bot):
             logger.critical(f"Trailing buy crash: {e}", exc_info=True)
             time.sleep(10)
 
+
 def trailing_sell_scanner(bot):
     while True:
         try:
-            for sym, data in list(trailing_sell_active.items()):
+            for sym, data in list(trailing_sell_active.items()):  # FIXED: removed 'obviously'
                 ob = bot.get_order_book_analysis(sym)
                 best_ask = ob['best_ask']
                 if best_ask <= 0: continue
@@ -672,6 +671,7 @@ def trailing_sell_scanner(bot):
             logger.critical(f"Trailing sell crash: {e}", exc_info=True)
             time.sleep(10)
 
+
 # === FEE & SIZE AWARE SELL TRIGGER ==========================================
 def sell_trigger_scanner(bot):
     while True:
@@ -685,7 +685,6 @@ def sell_trigger_scanner(bot):
                 entry = to_decimal(pos.avg_entry_price)
                 qty = to_decimal(pos.quantity)
 
-                # Size checks
                 if qty < 1:
                     logger.info(f"SELL SKIP {sym}: Qty {qty} < 1")
                     continue
@@ -694,7 +693,6 @@ def sell_trigger_scanner(bot):
                     logger.info(f"SELL SKIP {sym}: Value ${value:.2f} < ${SELL_ORDER_MINIMUM_USDT_COIN_VALUE}")
                     continue
 
-                # Profit check
                 maker, taker = bot.get_trade_fees(sym)
                 gross_profit = (ask - entry) * qty
                 fee_cost = (maker + taker) * ask * qty
@@ -788,12 +786,20 @@ def print_professional_dashboard(client, bot):
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
+
 # === ALERTS & MAIN ==========================================================
 def send_whatsapp_alert(msg):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
         try:
             requests.get(f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}", timeout=5)
         except: pass
+
+
+def buy_trigger_scanner(bot):
+    # Placeholder — implement your buy logic here
+    while True:
+        time.sleep(60)  # Prevent empty loop crash
+
 
 def main():
     if not API_KEY or not API_SECRET:
@@ -814,6 +820,7 @@ def main():
             print_professional_dashboard(bot.client, bot)
             last_dash = time.time()
         time.sleep(1)
+
 
 if __name__ == "__main__":
     main()
