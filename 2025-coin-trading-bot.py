@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-BINANCE.US LIVE TRADING BOT – FULLY FUNCTIONAL
-- Trailing Buy/Sell + MACD + 6MO Momentum
-- Auto-cancel orders >2h
-- Professional dashboard (FULLY INCLUDED)
+BINANCE.US LIVE TRADING BOT – PRODUCTION READY
+- Trailing Buy/Sell with order book
+- PRICE_FILTER & LOT_SIZE safe
+- Auto-cancel >2h
+- Full dashboard + WhatsApp alerts
 """
 
 import os
@@ -36,7 +37,7 @@ CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
 
 MAX_PRICE = 1000.00
 MIN_PRICE = 0.01
-MIN_24H_VOLUME_USDT = 8000
+MIN_24H_VOLUME_USDT = 100000
 LOG_FILE = "crypto_trading_bot.log"
 DEBUG_LOG_FILE = "crypto_trading_bot_debug.log"
 PROFIT_TARGET_NET = Decimal('0.008')
@@ -129,6 +130,7 @@ macd_cache: Dict[str, Tuple[float, float, float]] = {}
 momentum_cache: Dict[str, bool] = {}
 trailing_buy_active: Dict[str, dict] = {}
 trailing_sell_active: Dict[str, dict] = {}
+symbol_info_cache: Dict[str, dict] = {}
 last_fill_check = 0
 last_trade_timestamp = 0
 last_cancel_check = 0
@@ -155,8 +157,7 @@ class RateManager:
         if self.current['weight'] > 1100: time.sleep(10)
         if self.current['orders'] > 45: time.sleep(5)
 
-
-# === BOT CLASS ==============================================================
+        # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
@@ -463,7 +464,41 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Cancel check error: {e}")
 
-# === TRAILING SCANNERS ======================================================
+# === SYMBOL INFO & ROUNDING HELPERS =========================================
+def get_symbol_info(bot, symbol):
+    with bot.state_lock:
+        if symbol in symbol_info_cache:
+            return symbol_info_cache[symbol]
+    try:
+        with bot.api_lock:
+            bot.rate_manager.wait()
+            info = bot.client.get_symbol_info(symbol)
+            bot.rate_manager.update()
+        with bot.state_lock:
+            symbol_info_cache[symbol] = info
+        return info
+    except Exception as e:
+        logger.error(f"Failed to get symbol info {symbol}: {e}")
+        return None
+
+def round_price(price: Decimal, symbol: str, bot) -> Decimal:
+    info = get_symbol_info(bot, symbol)
+    if not info: return price
+    try:
+        tick_size = Decimal(info['filters'][1]['tickSize'])  # PRICE_FILTER
+        return (price // tick_size) * tick_size
+    except: return price
+
+def round_quantity(qty: Decimal, symbol: str, bot) -> Decimal:
+    info = get_symbol_info(bot, symbol)
+    if not info: return qty
+    try:
+        step_size = Decimal(info['filters'][2]['stepSize'])  # LOT_SIZE
+        return (qty // step_size) * step_size
+    except: return qty
+
+    
+# === TRAILING SCANNERS (PRODUCTION SAFE) ====================================
 def trailing_buy_scanner(bot):
     while True:
         try:
@@ -472,41 +507,58 @@ def trailing_buy_scanner(bot):
                 best_bid = ob['best_bid']
                 if best_bid <= 0: continue
 
-                last_price = data.get('last_price', best_bid)
+                last_price = Decimal(str(data.get('last_price', best_bid)))
                 target_price = best_bid * Decimal(str(1 - TRAILING_BUY_STEP_PCT))
 
-                if target_price < last_price:
-                    old_id = data.get('order_id')
-                    if old_id:
-                        try:
-                            with bot.api_lock:
-                                bot.rate_manager.wait()
-                                bot.client.cancel_order(symbol=sym, orderId=old_id)
-                                bot.rate_manager.update()
-                            logger.info(f"CANCELED trailing buy {sym} @ {last_price}")
-                        except: pass
+                if target_price >= last_price: continue
 
-                    usdt = float(bot.get_balance('USDT')) * RISK_PER_TRADE
-                    if usdt < MIN_BALANCE: continue
-
+                old_id = data.get('order_id')
+                if old_id:
                     try:
                         with bot.api_lock:
                             bot.rate_manager.wait()
-                            order = bot.client.order_limit_buy(
-                                symbol=sym,
-                                quantity=float(usdt / target_price),
-                                price=float(target_price)
-                            )
+                            bot.client.cancel_order(symbol=sym, orderId=old_id)
                             bot.rate_manager.update()
-                        with bot.state_lock:
-                            trailing_buy_active[sym] = {'order_id': order['orderId'], 'last_price': target_price}
-                        logger.info(f"TRAILING BUY {sym} @ {target_price:.6f}")
-                        send_whatsapp_alert(f"TRAIL BUY {sym} @ {target_price:.6f}")
-                    except Exception as e:
+                        logger.info(f"CANCELED trailing buy {sym} @ {last_price}")
+                    except: pass
+
+                usdt = float(bot.get_balance('USDT')) * RISK_PER_TRADE
+                if usdt < MIN_BALANCE: continue
+
+                target_price_rounded = round_price(target_price, sym, bot)
+                if target_price_rounded <= 0: continue
+
+                raw_qty = Decimal(str(usdt)) / target_price_rounded
+                qty = round_quantity(raw_qty, sym, bot)
+                if qty <= 0: continue
+
+                try:
+                    with bot.api_lock:
+                        bot.rate_manager.wait()
+                        order = bot.client.order_limit_buy(
+                            symbol=sym,
+                            quantity=float(qty),
+                            price=float(target_price_rounded)
+                        )
+                        bot.rate_manager.update()
+                    with bot.state_lock:
+                        trailing_buy_active[sym] = {
+                            'order_id': order['orderId'],
+                            'last_price': target_price_rounded
+                        }
+                    logger.info(f"TRAILING BUY {sym} {qty} @ {target_price_rounded}")
+                    send_whatsapp_alert(f"TRAIL BUY {sym} {qty} @ {target_price_rounded}")
+                except BinanceAPIException as e:
+                    if e.code == -1013:
+                        logger.warning(f"PRICE_FILTER buy {sym}, skipping")
+                    else:
                         logger.error(f"Trailing buy failed {sym}: {e}")
+                except Exception as e:
+                    logger.error(f"Trailing buy failed {sym}: {e}")
+
             time.sleep(POLL_INTERVAL)
         except Exception as e:
-            logger.critical(f"Trailing buy error: {e}", exc_info=True)
+            logger.critical(f"Trailing buy scanner crash: {e}", exc_info=True)
             time.sleep(10)
 
 def trailing_sell_scanner(bot):
@@ -517,46 +569,72 @@ def trailing_sell_scanner(bot):
                 best_ask = ob['best_ask']
                 if best_ask <= 0: continue
 
-                last_price = data.get('last_price', best_ask)
+                last_price = Decimal(str(data.get('last_price', best_ask)))
                 target_price = best_ask * Decimal(str(1 + TRAILING_SELL_STEP_PCT))
 
-                if target_price > last_price:
-                    old_id = data.get('order_id')
-                    if old_id:
-                        try:
-                            with bot.api_lock:
-                                bot.rate_manager.wait()
-                                bot.client.cancel_order(symbol=sym, orderId=old_id)
-                                bot.rate_manager.update()
-                            logger.info(f"CANCELED trailing sell {sym} @ {last_price}")
-                        except: pass
+                if target_price <= last_price: continue
 
-                    with DBManager() as sess:
-                        pos = sess.query(Position).filter_by(symbol=sym).first()
-                        if not pos or pos.quantity <= 0: continue
-                        qty = float(pos.quantity)
-
+                old_id = data.get('order_id')
+                if old_id:
                     try:
                         with bot.api_lock:
                             bot.rate_manager.wait()
-                            order = bot.client.order_limit_sell(
-                                symbol=sym,
-                                quantity=qty,
-                                price=float(target_price)
-                            )
+                            bot.client.cancel_order(symbol=sym, orderId=old_id)
                             bot.rate_manager.update()
+                        logger.info(f"CANCELED trailing sell {sym} @ {last_price}")
+                    except: pass
+
+                with DBManager() as sess:
+                    pos = sess.query(Position).filter_by(symbol=sym).first()
+                    if not pos or pos.quantity <= 0:
                         with bot.state_lock:
-                            trailing_sell_active[sym] = {'order_id': order['orderId'], 'last_price': target_price}
-                        logger.info(f"TRAILING SELL {sym} @ {target_price:.6f}")
-                        send_whatsapp_alert(f"TRAIL SELL {sym} @ {target_price:.6f}")
-                    except Exception as e:
+                            if sym in trailing_sell_active: del trailing_sell_active[sym]
+                        continue
+                    raw_qty = Decimal(str(pos.quantity))
+
+                qty = round_quantity(raw_qty, sym, bot)
+                if qty <= 0:
+                    logger.warning(f"Qty too small {sym}")
+                    continue
+
+                target_price_rounded = round_price(target_price, sym, bot)
+                if target_price_rounded <= 0: continue
+
+                try:
+                    with bot.api_lock:
+                        bot.rate_manager.wait()
+                        order = bot.client.order_limit_sell(
+                            symbol=sym,
+                            quantity=float(qty),
+                            price=float(target_price_rounded)
+                        )
+                        bot.rate_manager.update()
+                    with bot.state_lock:
+                        trailing_sell_active[sym] = {
+                            'order_id': order['orderId'],
+                            'last_price': target_price_rounded
+                        }
+                    logger.info(f"TRAILING SELL {sym} {qty} @ {target_price_rounded}")
+                    send_whatsapp_alert(f"TRAIL SELL {sym} {qty} @ {target_price_rounded}")
+                except BinanceAPIException as e:
+                    if e.code == -1013:
+                        logger.warning(f"PRICE_FILTER sell {sym}, using market")
+                        try:
+                            bot.place_market_sell(sym, float(qty))
+                            with bot.state_lock:
+                                if sym in trailing_sell_active: del trailing_sell_active[sym]
+                        except: pass
+                    else:
                         logger.error(f"Trailing sell failed {sym}: {e}")
+                except Exception as e:
+                    logger.error(f"Trailing sell failed {sym}: {e}")
+
             time.sleep(POLL_INTERVAL)
         except Exception as e:
-            logger.critical(f"Trailing sell error: {e}", exc_info=True)
+            logger.critical(f"Trailing sell scanner crash: {e}", exc_info=True)
             time.sleep(10)
 
-# === BUY/SELL TRIGGER SCANNERS ==============================================
+# === TRIGGER SCANNERS =======================================================
 def buy_trigger_scanner(bot):
     while True:
         try:
@@ -622,7 +700,7 @@ def print_professional_dashboard(client, bot):
         RESET = "\033[0m"
 
         print(f"{'='*120}")
-        print(f"{BOLD}{CYAN}{'TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
+        print(f"{BOLD}{CYAN}{'BINANCE.US TRADING BOT – LIVE DASHBOARD':^120}{RESET}")
         print(f"{'='*120}\n")
 
         print(f"{BOLD}{'Time (CST)':<20}{RESET} {now}")
