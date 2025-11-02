@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BINANCE.US SMART TRADING BOT – ORDER BOOK + INDICATORS
+SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS
 - Buy at lowest: order book sell pressure + MFI/RSI + volume dip
 - Sell at highest: order book buy pressure + MFI/RSI + volume climax
 - Trailing buy/sell with smart activation
@@ -880,7 +880,7 @@ def print_professional_dashboard(client, bot):
         RESET = "\033[0m"
 
         print(f"{'='*120}")
-        print(f"{BOLD}{'SMART ORDER BOOK BOT':^120}{RESET}")
+        print(f"{BOLD}{' SMART COIN TRADING BOT ':^120}{RESET}")
         print(f"{'='*120}\n")
 
         print(f"{BOLD}{'Time (CST)':<20}{RESET} {now}")
