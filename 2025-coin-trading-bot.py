@@ -328,7 +328,6 @@ def trigger_volume_alert(symbol: str, current_vol: float, avg_vol: float, bot):
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
-        self.client.API_URL = 'https://api.binance.us/api/v3'
         self.rate_manager = RateManager(self.client)
         self.api_lock = threading.Lock()
         self.state_lock = threading.Lock()
