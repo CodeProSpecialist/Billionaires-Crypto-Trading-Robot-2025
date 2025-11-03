@@ -1272,19 +1272,18 @@ def update_mutable_cells(
     header_table: Table,
     price_alert_panel: Panel,
     volume_alert_panel: Panel,
-    pos_table: Table  # type: ignore
+    pos_table: Table
 ):
     """
-    Updates all dynamic parts of the dashboard.
-    Rebuilds header and positions table — safest way with Rich.
+    Rebuilds header and ENTIRE pos_table from scratch.
+    This is the only safe way with Rich.
     """
-    global dashboard_skeleton, position_rows, panel_rows
-    global price_alert_flash, volume_alert_flash
+    global dashboard_skeleton, price_alert_flash, volume_alert_flash
 
-    if dashboard_skeleton is None or pos_table is None:
+    if dashboard_skeleton is None:
         return
 
-    # === 1. UPDATE HEADER (Rebuild) ===
+    # === 1. REBUILD HEADER ===
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
     total_portfolio, _ = bot.calculate_total_portfolio_value()
@@ -1300,25 +1299,15 @@ def update_mutable_cells(
         style="black"
     ))
 
-    # === 2. REBUILD POSITIONS TABLE ===
+    # === 2. REBUILD POSITIONS TABLE FROM SCRATCH ===
     total_pnl = Decimal('0')
-    active_symbols = set()
+    new_rows = []
 
     with DBManager() as sess:
         db_positions = sess.query(Position).all()
 
-    # Clear all rows except header and TOTAL row
-    while len(pos_table.rows) > 1:  # Keep header + TOTAL
-        pos_table.rows.pop(0)
-
-    position_rows.clear()
-    panel_rows.clear()
-
-    insert_idx = 0  # Start after header
-
     for pos in db_positions:
         sym = pos.symbol
-        active_symbols.add(sym)
         qty = float(pos.quantity)
         entry = float(pos.avg_entry_price)
 
@@ -1327,14 +1316,14 @@ def update_mutable_cells(
         rsi, _, _ = bot.get_rsi_and_trend(sym)
         mfi = bot.get_mfi(sym)
 
-        # === PRICE ALERT ===
+        # PRICE ALERT
         cache = price_alert_cache.get(sym, {})
         old_price = cache.get('last_price')
         if old_price and old_price > 0:
             trigger_price_alert(sym, old_price, cur_price, bot)
         price_alert_cache[sym] = {'last_price': cur_price}
 
-        # === VOLUME ALERT ===
+        # VOLUME ALERT
         try:
             with bot.api_lock:
                 bot.rate_manager.wait()
@@ -1343,21 +1332,15 @@ def update_mutable_cells(
             volumes = [float(k[5]) for k in klines]
             current_vol = volumes[-1]
             avg_vol = np.mean(volumes[:-1]) if len(volumes) > 1 else current_vol
-
             if sym not in volume_alert_cache:
                 volume_alert_cache[sym] = {'last_avg_vol': avg_vol, 'last_alert_ts': 0}
             else:
                 volume_alert_cache[sym]['last_avg_vol'] = avg_vol
-
             trigger_volume_alert(sym, current_vol, avg_vol, bot)
-        except Exception as e:
+        except:
             current_vol = 0.0
-            logger.debug(f"Volume check failed {sym}: {e}")
 
-        # === P&L & STYLING ===
-        rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
-        mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
-
+        # P&L
         maker, taker = bot.get_trade_fees(sym)
         gross = (cur_price - entry) * qty
         fee_cost = (maker + taker) * cur_price * qty
@@ -1375,39 +1358,41 @@ def update_mutable_cells(
             "Monitoring"
         )
 
-        # === INSERT POSITION ROW ===
-        position_rows[sym] = insert_idx
-        pos_table.insert_row(
-            insert_idx,
-            [
-                sym,
-                f"{qty:.6f}",
-                f"{entry:.6f}",
-                f"{cur_price:.6f}",
-                rsi_str,
-                mfi_str,
-                Text(f"{pnl_pct:+.2f}%", style=pnl_style),
-                Text(f"{float(net_profit):+.2f}", style=pnl_style),
-                Text(vol_str, style=vol_style),
-                status
-            ]
-        )
-        insert_idx += 1
+        # Add position row
+        new_rows.append([
+            sym,
+            f"{qty:.6f}",
+            f"{entry:.6f}",
+            f"{cur_price:.6f}",
+            f"{rsi:5.1f}" if rsi else "N/A",
+            f"{mfi:5.1f}" if mfi else "N/A",
+            Text(f"{pnl_pct:+.2f}%", style=pnl_style),
+            Text(f"{float(net_profit):+.2f}", style=pnl_style),
+            Text(vol_str, style=vol_style),
+            status
+        ])
 
-        # === DYNAMIC ORDER BOOK PANEL ===
+        # Add order book panel if active
         if sym in trailing_buy_active or sym in trailing_sell_active:
             thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
             panel = _make_orderbook_panel(sym, bot, thread)
-            pos_table.insert_row(insert_idx, [panel])
-            panel_rows[sym] = insert_idx
-            insert_idx += 1
+            new_rows.append([panel])
 
-    # === UPDATE TOTAL P&L ROW (last row) ===
-    total_row_idx = len(pos_table.rows) - 1
+    # Add TOTAL row
     pnl_style = "bold green" if total_pnl > 0 else "bold red"
-    pos_table.rows[total_row_idx].cells[8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
+    new_rows.append([
+        Text("TOTAL NET P&L", style="black bold"),
+        "", "", "", "", "", "", "",
+        Text(f"${float(total_pnl):+.2f}", style=pnl_style),
+        ""
+    ])
 
-    # === PRICE ALERT PANEL ===
+    # === REPLACE pos_table content ===
+    pos_table.rows.clear()
+    for row in new_rows:
+        pos_table.add_row(*row)
+
+    # === ALERT PANELS ===
     if price_alert_flash:
         sym, direction, pct = price_alert_flash
         color = "green" if direction == "UP" else "red"
@@ -1417,7 +1402,6 @@ def update_mutable_cells(
         price_alert_panel.renderable = ""
         price_alert_panel.style = ""
 
-    # === VOLUME ALERT PANEL ===
     if volume_alert_flash:
         sym, ratio = volume_alert_flash
         volume_alert_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}x ", style="bold black on yellow")
@@ -1436,7 +1420,7 @@ def update_mutable_cells(
     log_text = "[bold]REALTIME LOG (last 15 lines)[/]\n"
     for line in log_lines[-15:]:
         log_text += line[:140] + "\n"
-    if dashboard_skeleton and len(dashboard_skeleton.rows) > 0:
+    if len(dashboard_skeleton.rows) > 0:
         dashboard_skeleton.rows[-1].cells[0].renderable = log_text.rstrip()
 
 # === MAIN ===
