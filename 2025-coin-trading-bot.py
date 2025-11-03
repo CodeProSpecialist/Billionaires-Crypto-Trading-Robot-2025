@@ -8,7 +8,8 @@ SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS
 - LIMIT → MARKET fallback after 5 min
 - Fast-rising market sell
 - Realtime log window
-- Dynamic order-book ladder (appears/disappears without flicker)
+- Dynamic order-book ladder (appears/disappears)
+- BLACK TEXT TITLES, NO FLICKER
 """
 
 import os
@@ -733,7 +734,7 @@ class BinanceTradingBot:
 
                 limit_price = Decimal(order['price'])
                 ob = self.get_order_book_analysis(sym)
-                last_price = to_decimal(ob['best_bid'] if side == 'BUY' else ob['best_ask'])
+                last_price = to_decimal(ob['best_bid'] if side == 'BUY' else ob['best_best'])
                 if last_price <= 0:
                     logger.warning(f"[{sym}] No valid market price → skip fallback")
                     continue
@@ -1119,7 +1120,7 @@ def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
     content.add_row(top)
     content.add_row(ladder)
 
-    title = f"{symbol} Order Book ({thread_type})"
+    title = Text(f"{symbol} Order Book ({thread_type})", style="black")
     return Panel(content, title=title, border_style="bright_black", padding=(0,1))
 
 # === DASHBOARD: SKELETON + DYNAMIC UPDATES ===
@@ -1130,7 +1131,7 @@ def build_dashboard_skeleton(bot) -> Table:
     dashboard.add_column(justify="left")
     dashboard.add_column(justify="right")
 
-    # === HEADER ===
+    # === HEADER (BLACK TEXT) ===
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
     total_portfolio, _ = bot.calculate_total_portfolio_value()
@@ -1138,16 +1139,16 @@ def build_dashboard_skeleton(bot) -> Table:
 
     header = Table.grid(expand=True)
     header.add_column(justify="center")
-    header.add_row(Text("SMART COIN TRADING BOT", style="bold magenta"))
-    header.add_row(f"Time (CST): {now}")
-    header.add_row(f"Available USDT: ${usdt_free:,.6f}")
-    header.add_row(f"Portfolio Value: ${total_portfolio:,.6f}")
-    header.add_row(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}")
+    header.add_row(Text("SMART COIN TRADING BOT", style="black bold"))
+    header.add_row(Text(f"Time (CST): {now}", style="black"))
+    header.add_row(Text(f"Available USDT: ${usdt_free:,.6f}", style="black"))
+    header.add_row(Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black"))
+    header.add_row(Text(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}", style="black"))
     dashboard.add_row(Panel(header, box=box.DOUBLE, padding=(1, 2)))
     dashboard.add_row("")  # separator
 
     # === POSITIONS TABLE ===
-    pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+    pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="black bold")
     pos_table.add_column("SYMBOL", width=10)
     pos_table.add_column("QTY", justify="right", width=12)
     pos_table.add_column("ENTRY", justify="right", width=12)
@@ -1169,13 +1170,13 @@ def build_dashboard_skeleton(bot) -> Table:
         position_rows[sym] = idx
         pos_table.add_row(sym, "", "", "", "", "", "", "", "")
 
-    pos_table.add_row(Text("TOTAL NET P&L", style="bold"), "", "", "", "", "", "", "", "")
+    pos_table.add_row(Text("TOTAL NET P&L", style="black bold"), "", "", "", "", "", "", "", "")
 
     dashboard.add_row(pos_table)
     dashboard.add_row("")  # separator
 
-    # === LOG PANEL ===
-    log_panel = Panel("[bold]REALTIME LOG (last 15 lines)[/]", box=box.ROUNDED)
+    # === LOG PANEL (BLACK TITLE) ===
+    log_panel = Panel("[bold]REALTIME LOG (last 15 lines)[/]", box=box.ROUNDED, title=Text("Logs", style="black"))
     dashboard.add_row(log_panel)
 
     dashboard_skeleton = dashboard
@@ -1187,7 +1188,7 @@ def update_mutable_cells(bot):
     if dashboard_skeleton is None or pos_table is None:
         return
 
-    # === HEADER ===
+    # === HEADER (BLACK TEXT) ===
     header_panel = dashboard_skeleton.rows[0].cells[0]
     header_table = header_panel.renderable
     now = now_cst()
@@ -1195,10 +1196,10 @@ def update_mutable_cells(bot):
     total_portfolio, _ = bot.calculate_total_portfolio_value()
     total_portfolio = float(total_portfolio)
 
-    header_table.rows[1].cells[0] = f"Time (CST): {now}"
-    header_table.rows[2].cells[0] = f"Available USDT: ${usdt_free:,.6f}"
-    header_table.rows[3].cells[0] = f"Portfolio Value: ${total_portfolio:,.6f}"
-    header_table.rows[4].cells[0] = f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}"
+    header_table.rows[1][0] = Text(f"Time (CST): {now}", style="black")
+    header_table.rows[2][0] = Text(f"Available USDT: ${usdt_free:,.6f}", style="black")
+    header_table.rows[3][0] = Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black")
+    header_table.rows[4][0] = Text(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}", style="black")
 
     # === POSITIONS + ORDER BOOK PANEL ===
     total_pnl = Decimal('0')
@@ -1237,15 +1238,15 @@ def update_mutable_cells(bot):
 
         row_idx = position_rows.get(sym)
         if row_idx is not None:
-            r = pos_table.rows[row_idx]
-            r.cells[1] = f"{qty:.6f}"
-            r.cells[2] = f"{entry:.6f}"
-            r.cells[3] = f"{cur_price:.6f}"
-            r.cells[4] = rsi_str
-            r.cells[5] = mfi_str
-            r.cells[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
-            r.cells[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
-            r.cells[8] = status
+            row = pos_table.rows[row_idx]
+            row[1] = f"{qty:.6f}"
+            row[2] = f"{entry:.6f}"
+            row[3] = f"{cur_price:.6f}"
+            row[4] = rsi_str
+            row[5] = mfi_str
+            row[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
+            row[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
+            row[8] = status
 
         # === DYNAMIC ORDER BOOK PANEL ===
         is_active = sym in trailing_buy_active or sym in trailing_sell_active
@@ -1271,7 +1272,7 @@ def update_mutable_cells(bot):
         elif is_active and panel_row_idx is not None:
             thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
             panel = _make_orderbook_panel(sym, bot, thread)
-            pos_table.rows[panel_row_idx].cells[0] = panel
+            pos_table.rows[panel_row_idx][0] = panel
 
     # Clean stale panels
     for sym in list(panel_rows.keys()):
@@ -1286,9 +1287,9 @@ def update_mutable_cells(bot):
     # === TOTAL P&L ===
     total_row_idx = len(pos_table.rows) - 1
     pnl_style = "bold green" if total_pnl > 0 else "bold red"
-    pos_table.rows[total_row_idx].cells[8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
+    pos_table.rows[total_row_idx][8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
 
-    # === LOG PANEL ===
+    # === LOG PANEL (BLACK TITLE) ===
     log_lines = []
     while not log_queue.empty() and len(log_lines) < 15:
         log_lines.append(log_queue.get_nowait())
