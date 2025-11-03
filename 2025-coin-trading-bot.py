@@ -1069,26 +1069,26 @@ def print_professional_dashboard(client, bot):
         CYAN = "\033[36m"
         RESET = "\033[0m"
 
-        print(f"{'='*120}")
-        print(f"{BOLD}{' SMART COIN TRADING BOT ':^120}{RESET}")
-        print(f"{'='*120}\n")
+        print(f"{'='*130}")
+        print(f"{BOLD}{' SMART COIN TRADING BOT ':^130}{RESET}")
+        print(f"{'='*130}\n")
 
         print(f"{BOLD}{'Time (CST)':<20}{RESET} {now}")
         print(f"{BOLD}{'Available USDT':<20}{RESET} ${usdt_free:,.6f}")
         print(f"{BOLD}{'Portfolio Value':<20}{RESET} ${total_portfolio:,.6f}")
         print(f"{BOLD}{'Trailing Buys':<20}{RESET} {len(trailing_buy_active)}")
         print(f"{BOLD}{'Trailing Sells':<20}{RESET} {len(trailing_sell_active)}")
-        print(f"{'-'*120}\n")
+        print(f"{'-'*130}\n")
 
         # === POSITIONS TABLE ===
         with DBManager() as sess:
             db_positions = sess.query(Position).all()
 
         if db_positions:
-            print(f"{BOLD}{'POSITIONS IN DATABASE':^120}{RESET}")
-            print(f"{'-'*120}")
+            print(f"{BOLD}{'POSITIONS IN DATABASE':^130}{RESET}")
+            print(f"{'-'*130}")
             print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'MFI':>6} {'NET P&L%':>10} {'PROFIT':>10} {'STATUS':<25}")
-            print(f"{'-'*120}")
+            print(f"{'-'*130}")
             total_pnl = Decimal('0')
             for pos in db_positions:
                 symbol = pos.symbol
@@ -1114,46 +1114,61 @@ def print_professional_dashboard(client, bot):
                 color = GREEN if net_profit > 0 else RED
                 print(f"{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {mfi_str} {color}{pnl_pct:>9.2f}%{RESET} {color}{float(net_profit):>10.2f}{RESET} {status:<25}")
 
-            print(f"{'-'*120}")
+            print(f"{'-'*130}")
             pnl_color = GREEN if total_pnl > 0 else RED
-            print(f"{BOLD}{'TOTAL NET P&L (after fees)':<50}{RESET} {pnl_color}${float(total_pnl):>12,.2f}{RESET}\n")
+            print(f"{BOLD}{'TOTAL NET P&L (after fees)':<50}{RESET} {pnl_color}${float(total_pnl):>14,.2f}{RESET}\n")
         else:
             print(f"{YELLOW} No active positions.\n{RESET}")
 
-        # === TRAILING BUY ORDERS WITH ORDER BOOK IMBALANCE ===
+        # === TRAILING BUY ORDERS - LIVE ACTION ===
         if trailing_buy_active:
-            print(f"{BOLD}{'TRAILING BUY ORDERS (Order Book Pressure)':^120}{RESET}")
-            print(f"{'-'*120}")
+            print(f"{BOLD}{'TRAILING BUY ORDERS - LIVE':^130}{RESET}")
+            print(f"{'-'*130}")
+            print(f"{'SYMBOL':<12} {'TARGET PRICE':>15} {'BEST BID':>12} {'BUY %':>8} {'SELL %':>8} {'IMBALANCE':<20}")
+            print(f"{'-'*130}")
             for sym in sorted(trailing_buy_active.keys()):
+                data = trailing_buy_active[sym]
                 ob = bot.get_order_book_analysis(sym)
+                best_bid = ob['best_bid']
                 ask_pct = ob['ask_pct']
                 bid_pct = 1.0 - ask_pct
-                color = GREEN if bid_pct > ask_pct else RED
-                print(f"{sym:<12} {color}{bid_pct:>6.1%} BUY / {ask_pct:>6.1%} SELL{RESET}")
-            print(f"{'-'*120}\n")
+                target_price = Decimal(str(data.get('last_price', best_bid)))
+                color = GREEN if bid_pct > 0.6 else YELLOW if bid_pct > 0.4 else RED
+                imbalance = "STRONG BUY" if bid_pct > 0.7 else "BUY PRESSURE" if bid_pct > 0.5 else "NEUTRAL"
+                print(f"{sym:<12} {float(target_price):>15.6f} {float(best_bid):>12.6f} {color}{bid_pct:>7.1%}{RESET} {ask_pct:>7.1%} {imbalance:<20}")
+            print(f"{'-'*130}\n")
 
-        # === TRAILING SELL ORDERS WITH ORDER BOOK IMBALANCE ===
+        # === TRAILING SELL ORDERS - LIVE ACTION ===
         if trailing_sell_active:
-            print(f"{BOLD}{'TRAILING SELL ORDERS (Order Book Pressure)':^120}{RESET}")
-            print(f"{'-'*120}")
+            print(f"{BOLD}{'TRAILING SELL ORDERS - LIVE':^130}{RESET}")
+            print(f"{'-'*130}")
+            print(f"{'SYMBOL':<12} {'TARGET PRICE':>15} {'BEST ASK':>12} {'BUY %':>8} {'SELL %':>8} {'IMBALANCE':<20}")
+            print(f"{'-'*130}")
             for sym in sorted(trailing_sell_active.keys()):
+                data = trailing_sell_active[sym]
                 ob = bot.get_order_book_analysis(sym)
+                best_ask = ob['best_ask']
                 ask_pct = ob['ask_pct']
                 bid_pct = 1.0 - ask_pct
-                color = GREEN if ask_pct > bid_pct else RED
-                print(f"{sym:<12} {color}{bid_pct:>6.1%} BUY / {ask_pct:>6.1%} SELL{RESET}")
-            print(f"{'-'*120}\n")
+                target_price = Decimal(str(data.get('last_price', best_ask)))
+                color = GREEN if ask_pct > 0.6 else YELLOW if ask_pct > 0.4 else RED
+                imbalance = "STRONG SELL" if ask_pct > 0.7 else "SELL PRESSURE" if ask_pct > 0.5 else "NEUTRAL"
+                print(f"{sym:<12} {float(target_price):>15.6f} {float(best_ask):>12.6f} {bid_pct:>7.1%} {color}{ask_pct:>7.1%}{RESET} {imbalance:<20}")
+            print(f"{'-'*130}\n")
 
-        # === REALTIME LOG WINDOW ===
-        print(f"{'='*120}")
+        # === REALTIME LOG WINDOW - 80 LINES ===
+        print(f"{'='*130}")
         print(f"{BOLD}REALTIME LOG (last 80 lines){RESET}")
-        print(f"{'-'*120}")
+        print(f"{'-'*130}")
         lines = []
         while not log_queue.empty() and len(lines) < 80:
             lines.append(log_queue.get_nowait())
-        for line in lines[-12:]:
-            print(line[:118])
-        print(f"{'='*120}\n")
+        # Keep only last 80
+        recent_lines = lines[-80:]
+        for line in recent_lines:
+            # Truncate long lines
+            print(line[:128])
+        print(f"{'='*130}\n")
 
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
