@@ -1208,7 +1208,8 @@ def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
 # === DASHBOARD: SKELETON + DYNAMIC UPDATES ===
 def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     """
-    Builds the full dashboard skeleton and returns references to mutable parts.
+    Returns references to mutable components.
+    We will rebuild pos_table completely on update.
     """
     global dashboard_skeleton, pos_table, position_rows, panel_rows
 
@@ -1216,7 +1217,7 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     dashboard.add_column(justify="left")
     dashboard.add_column(justify="right")
 
-    # === HEADER TABLE (BLACK TEXT) ===
+    # === HEADER TABLE ===
     header_table = Table.grid(expand=True)
     header_table.add_column(justify="center")
     header_table.add_row(Text("SMART COIN TRADING BOT", style="black bold"))
@@ -1227,15 +1228,15 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
 
     header_panel = Panel(header_table, box=box.DOUBLE, padding=(1, 2))
     dashboard.add_row(header_panel)
-    dashboard.add_row("")  # separator
+    dashboard.add_row("")
 
     # === ALERT BARS ===
     price_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
     volume_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
-    dashboard.add_row(price_alert_panel)  # row 2
-    dashboard.add_row(volume_alert_panel)  # row 3
+    dashboard.add_row(price_alert_panel)
+    dashboard.add_row(volume_alert_panel)
 
-    # === POSITIONS TABLE ===
+    # === POSITIONS TABLE (EMPTY - will be rebuilt) ===
     pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="black bold")
     pos_table.add_column("SYMBOL", width=10)
     pos_table.add_column("QTY", justify="right", width=12)
@@ -1248,23 +1249,8 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     pos_table.add_column("VOLUME", justify="right", width=12)
     pos_table.add_column("STATUS", width=25)
 
-    position_rows.clear()
-    panel_rows.clear()
-
-    # Add placeholder rows for existing positions
-    with DBManager() as sess:
-        db_positions = sess.query(Position).all()
-
-    for idx, pos in enumerate(db_positions):
-        sym = pos.symbol
-        position_rows[sym] = idx
-        pos_table.add_row(sym, "", "", "", "", "", "", "", "", "")
-
-    # Add TOTAL row (will be updated later)
-    pos_table.add_row(Text("TOTAL NET P&L", style="black bold"), "", "", "", "", "", "", "", "", "")
-
     dashboard.add_row(pos_table)
-    dashboard.add_row("")  # separator
+    dashboard.add_row("")
 
     # === LOG PANEL ===
     log_panel = Panel(
@@ -1275,7 +1261,11 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     dashboard.add_row(log_panel)
 
     dashboard_skeleton = dashboard
+    position_rows.clear()
+    panel_rows.clear()
+
     return dashboard, header_table, price_alert_panel, volume_alert_panel, pos_table
+
 
 def update_mutable_cells(
     bot,
