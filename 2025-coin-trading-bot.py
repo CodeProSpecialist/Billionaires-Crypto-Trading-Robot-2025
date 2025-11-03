@@ -203,13 +203,14 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def format_volume(vol_usdt: float) -> str:
-    """Format large volume numbers with K/M suffixes."""
+    if vol_usdt >= 1_000_000_000:
+        return f"{vol_usdt/1_000_000_000:.2f}B"
     if vol_usdt >= 1_000_000:
-        return f"{vol_usdt/1_000_000:.1f}M"
-    elif vol_usdt >= 1_000:
-        return f"{vol_usdt/1_000:.0f}K"
-    else:
-        return f"{vol_usdt:.0f}"
+        return f"{vol_usdt/1_000_000:.2f}M"
+    if vol_usdt >= 1_000:
+        return f"{vol_usdt/1_000:.2f}K"
+    hundreds = int(round(vol_usdt / 100.0))
+    return f"{hundreds * 100}"
 
 # === RATE MANAGER ===========================================================
 class RateManager:
