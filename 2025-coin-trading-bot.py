@@ -1207,6 +1207,9 @@ def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
 
 # === DASHBOARD: SKELETON + DYNAMIC UPDATES ===
 def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
+    """
+    Builds the full dashboard skeleton and returns references to mutable parts.
+    """
     global dashboard_skeleton, pos_table, position_rows, panel_rows
 
     dashboard = Table.grid(expand=True, padding=(0, 1))
@@ -1229,8 +1232,8 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     # === ALERT BARS ===
     price_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
     volume_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
-    dashboard.add_row(price_alert_panel)
-    dashboard.add_row(volume_alert_panel)
+    dashboard.add_row(price_alert_panel)  # row 2
+    dashboard.add_row(volume_alert_panel)  # row 3
 
     # === POSITIONS TABLE ===
     pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="black bold")
@@ -1248,6 +1251,7 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     position_rows.clear()
     panel_rows.clear()
 
+    # Add placeholder rows for existing positions
     with DBManager() as sess:
         db_positions = sess.query(Position).all()
 
@@ -1256,6 +1260,7 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
         position_rows[sym] = idx
         pos_table.add_row(sym, "", "", "", "", "", "", "", "", "")
 
+    # Add TOTAL row (will be updated later)
     pos_table.add_row(Text("TOTAL NET P&L", style="black bold"), "", "", "", "", "", "", "", "", "")
 
     dashboard.add_row(pos_table)
