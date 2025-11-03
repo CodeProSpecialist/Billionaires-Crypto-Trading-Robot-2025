@@ -18,7 +18,7 @@ import talib
 import requests
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from collections import deque
 import threading
 import pytz
