@@ -136,27 +136,26 @@ TOTAL NET P&L (after fees)                         $112.00
 ═══════════════════════════════════════════════════════════════════════════════
 ```
 
-WHY 99% OF BOTS FAIL — AND THIS ONE WINS
-Most Bots
-THIS BOT
-Buy on green candle
-Waits for 6 confirmations
-Sell on red candle
-Sells only at climax
-Use 1 indicator
-Uses order book + 5 indicators
-Spam limit orders
-Smart activation + trailing
-Get rate-limited
-Built-in RateManager
-No alerts
-WhatsApp + Dashboard
+# WHY 99% OF BOTS FAIL — AND THIS ONE WINS
 
-WHO THIS IS FOR
-	•	Swing traders who want precision entries/exits
-	•	HODLers who want to buy dips automatically
-	•	Algo traders who want institutional-grade logic
-	•	Anyone tired of emotional trading
+| **Most Bots** | **THIS BOT** |
+|----------------|--------------|
+| Buy on green candle | Waits for 6 confirmations |
+| Sell on red candle | Sells only at climax |
+| Use 1 indicator | Uses order book + 5 indicators |
+| Spam limit orders | Smart activation + trailing |
+| Get rate-limited | Built-in RateManager |
+| No alerts | WhatsApp + Dashboard |
+
+---
+
+# WHO THIS IS FOR
+
+- Swing traders who want **precision entries/exits**
+- HODLers who want to **buy dips automatically**
+- Algo traders who want **institutional-grade logic**
+- Anyone **tired of emotional trading**
+
 
 
 Just add your Binance.US API keys + CallMeBot → RUN
