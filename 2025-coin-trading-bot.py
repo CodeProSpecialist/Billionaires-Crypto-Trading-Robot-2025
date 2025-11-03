@@ -1282,7 +1282,7 @@ def update_mutable_cells(
     header_table: Table,
     price_alert_panel: Panel,
     volume_alert_panel: Panel,
-    pos_table: RichTable  # type: ignore
+    pos_table: Table  # type: ignore
 ):
     """
     Updates all dynamic parts of the dashboard.
