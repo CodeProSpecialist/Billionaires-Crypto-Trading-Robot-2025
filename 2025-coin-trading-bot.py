@@ -223,7 +223,6 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def format_volume(vol_usdt: float) -> str:
-    """Format large volume numbers with K/M suffixes."""
     if vol_usdt >= 1_000_000:
         return f"{vol_usdt/1_000_000:.1f}M"
     elif vol_usdt >= 1_000:
@@ -1207,34 +1206,31 @@ def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
     return Panel(content, title=title, border_style="bright_black", padding=(0,1))
 
 # === DASHBOARD: SKELETON + DYNAMIC UPDATES ===
-def build_dashboard_skeleton(bot) -> Table:
+def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     global dashboard_skeleton, pos_table, position_rows, panel_rows
 
     dashboard = Table.grid(expand=True, padding=(0, 1))
     dashboard.add_column(justify="left")
     dashboard.add_column(justify="right")
 
-    # === HEADER (BLACK TEXT) ===
-    now = now_cst()
-    usdt_free = float(bot.get_balance('USDT'))
-    total_portfolio, _ = bot.calculate_total_portfolio_value()
-    total_portfolio = float(total_portfolio)
+    # === HEADER TABLE (BLACK TEXT) ===
+    header_table = Table.grid(expand=True)
+    header_table.add_column(justify="center")
+    header_table.add_row(Text("SMART COIN TRADING BOT", style="black bold"))
+    header_table.add_row(Text("Time (CST): ...", style="black"))
+    header_table.add_row(Text("Available USDT: $0.000000", style="black"))
+    header_table.add_row(Text("Portfolio Value: $0.000000", style="black"))
+    header_table.add_row(Text("Trailing Buys: 0 | Trailing Sells: 0", style="black"))
 
-    header = Table.grid(expand=True)
-    header.add_column(justify="center")
-    header.add_row(Text("SMART COIN TRADING BOT", style="black bold"))
-    header.add_row(Text(f"Time (CST): {now}", style="black"))
-    header.add_row(Text(f"Available USDT: ${usdt_free:,.6f}", style="black"))
-    header.add_row(Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black"))
-    header.add_row(Text(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}", style="black"))
-    dashboard.add_row(Panel(header, box=box.DOUBLE, padding=(1, 2)))
+    header_panel = Panel(header_table, box=box.DOUBLE, padding=(1, 2))
+    dashboard.add_row(header_panel)
     dashboard.add_row("")  # separator
 
     # === ALERT BARS ===
-    price_alert_panel = Panel("", box=box.DOUBLE, style="on red", height=3)
-    dashboard.add_row(price_alert_panel)  # -3
-    volume_alert_panel = Panel("", box=box.DOUBLE, style="on yellow", height=3)
-    dashboard.add_row(volume_alert_panel)  # -2
+    price_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
+    volume_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
+    dashboard.add_row(price_alert_panel)
+    dashboard.add_row(volume_alert_panel)
 
     # === POSITIONS TABLE ===
     pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="black bold")
@@ -1265,34 +1261,45 @@ def build_dashboard_skeleton(bot) -> Table:
     dashboard.add_row(pos_table)
     dashboard.add_row("")  # separator
 
-    # === LOG PANEL (BLACK TITLE) ===
-    log_panel = Panel("[bold]REALTIME LOG (last 15 lines)[/]", box=box.ROUNDED, title=Text("Logs", style="black"))
+    # === LOG PANEL ===
+    log_panel = Panel(
+        "[bold]REALTIME LOG (last 15 lines)[/]",
+        box=box.ROUNDED,
+        title=Text("Logs", style="black")
+    )
     dashboard.add_row(log_panel)
 
     dashboard_skeleton = dashboard
-    return dashboard
+    return dashboard, header_table, price_alert_panel, volume_alert_panel, pos_table
 
-def update_mutable_cells(bot):
-    global dashboard_skeleton, pos_table, position_rows, panel_rows, live
+def update_mutable_cells(
+    bot,
+    header_table: Table,
+    price_alert_panel: Panel,
+    volume_alert_panel: Panel,
+    pos_table: Table
+):
+    global dashboard_skeleton, position_rows, panel_rows
     global price_alert_flash, volume_alert_flash
 
     if dashboard_skeleton is None or pos_table is None:
         return
 
-    # === HEADER ===
-    header_panel = dashboard_skeleton.rows[0][0]
-    header_table = header_panel.renderable
+    # === UPDATE HEADER ===
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
     total_portfolio, _ = bot.calculate_total_portfolio_value()
     total_portfolio = float(total_portfolio)
 
-    header_table.rows[1][0] = Text(f"Time (CST): {now}", style="black")
-    header_table.rows[2][0] = Text(f"Available USDT: ${usdt_free:,.6f}", style="black")
-    header_table.rows[3][0] = Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black")
-    header_table.rows[4][0] = Text(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}", style="black")
+    header_table.rows[1].cells[0] = Text(f"Time (CST): {now}", style="black")
+    header_table.rows[2].cells[0] = Text(f"Available USDT: ${usdt_free:,.6f}", style="black")
+    header_table.rows[3].cells[0] = Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black")
+    header_table.rows[4].cells[0] = Text(
+        f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}",
+        style="black"
+    )
 
-    # === PRICE & VOLUME ALERT TRACKING ===
+    # === POSITIONS & ALERTS ===
     total_pnl = Decimal('0')
     active_symbols = set()
 
@@ -1315,8 +1322,7 @@ def update_mutable_cells(bot):
         old_price = cache.get('last_price')
         if old_price and old_price > 0:
             trigger_price_alert(sym, old_price, cur_price, bot)
-        price_alert_cache[sym] = price_alert_cache.get(sym, {})
-        price_alert_cache[sym]['last_price'] = cur_price
+        price_alert_cache[sym] = {'last_price': cur_price}
 
         # === VOLUME ALERT + CURRENT VOLUME ===
         try:
@@ -1329,7 +1335,7 @@ def update_mutable_cells(bot):
             avg_vol = np.mean(volumes[:-1]) if len(volumes) > 1 else current_vol
 
             if sym not in volume_alert_cache:
-                volume_alert_cache[sym] = {'last_avg_vol': avg_vol}
+                volume_alert_cache[sym] = {'last_avg_vol': avg_vol, 'last_alert_ts': 0}
             else:
                 volume_alert_cache[sym]['last_avg_vol'] = avg_vol
 
@@ -1361,22 +1367,22 @@ def update_mutable_cells(bot):
         row_idx = position_rows.get(sym)
         if row_idx is not None:
             row = pos_table.rows[row_idx]
-            row[1] = f"{qty:.6f}"
-            row[2] = f"{entry:.6f}"
-            row[3] = f"{cur_price:.6f}"
-            row[4] = rsi_str
-            row[5] = mfi_str
-            row[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
-            row[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
-            row[8] = Text(vol_str, style=vol_style)
-            row[9] = status
+            row.cells[1] = f"{qty:.6f}"
+            row.cells[2] = f"{entry:.6f}"
+            row.cells[3] = f"{cur_price:.6f}"
+            row.cells[4] = rsi_str
+            row.cells[5] = mfi_str
+            row.cells[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
+            row.cells[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
+            row.cells[8] = Text(vol_str, style=vol_style)
+            row.cells[9] = status
 
         # === DYNAMIC ORDER BOOK PANEL ===
         is_active = sym in trailing_buy_active or sym in trailing_sell_active
         panel_row_idx = panel_rows.get(sym)
 
         if is_active and panel_row_idx is None:
-            insert_idx = row_idx + 1 if row_idx is not None else len(pos_table.rows) - 1
+            insert_idx = row_idx + 1
             thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
             panel = _make_orderbook_panel(sym, bot, thread)
             pos_table.insert_row(insert_idx, [panel])
@@ -1395,9 +1401,9 @@ def update_mutable_cells(bot):
         elif is_active and panel_row_idx is not None:
             thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
             panel = _make_orderbook_panel(sym, bot, thread)
-            pos_table.rows[panel_row_idx][0] = panel
+            pos_table.rows[panel_row_idx].cells[0] = panel
 
-    # Clean stale panels
+    # === CLEAN STALE PANELS ===
     for sym in list(panel_rows.keys()):
         if sym not in active_symbols:
             idx = panel_rows[sym]
@@ -1407,42 +1413,42 @@ def update_mutable_cells(bot):
                 if i > idx:
                     panel_rows[s] = i - 1
 
-    # === TOTAL P&L ===
+    # === TOTAL P&L ROW ===
     total_row_idx = len(pos_table.rows) - 1
     pnl_style = "bold green" if total_pnl > 0 else "bold red"
-    pos_table.rows[total_row_idx][8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
+    pos_table.rows[total_row_idx].cells[8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
 
-    # === UPDATE PRICE ALERT BAR ===
-    price_alert_row_idx = len(dashboard_skeleton.rows) - 3
-    price_panel = dashboard_skeleton.rows[price_alert_row_idx][0]
+    # === PRICE ALERT PANEL ===
     if price_alert_flash:
         sym, direction, pct = price_alert_flash
         color = "green" if direction == "UP" else "red"
-        price_panel.renderable = Text(f" {direction} {sym} {pct:+.2%} ", style=f"bold white on {color}")
-        price_panel.style = f"on {color}"
+        price_alert_panel.renderable = Text(f" {direction} {sym} {pct:+.2%} ", style=f"bold white on {color}")
+        price_alert_panel.style = f"on {color}"
     else:
-        price_panel.renderable = ""
-        price_panel.style = ""
+        price_alert_panel.renderable = ""
+        price_alert_panel.style = ""
 
-    # === UPDATE VOLUME ALERT BAR ===
-    volume_alert_row_idx = len(dashboard_skeleton.rows) - 2
-    volume_panel = dashboard_skeleton.rows[volume_alert_row_idx][0]
+    # === VOLUME ALERT PANEL ===
     if volume_alert_flash:
         sym, ratio = volume_alert_flash
-        volume_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}× ", style="bold black on yellow")
-        volume_panel.style = "on yellow"
+        volume_alert_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}× ", style="bold black on yellow")
+        volume_alert_panel.style = "on yellow"
     else:
-        volume_panel.renderable = ""
-        volume_panel.style = ""
+        volume_alert_panel.renderable = ""
+        volume_alert_panel.style = ""
 
     # === LOG PANEL ===
     log_lines = []
     while not log_queue.empty() and len(log_lines) < 15:
-        log_lines.append(log_queue.get_nowait())
+        try:
+            log_lines.append(log_queue.get_nowait())
+        except:
+            break
     log_text = "[bold]REALTIME LOG (last 15 lines)[/]\n"
     for line in log_lines[-15:]:
         log_text += line[:140] + "\n"
-    dashboard_skeleton.rows[-1][0].renderable = log_text.rstrip()
+    if dashboard_skeleton and len(dashboard_skeleton.rows) > 0:
+        dashboard_skeleton.rows[-1].cells[0].renderable = log_text.rstrip()
 
 # === MAIN ===
 def main():
@@ -1456,7 +1462,8 @@ def main():
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    skeleton = build_dashboard_skeleton(bot)
+    # === BUILD DASHBOARD WITH REFERENCES ===
+    skeleton, header_tbl, price_panel, vol_panel, pos_tbl = build_dashboard_skeleton(bot)
 
     with Live(skeleton, refresh_per_second=0.125, console=console) as live_obj:
         global live
@@ -1469,7 +1476,7 @@ def main():
             bot.check_unfilled_limit_orders()
 
             if time.time() - last_dash >= 8:
-                update_mutable_cells(bot)
+                update_mutable_cells(bot, header_tbl, price_panel, vol_panel, pos_tbl)
                 live.update(skeleton)
                 last_dash = time.time()
 
