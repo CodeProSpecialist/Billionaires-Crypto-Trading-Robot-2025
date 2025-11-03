@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS
+SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS + ALERTS
 - Buy at lowest: order book sell pressure + MFI/RSI + volume dip
 - Sell at highest: order book buy pressure + MFI/RSI + volume climax
 - Trailing buy/sell with smart activation
@@ -10,6 +10,8 @@ SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS
 - Realtime log window
 - Dynamic order-book ladder (appears/disappears)
 - BLACK TEXT TITLES, NO FLICKER
+- PRICE + VOLUME ALERTS
+- VOLUME COLUMN IN TABLE
 """
 
 import os
@@ -96,6 +98,14 @@ MIN_MOMENTUM_GAIN = 0.25
 FALLBACK_TO_MARKET_AFTER = 300
 MAX_PRICE_DRIFT_PCT = 0.01
 FAST_RISE_FOR_MARKET_SELL = 0.003
+
+# === PRICE ALERTS ===========================================================
+PRICE_ALERT_PCT = 0.005        # 0.5% change in 1 min
+PRICE_ALERT_COOLDOWN = 30      # seconds
+
+# === VOLUME SPIKE ALERTS ====================================================
+VOLUME_SPIKE_MULTIPLIER = 3.0
+VOLUME_SPIKE_COOLDOWN = 60
 
 # === LOGGING ================================================================
 logger = logging.getLogger(__name__)
@@ -188,6 +198,12 @@ last_fill_check = 0
 last_trade_timestamp = 0
 last_cancel_check = 0
 
+# === PRICE & VOLUME ALERT STATE ===
+price_alert_cache: Dict[str, Dict] = {}
+price_alert_flash: Optional[Tuple[str, str, float]] = None
+volume_alert_cache: Dict[str, Dict] = {}
+volume_alert_flash: Optional[Tuple[str, float]] = None
+
 # === RICH CONSOLE & DASHBOARD STATE ===
 console = Console()
 dashboard_skeleton: Table = None
@@ -205,6 +221,15 @@ def to_decimal(v):
 
 def now_cst(): 
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def format_volume(vol_usdt: float) -> str:
+    """Format large volume numbers with K/M suffixes."""
+    if vol_usdt >= 1_000_000:
+        return f"{vol_usdt/1_000_000:.1f}M"
+    elif vol_usdt >= 1_000:
+        return f"{vol_usdt/1_000:.0f}K"
+    else:
+        return f"{vol_usdt:.0f}"
 
 # === RATE MANAGER ===========================================================
 class RateManager:
@@ -260,6 +285,64 @@ def price_change_last_n_sec(bot, symbol: str, seconds: int = 30) -> float:
         return (new - old) / old if old > 0 else 0.0
     except Exception:
         return 0.0
+
+# === PRICE ALERT ============================================================
+def trigger_price_alert(symbol: str, old_price: float, new_price: float, bot):
+    if old_price <= 0 or new_price <= 0:
+        return
+
+    pct_change = abs(new_price - old_price) / old_price
+    if pct_change < PRICE_ALERT_PCT:
+        return
+
+    now = time.time()
+    cache = price_alert_cache.get(symbol, {})
+    last_ts = cache.get('last_alert_ts', 0)
+    last_dir = cache.get('direction')
+
+    direction = "UP" if new_price > old_price else "DOWN"
+    if now - last_ts < PRICE_ALERT_COOLDOWN and last_dir == direction:
+        return
+
+    price_alert_cache[symbol] = {
+        'last_price': new_price,
+        'last_alert_ts': now,
+        'direction': direction
+    }
+
+    console.bell()
+    global price_alert_flash
+    price_alert_flash = (symbol, direction, pct_change)
+    threading.Timer(1.0, lambda: globals().update(price_alert_flash=None)).start()
+
+    send_whatsapp_alert(f"{direction} {symbol} {pct_change:+.2%} in 1 min!")
+    logger.warning(f"PRICE ALERT: {symbol} {direction} {pct_change:+.2%}")
+
+# === VOLUME ALERT ===========================================================
+def trigger_volume_alert(symbol: str, current_vol: float, avg_vol: float, bot):
+    if current_vol <= 0 or avg_vol <= 0:
+        return
+
+    ratio = current_vol / avg_vol
+    if ratio < VOLUME_SPIKE_MULTIPLIER:
+        return
+
+    now = time.time()
+    cache = volume_alert_cache.get(symbol, {})
+    last_ts = cache.get('last_alert_ts', 0)
+
+    if now - last_ts < VOLUME_SPIKE_COOLDOWN:
+        return
+
+    volume_alert_cache[symbol]['last_alert_ts'] = now
+
+    console.bell()
+    global volume_alert_flash
+    volume_alert_flash = (symbol, ratio)
+    threading.Timer(1.5, lambda: globals().update(volume_alert_flash=None)).start()
+
+    send_whatsapp_alert(f"VOLUME SPIKE {symbol} {ratio:.1f}× avg!")
+    logger.warning(f"VOLUME ALERT: {symbol} {ratio:.1f}× volume spike")
 
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
@@ -734,7 +817,7 @@ class BinanceTradingBot:
 
                 limit_price = Decimal(order['price'])
                 ob = self.get_order_book_analysis(sym)
-                last_price = to_decimal(ob['best_bid'] if side == 'BUY' else ob['best_best'])
+                last_price = to_decimal(ob['best_bid'] if side == 'BUY' else ob['best_ask'])
                 if last_price <= 0:
                     logger.warning(f"[{sym}] No valid market price → skip fallback")
                     continue
@@ -1147,6 +1230,12 @@ def build_dashboard_skeleton(bot) -> Table:
     dashboard.add_row(Panel(header, box=box.DOUBLE, padding=(1, 2)))
     dashboard.add_row("")  # separator
 
+    # === ALERT BARS ===
+    price_alert_panel = Panel("", box=box.DOUBLE, style="on red", height=3)
+    dashboard.add_row(price_alert_panel)  # -3
+    volume_alert_panel = Panel("", box=box.DOUBLE, style="on yellow", height=3)
+    dashboard.add_row(volume_alert_panel)  # -2
+
     # === POSITIONS TABLE ===
     pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="black bold")
     pos_table.add_column("SYMBOL", width=10)
@@ -1157,6 +1246,7 @@ def build_dashboard_skeleton(bot) -> Table:
     pos_table.add_column("MFI", justify="right", width=6)
     pos_table.add_column("P&L%", justify="right", width=10)
     pos_table.add_column("PROFIT $", justify="right", width=10)
+    pos_table.add_column("VOLUME", justify="right", width=12)
     pos_table.add_column("STATUS", width=25)
 
     position_rows.clear()
@@ -1168,9 +1258,9 @@ def build_dashboard_skeleton(bot) -> Table:
     for idx, pos in enumerate(db_positions):
         sym = pos.symbol
         position_rows[sym] = idx
-        pos_table.add_row(sym, "", "", "", "", "", "", "", "")
+        pos_table.add_row(sym, "", "", "", "", "", "", "", "", "")
 
-    pos_table.add_row(Text("TOTAL NET P&L", style="black bold"), "", "", "", "", "", "", "", "")
+    pos_table.add_row(Text("TOTAL NET P&L", style="black bold"), "", "", "", "", "", "", "", "", "")
 
     dashboard.add_row(pos_table)
     dashboard.add_row("")  # separator
@@ -1184,12 +1274,13 @@ def build_dashboard_skeleton(bot) -> Table:
 
 def update_mutable_cells(bot):
     global dashboard_skeleton, pos_table, position_rows, panel_rows, live
+    global price_alert_flash, volume_alert_flash
 
     if dashboard_skeleton is None or pos_table is None:
         return
 
-    # === HEADER (BLACK TEXT) ===
-    header_panel = dashboard_skeleton.rows[0].cells[0]
+    # === HEADER ===
+    header_panel = dashboard_skeleton.rows[0][0]
     header_table = header_panel.renderable
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
@@ -1201,7 +1292,7 @@ def update_mutable_cells(bot):
     header_table.rows[3][0] = Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black")
     header_table.rows[4][0] = Text(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}", style="black")
 
-    # === POSITIONS + ORDER BOOK PANEL ===
+    # === PRICE & VOLUME ALERT TRACKING ===
     total_pnl = Decimal('0')
     active_symbols = set()
 
@@ -1219,6 +1310,34 @@ def update_mutable_cells(bot):
         rsi, _, _ = bot.get_rsi_and_trend(sym)
         mfi = bot.get_mfi(sym)
 
+        # === PRICE ALERT ===
+        cache = price_alert_cache.get(sym, {})
+        old_price = cache.get('last_price')
+        if old_price and old_price > 0:
+            trigger_price_alert(sym, old_price, cur_price, bot)
+        price_alert_cache[sym] = price_alert_cache.get(sym, {})
+        price_alert_cache[sym]['last_price'] = cur_price
+
+        # === VOLUME ALERT + CURRENT VOLUME ===
+        try:
+            with bot.api_lock:
+                bot.rate_manager.wait()
+                klines = bot.client.get_klines(symbol=sym, interval='1m', limit=21)
+                bot.rate_manager.update()
+            volumes = [float(k[5]) for k in klines]
+            current_vol = volumes[-1]
+            avg_vol = np.mean(volumes[:-1]) if len(volumes) > 1 else current_vol
+
+            if sym not in volume_alert_cache:
+                volume_alert_cache[sym] = {'last_avg_vol': avg_vol}
+            else:
+                volume_alert_cache[sym]['last_avg_vol'] = avg_vol
+
+            trigger_volume_alert(sym, current_vol, avg_vol, bot)
+        except Exception as e:
+            current_vol = 0.0
+            logger.debug(f"Volume check failed {sym}: {e}")
+
         rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
         mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
 
@@ -1228,6 +1347,9 @@ def update_mutable_cells(bot):
         net_profit = Decimal(str(gross - fee_cost))
         pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
         total_pnl += net_profit
+
+        vol_str = format_volume(current_vol)
+        vol_style = "green" if current_vol > 100_000 else "bright_black"
 
         status = (
             "Trailing Sell Active" if sym in trailing_sell_active else
@@ -1246,7 +1368,8 @@ def update_mutable_cells(bot):
             row[5] = mfi_str
             row[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
             row[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
-            row[8] = status
+            row[8] = Text(vol_str, style=vol_style)
+            row[9] = status
 
         # === DYNAMIC ORDER BOOK PANEL ===
         is_active = sym in trailing_buy_active or sym in trailing_sell_active
@@ -1289,15 +1412,37 @@ def update_mutable_cells(bot):
     pnl_style = "bold green" if total_pnl > 0 else "bold red"
     pos_table.rows[total_row_idx][8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
 
-    # === LOG PANEL (BLACK TITLE) ===
+    # === UPDATE PRICE ALERT BAR ===
+    price_alert_row_idx = len(dashboard_skeleton.rows) - 3
+    price_panel = dashboard_skeleton.rows[price_alert_row_idx][0]
+    if price_alert_flash:
+        sym, direction, pct = price_alert_flash
+        color = "green" if direction == "UP" else "red"
+        price_panel.renderable = Text(f" {direction} {sym} {pct:+.2%} ", style=f"bold white on {color}")
+        price_panel.style = f"on {color}"
+    else:
+        price_panel.renderable = ""
+        price_panel.style = ""
+
+    # === UPDATE VOLUME ALERT BAR ===
+    volume_alert_row_idx = len(dashboard_skeleton.rows) - 2
+    volume_panel = dashboard_skeleton.rows[volume_alert_row_idx][0]
+    if volume_alert_flash:
+        sym, ratio = volume_alert_flash
+        volume_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}× ", style="bold black on yellow")
+        volume_panel.style = "on yellow"
+    else:
+        volume_panel.renderable = ""
+        volume_panel.style = ""
+
+    # === LOG PANEL ===
     log_lines = []
     while not log_queue.empty() and len(log_lines) < 15:
         log_lines.append(log_queue.get_nowait())
-
     log_text = "[bold]REALTIME LOG (last 15 lines)[/]\n"
     for line in log_lines[-15:]:
         log_text += line[:140] + "\n"
-    dashboard_skeleton.rows[-1].cells[0].renderable = log_text.rstrip()
+    dashboard_skeleton.rows[-1][0].renderable = log_text.rstrip()
 
 # === MAIN ===
 def main():
