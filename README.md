@@ -111,30 +111,6 @@ That’s what this bot says — in real time, 24/7, on Binance.US.
 | Thread-safe, rate-limited | **Stable** |
 | SQLite trade logging | **Auditable** |
 
-```bash
-
-LIVE DASHBOARD (REAL-TIME)
-═══════════════════════════════════════════════════════════════════════════════
-                        SMART COIN TRADING BOT
-═══════════════════════════════════════════════════════════════
-
-Time (CST)          2025-11-02 14:32:10 CST
-Available USDT      $1,248.500000
-Portfolio Value     $3,892.12
-Trailing Buys       2
-Trailing Sells      1
---------------------------------------------------------------------------------
-
-POSITIONS IN DATABASE
---------------------------------------------------------------------------------
-SYMBOL      QTY         ENTRY       CURRENT    RSI   MFI   NET P&L%    PROFIT   STATUS
---------------------------------------------------------------------------------
-BTCUSDT   0.021500   60200.00    61850.00   58.2  72.1    +2.41%    $54.20   Trailing Sell Active
-ETHUSDT   0.850000   4050.00     4120.00    32.1  24.8    +1.65%    $57.80   Monitoring
---------------------------------------------------------------------------------
-TOTAL NET P&L (after fees)                         $112.00
-═══════════════════════════════════════════════════════════════════════════════
-```
 
 # WHY 99% OF BOTS FAIL — AND THIS ONE WINS
 
@@ -172,7 +148,8 @@ SMART COIN TRADING BOT
 
 ```bash
 # 1. Install
-pip install python-binance sqlalchemy talib numpy requests
+
+pip3 install python-binance rich sqlalchemy pytz numpy TA-Lib requests
 
 # 2. Set env
 export BINANCE_API_KEY="your_key"
