@@ -5,9 +5,10 @@ SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS
 - Sell at highest: order book buy pressure + MFI/RSI + volume climax
 - Trailing buy/sell with smart activation
 - Full dashboard + WhatsApp alerts
-- LIMIT to MARKET fallback after 5 min
+- LIMIT → MARKET fallback after 5 min
 - Fast-rising market sell
 - Realtime log window
+- Dynamic order-book ladder (appears/disappears without flicker)
 """
 
 import os
@@ -70,8 +71,8 @@ SHORT_TREND_WINDOW = 15
 
 # === ORDER BOOK & TRAILING ==================================================
 ORDER_BOOK_DEPTH = 50
-ORDER_BOOK_IMBALANCE_BUY = 0.65   # >65% ask vol to sell pressure to buy
-ORDER_BOOK_IMBALANCE_SELL = 0.35  # <35% ask vol to buy pressure to sell
+ORDER_BOOK_IMBALANCE_BUY = 0.65
+ORDER_BOOK_IMBALANCE_SELL = 0.35
 TRAILING_BUY_STEP_PCT = 0.002
 TRAILING_SELL_STEP_PCT = 0.002
 CANCEL_AFTER_HOURS = 2.0
@@ -79,9 +80,9 @@ CANCEL_CHECK_INTERVAL = 300
 POLL_INTERVAL = 2.0
 
 # === TRAILING ACTIVATION ====================================================
-MIN_DIP_FOR_TRAIL_BUY = 0.015      # 1.5% drop from 1h high
-MIN_PROFIT_FOR_TRAIL_SELL = 0.012  # 1.2% gross
-MIN_RISE_FOR_TRAIL_SELL = 0.02     # 2.0% rise from 1h low
+MIN_DIP_FOR_TRAIL_BUY = 0.015
+MIN_PROFIT_FOR_TRAIL_SELL = 0.012
+MIN_RISE_FOR_TRAIL_SELL = 0.02
 
 # === TECHNICAL INDICATORS ===================================================
 MACD_FAST = 12
@@ -90,10 +91,10 @@ MACD_SIGNAL = 9
 MOMENTUM_LOOKBACK_DAYS = 180
 MIN_MOMENTUM_GAIN = 0.25
 
-# === LIMIT to MARKET FALLBACK ================================================
-FALLBACK_TO_MARKET_AFTER = 300          # 5 minutes
-MAX_PRICE_DRIFT_PCT = 0.01              # 1% drift to skip market
-FAST_RISE_FOR_MARKET_SELL = 0.003       # 0.3% rise in 30s to market sell
+# === LIMIT → MARKET FALLBACK ================================================
+FALLBACK_TO_MARKET_AFTER = 300
+MAX_PRICE_DRIFT_PCT = 0.01
+FAST_RISE_FOR_MARKET_SELL = 0.003
 
 # === LOGGING ================================================================
 logger = logging.getLogger(__name__)
@@ -186,8 +187,13 @@ last_fill_check = 0
 last_trade_timestamp = 0
 last_cancel_check = 0
 
-# === RICH CONSOLE ===
+# === RICH CONSOLE & DASHBOARD STATE ===
 console = Console()
+dashboard_skeleton: Table = None
+pos_table: Table = None
+position_rows: Dict[str, int] = {}
+panel_rows: Dict[str, int] = {}
+live: Live = None
 
 # === HELPERS ================================================================
 def safe_float(v, default=0.0): 
@@ -723,24 +729,24 @@ class BinanceTradingBot:
                     logger.error(f"Cancel stale {sym} {order_id}: {e}")
                     continue
 
-                logger.warning(f"[{sym}] Stale LIMIT {side} ID:{order_id} ({age_sec:.0f}s) to cancelled")
+                logger.warning(f"[{sym}] Stale LIMIT {side} ID:{order_id} ({age_sec:.0f}s) → cancelled")
 
                 limit_price = Decimal(order['price'])
                 ob = self.get_order_book_analysis(sym)
                 last_price = to_decimal(ob['best_bid'] if side == 'BUY' else ob['best_ask'])
                 if last_price <= 0:
-                    logger.warning(f"[{sym}] No valid market price to skip fallback")
+                    logger.warning(f"[{sym}] No valid market price → skip fallback")
                     continue
 
                 drift = abs((last_price - limit_price) / limit_price)
                 if drift > MAX_PRICE_DRIFT_PCT:
-                    logger.info(f"[{sym}] Price drift {drift:.2%} > {MAX_PRICE_DRIFT_PCT:.0%} to skip market")
+                    logger.info(f"[{sym}] Price drift {drift:.2%} > {MAX_PRICE_DRIFT_PCT:.0%} → skip market")
                     continue
 
                 if side == 'SELL':
                     rise = price_change_last_n_sec(self, sym, seconds=30)
                     if rise > FAST_RISE_FOR_MARKET_SELL:
-                        logger.info(f"[{sym}] Fast rise {rise:.2%} to immediate market SELL")
+                        logger.info(f"[{sym}] Fast rise {rise:.2%} → immediate market SELL")
                         self.place_market_sell(sym, float(remaining))
                         continue
 
@@ -759,8 +765,8 @@ class BinanceTradingBot:
                         )
                         self.rate_manager.update()
 
-                    logger.info(f"[{sym}] MARKET {market_side} {remaining} (limit to market fallback)")
-                    send_whatsapp_alert(f"{sym}: LIMIT stale to MARKET {market_side} {remaining}")
+                    logger.info(f"[{sym}] MARKET {market_side} {remaining} (limit → market fallback)")
+                    send_whatsapp_alert(f"{sym}: LIMIT stale → MARKET {market_side} {remaining}")
                     self.log_trade(symbol=sym, side=market_side, type='MARKET', qty=remaining, fallback=True)
 
                 except Exception as e:
@@ -1061,7 +1067,7 @@ def send_whatsapp_alert(msg):
         except: 
             pass
 
-# === RICH DASHBOARD FUNCTIONS ===
+# === ORDER BOOK PANEL (appears/disappears dynamically) ===
 def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
     ob = bot.get_order_book_analysis(symbol)
     raw_bids = ob.get('raw_bids', [])[:5]
@@ -1116,17 +1122,20 @@ def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
     title = f"{symbol} Order Book ({thread_type})"
     return Panel(content, title=title, border_style="bright_black", padding=(0,1))
 
-def make_dashboard(bot) -> Table:
+# === DASHBOARD: SKELETON + DYNAMIC UPDATES ===
+def build_dashboard_skeleton(bot) -> Table:
+    global dashboard_skeleton, pos_table, position_rows, panel_rows
+
     dashboard = Table.grid(expand=True, padding=(0, 1))
     dashboard.add_column(justify="left")
     dashboard.add_column(justify="right")
 
+    # === HEADER ===
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
     total_portfolio, _ = bot.calculate_total_portfolio_value()
     total_portfolio = float(total_portfolio)
 
-    # === HEADER ===
     header = Table.grid(expand=True)
     header.add_column(justify="center")
     header.add_row(Text("SMART COIN TRADING BOT", style="bold magenta"))
@@ -1137,95 +1146,157 @@ def make_dashboard(bot) -> Table:
     dashboard.add_row(Panel(header, box=box.DOUBLE, padding=(1, 2)))
     dashboard.add_row("")  # separator
 
-    # === POSITIONS ===
+    # === POSITIONS TABLE ===
+    pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+    pos_table.add_column("SYMBOL", width=10)
+    pos_table.add_column("QTY", justify="right", width=12)
+    pos_table.add_column("ENTRY", justify="right", width=12)
+    pos_table.add_column("CURRENT", justify="right", width=12)
+    pos_table.add_column("RSI", justify="right", width=6)
+    pos_table.add_column("MFI", justify="right", width=6)
+    pos_table.add_column("P&L%", justify="right", width=10)
+    pos_table.add_column("PROFIT $", justify="right", width=10)
+    pos_table.add_column("STATUS", width=25)
+
+    position_rows.clear()
+    panel_rows.clear()
+
     with DBManager() as sess:
         db_positions = sess.query(Position).all()
 
-    if db_positions:
-        pos_section = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
-        pos_section.add_column("SYMBOL", width=10)
-        pos_section.add_column("QTY", justify="right", width=12)
-        pos_section.add_column("ENTRY", justify="right", width=12)
-        pos_section.add_column("CURRENT", justify="right", width=12)
-        pos_section.add_column("RSI", justify="right", width=6)
-        pos_section.add_column("MFI", justify="right", width=6)
-        pos_section.add_column("P&L%", justify="right", width=10)
-        pos_section.add_column("PROFIT $", justify="right", width=10)
-        pos_section.add_column("STATUS", width=25)
+    for idx, pos in enumerate(db_positions):
+        sym = pos.symbol
+        position_rows[sym] = idx
+        pos_table.add_row(sym, "", "", "", "", "", "", "", "")
 
-        total_pnl = Decimal('0')
+    pos_table.add_row(Text("TOTAL NET P&L", style="bold"), "", "", "", "", "", "", "", "")
 
-        for pos in db_positions:
-            symbol = pos.symbol
-            qty = float(pos.quantity)
-            entry = float(pos.avg_entry_price)
-
-            ob = bot.get_order_book_analysis(symbol)
-            cur_price = float(ob['best_bid'] or ob['best_ask'])
-            rsi, _, _ = bot.get_rsi_and_trend(symbol)
-            mfi = bot.get_mfi(symbol)
-
-            rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
-            mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
-
-            maker, taker = bot.get_trade_fees(symbol)
-            gross = (cur_price - entry) * qty
-            fee_cost = (maker + taker) * cur_price * qty
-            net_profit = Decimal(str(gross - fee_cost))
-            pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
-            total_pnl += net_profit
-
-            status = (
-                "Trailing Sell Active" if symbol in trailing_sell_active else
-                "Trailing Buy Active" if symbol in trailing_buy_active else
-                "Monitoring"
-            )
-            pnl_style = "green" if net_profit > 0 else "red"
-
-            pos_section.add_row(
-                symbol,
-                f"{qty:.6f}",
-                f"{entry:.6f}",
-                f"{cur_price:.6f}",
-                rsi_str,
-                mfi_str,
-                Text(f"{pnl_pct:+.2f}%", style=pnl_style),
-                Text(f"{float(net_profit):+.2f}", style=pnl_style),
-                status
-            )
-
-            if symbol in trailing_buy_active or symbol in trailing_sell_active:
-                thread = "BUY THREAD" if symbol in trailing_buy_active else "SELL THREAD"
-                panel = _make_orderbook_panel(symbol, bot, thread)
-                pos_section.add_row(panel, colspan=9)
-
-        pnl_style = "bold green" if total_pnl > 0 else "bold red"
-        pos_section.add_row(
-            Text("TOTAL NET P&L", style="bold"),
-            "", "", "", "", "", "", "",
-            Text(f"${float(total_pnl):+.2f}", style=pnl_style)
-        )
-
-        dashboard.add_row(pos_section)
-    else:
-        dashboard.add_row(Panel("[yellow]No active positions.[/]", box=box.ROUNDED))
-
+    dashboard.add_row(pos_table)
     dashboard.add_row("")  # separator
 
-    # === LOGS ===
+    # === LOG PANEL ===
+    log_panel = Panel("[bold]REALTIME LOG (last 15 lines)[/]", box=box.ROUNDED)
+    dashboard.add_row(log_panel)
+
+    dashboard_skeleton = dashboard
+    return dashboard
+
+def update_mutable_cells(bot):
+    global dashboard_skeleton, pos_table, position_rows, panel_rows, live
+
+    if dashboard_skeleton is None or pos_table is None:
+        return
+
+    # === HEADER ===
+    header_panel = dashboard_skeleton.rows[0].cells[0]
+    header_table = header_panel.renderable
+    now = now_cst()
+    usdt_free = float(bot.get_balance('USDT'))
+    total_portfolio, _ = bot.calculate_total_portfolio_value()
+    total_portfolio = float(total_portfolio)
+
+    header_table.rows[1].cells[0] = f"Time (CST): {now}"
+    header_table.rows[2].cells[0] = f"Available USDT: ${usdt_free:,.6f}"
+    header_table.rows[3].cells[0] = f"Portfolio Value: ${total_portfolio:,.6f}"
+    header_table.rows[4].cells[0] = f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}"
+
+    # === POSITIONS + ORDER BOOK PANEL ===
+    total_pnl = Decimal('0')
+    active_symbols = set()
+
+    with DBManager() as sess:
+        db_positions = sess.query(Position).all()
+
+    for pos in db_positions:
+        sym = pos.symbol
+        active_symbols.add(sym)
+        qty = float(pos.quantity)
+        entry = float(pos.avg_entry_price)
+
+        ob = bot.get_order_book_analysis(sym)
+        cur_price = float(ob['best_bid'] or ob['best_ask'])
+        rsi, _, _ = bot.get_rsi_and_trend(sym)
+        mfi = bot.get_mfi(sym)
+
+        rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+        mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
+
+        maker, taker = bot.get_trade_fees(sym)
+        gross = (cur_price - entry) * qty
+        fee_cost = (maker + taker) * cur_price * qty
+        net_profit = Decimal(str(gross - fee_cost))
+        pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+        total_pnl += net_profit
+
+        status = (
+            "Trailing Sell Active" if sym in trailing_sell_active else
+            "Trailing Buy Active" if sym in trailing_buy_active else
+            "Monitoring"
+        )
+        pnl_style = "green" if net_profit > 0 else "red"
+
+        row_idx = position_rows.get(sym)
+        if row_idx is not None:
+            r = pos_table.rows[row_idx]
+            r.cells[1] = f"{qty:.6f}"
+            r.cells[2] = f"{entry:.6f}"
+            r.cells[3] = f"{cur_price:.6f}"
+            r.cells[4] = rsi_str
+            r.cells[5] = mfi_str
+            r.cells[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
+            r.cells[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
+            r.cells[8] = status
+
+        # === DYNAMIC ORDER BOOK PANEL ===
+        is_active = sym in trailing_buy_active or sym in trailing_sell_active
+        panel_row_idx = panel_rows.get(sym)
+
+        if is_active and panel_row_idx is None:
+            insert_idx = row_idx + 1 if row_idx is not None else len(pos_table.rows) - 1
+            thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
+            panel = _make_orderbook_panel(sym, bot, thread)
+            pos_table.insert_row(insert_idx, [panel])
+            for s, idx in list(panel_rows.items()):
+                if idx >= insert_idx:
+                    panel_rows[s] = idx + 1
+            panel_rows[sym] = insert_idx
+
+        elif not is_active and panel_row_idx is not None:
+            pos_table.remove_row(panel_row_idx)
+            del panel_rows[sym]
+            for s, idx in list(panel_rows.items()):
+                if idx > panel_row_idx:
+                    panel_rows[s] = idx - 1
+
+        elif is_active and panel_row_idx is not None:
+            thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
+            panel = _make_orderbook_panel(sym, bot, thread)
+            pos_table.rows[panel_row_idx].cells[0] = panel
+
+    # Clean stale panels
+    for sym in list(panel_rows.keys()):
+        if sym not in active_symbols:
+            idx = panel_rows[sym]
+            pos_table.remove_row(idx)
+            del panel_rows[sym]
+            for s, i in list(panel_rows.items()):
+                if i > idx:
+                    panel_rows[s] = i - 1
+
+    # === TOTAL P&L ===
+    total_row_idx = len(pos_table.rows) - 1
+    pnl_style = "bold green" if total_pnl > 0 else "bold red"
+    pos_table.rows[total_row_idx].cells[8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
+
+    # === LOG PANEL ===
     log_lines = []
     while not log_queue.empty() and len(log_lines) < 15:
         log_lines.append(log_queue.get_nowait())
 
-    log_table = Table.grid(expand=True)
-    log_table.add_column()
-    log_table.add_row("[bold]REALTIME LOG (last 15 lines)[/]")
+    log_text = "[bold]REALTIME LOG (last 15 lines)[/]\n"
     for line in log_lines[-15:]:
-        log_table.add_row(line[:140])
-
-    dashboard.add_row(log_table)
-
-    return dashboard
+        log_text += line[:140] + "\n"
+    dashboard_skeleton.rows[-1].cells[0].renderable = log_text.rstrip()
 
 # === MAIN ===
 def main():
@@ -1239,16 +1310,21 @@ def main():
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    # === LIVE DASHBOARD – 8-SECOND REFRESH ===
-    with Live(make_dashboard(bot), refresh_per_second=0.125, console=console) as live:
+    skeleton = build_dashboard_skeleton(bot)
+
+    with Live(skeleton, refresh_per_second=0.125, console=console) as live_obj:
+        global live
+        live = live_obj
         last_dash = time.time()
+
         while True:
             bot.check_fills_and_update_db()
             bot.cancel_old_orders()
             bot.check_unfilled_limit_orders()
 
             if time.time() - last_dash >= 8:
-                live.update(make_dashboard(bot))
+                update_mutable_cells(bot)
+                live.update(skeleton)
                 last_dash = time.time()
 
             time.sleep(1)
