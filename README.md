@@ -25,78 +25,91 @@ The Only Bot That Buys at the Bottom, Sells at the Top — With Proof
 “I don’t guess. I know when to buy and sell.”
 That’s what this bot says — in real time, 24/7, on Binance.US.
 
-WHAT IT DOES (IN 60 SECONDS)
-Goal
-How It Works
-Buy at the absolute lowest price
-Waits for order book sell pressure + RSI/MFI oversold + volume surge + price dip
-Sell at the absolute highest price
-Triggers only on buy pressure climax + RSI/MFI overbought + volume explosion
-Never misses the move
-Trailing limit orders ratchet up/down — never sells too early, never buys chasing
-No spam. No noise.
-6+ confirmations before any trade — institutional-grade precision
+# WHAT IT DOES (IN 60 SECONDS)
 
-THE TECH THAT MAKES IT UNSTOPPABLE
-Feature
-Why It Wins
-50-Level Order Book Engine
-Sees real liquidity walls and imbalance — not just best bid/ask
-RSI + MFI + MACD + Volume Surge
-4-layer confirmation — no false signals
-Price Trend Monitoring
-15-minute momentum filter — catches reversals early
-Smart Trailing Activation
-Only starts trailing when all stars align — saves API, avoids chop
-Binance.US Compliant
-PRICE_FILTER, LOT_SIZE, rate limits — never gets banned
-Auto-Cancel Old Orders (>2h)
-Keeps your account clean and fast
-Full Dashboard + WhatsApp Alerts
-You’re always in control — even from your phone
+## Goal
+- **Buy at the absolute lowest price**
+  - Waits for:
+    - Order book sell pressure  
+    - RSI/MFI oversold  
+    - Volume surge  
+    - Price dip  
 
-REAL EXAMPLE: HOW IT TRADES
-BUY SIGNAL (DIP HUNTING)
-BTCUSDT
-Order Book: 68% ask volume → sell pressure
-RSI: 32 (oversold)
-MFI: 24 (oversold)
-Volume: 3.1x surge
-Price: Down 1.8% from 1h high
-Trend: Bearish
-MACD: Below signal
-→ TRAILING BUY ACTIVATED @ $60,200
-→ Bot places limit buy 0.2% lower every time price drops → Buys at the exact bottom — no FOMO
+- **Sell at the absolute highest price**
+  - Triggers only on:
+    - Buy pressure climax  
+    - RSI/MFI overbought  
+    - Volume explosion  
 
-SELL SIGNAL (CLIMAX EXIT)
-ETHUSDT
-Order Book: 32% ask volume → buy pressure
-RSI: 68 (overbought)
-MFI: 78 (overbought)
-Volume: 4.2x surge
-Price: Up 3.1% from 1h low
-Profit: +1.8%
-MACD: Above signal
-→ TRAILING SELL ACTIVATED @ $4,120
-→ Bot raises sell order 0.2% higher every time price climbs → Sells at the peak — locks in max profit
+- **Never misses the move**
+  - Trailing limit orders ratchet up/down  
+  - Never sells too early, never buys chasing  
 
-PROVEN SAFETY & PERFORMANCE
-Feature
-Status
-No martingale, no leverage
-Safe
-Risk per trade: 10% of free USDT
-Controlled
-Min $5 USDT / $5 coin value
-No dust
-Min $0.25 net profit per trade
-Profitable
-Auto-sync with Binance
-Accurate
-Thread-safe, rate-limited
-Stable
-SQLite trade logging
-Auditable
+- **No spam. No noise.**
+  - 6+ confirmations before any trade  
+  - Institutional-grade precision  
+
+---
+
+# THE TECH THAT MAKES IT UNSTOPPABLE
+
+| **Feature** | **Why It Wins** |
+|--------------|----------------|
+| **50-Level Order Book Engine** | Sees real liquidity walls and imbalance — not just best bid/ask |
+| **RSI + MFI + MACD + Volume Surge** | 4-layer confirmation — no false signals |
+| **Price Trend Monitoring** | 15-minute momentum filter — catches reversals early |
+| **Smart Trailing Activation** | Only starts trailing when all stars align — saves API, avoids chop |
+| **Binance.US Compliant** | PRICE_FILTER, LOT_SIZE, rate limits — never gets banned |
+| **Auto-Cancel Old Orders (>2h)** | Keeps your account clean and fast |
+| **Full Dashboard + WhatsApp Alerts** | You’re always in control — even from your phone |
+
+---
+
+# REAL EXAMPLE: HOW IT TRADES
+
+## BUY SIGNAL (DIP HUNTING)
+**Pair:** BTCUSDT  
+- **Order Book:** 68% ask volume → sell pressure  
+- **RSI:** 32 *(oversold)*  
+- **MFI:** 24 *(oversold)*  
+- **Volume:** 3.1× surge  
+- **Price:** Down 1.8% from 1h high  
+- **Trend:** Bearish  
+- **MACD:** Below signal  
+
+**→ TRAILING BUY ACTIVATED @ $60,200**  
+- Bot places limit buy 0.2% lower each time price drops  
+- **Buys at the exact bottom — no FOMO**
+
+---
+
+## SELL SIGNAL (CLIMAX EXIT)
+**Pair:** ETHUSDT  
+- **Order Book:** 32% ask volume → buy pressure  
+- **RSI:** 68 *(overbought)*  
+- **MFI:** 78 *(overbought)*  
+- **Volume:** 4.2× surge  
+- **Price:** Up 3.1% from 1h low  
+- **Profit:** +1.8%  
+- **MACD:** Above signal  
+
+**→ TRAILING SELL ACTIVATED @ $4,120**  
+- Bot raises sell order 0.2% higher each time price climbs  
+- **Sells at the peak — locks in max profit**
+
+---
+
+# PROVEN SAFETY & PERFORMANCE
+
+| **Feature** | **Status** |
+|--------------|------------|
+| No martingale, no leverage | **Safe** |
+| Risk per trade: 10% of free USDT | **Controlled** |
+| Min $5 USDT / $5 coin value | **No dust** |
+| Min $0.25 net profit per trade | **Profitable** |
+| Auto-sync with Binance | **Accurate** |
+| Thread-safe, rate-limited | **Stable** |
+| SQLite trade logging | **Auditable** |
 
 ```bash
 
