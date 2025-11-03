@@ -1179,7 +1179,7 @@ def update_ascii_dashboard(bot):
 
     # Positions Table
     print("─" * 160)
-    print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'MFI':>6} {'P&L%':>10} {'PROFIT $':>12} {'VOLUME':>12} {'STATUS':<25}")
+    print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'MFI':>6} {'P&L%':>10} {'PROFIT $':>12} {'STATUS':<25}")
     print("─" * 160)
 
     total_pnl = 0.0
@@ -1221,7 +1221,7 @@ def update_ascii_dashboard(bot):
             "Monitoring"
         )
 
-        print(f"{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi:>6.1f} {mfi:>6.1f} {pnl_pct:>10.2f}% {pnl_style} {net_profit:>12.2f} {vol_str:>12} {status:<25}")
+        print(f"{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi:>6.1f} {mfi:>6.1f} {pnl_pct:>10.2f}% {pnl_style} {net_profit:>12.2f} {status:<25}")
 
         # Dynamic Order Book Panel
         if sym in trailing_buy_active or sym in trailing_sell_active:
