@@ -1208,16 +1208,21 @@ def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
 # === DASHBOARD: SKELETON + DYNAMIC UPDATES ===
 def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     """
-    Returns references to mutable components.
-    We will rebuild pos_table completely on update.
+    Builds the full dashboard skeleton.
+    Returns references to:
+        - header_table
+        - price_alert_panel
+        - volume_alert_panel
+        - pos_table (will be rebuilt)
     """
-    global dashboard_skeleton, pos_table, position_rows, panel_rows
+    global dashboard_skeleton
 
+    # === MAIN DASHBOARD LAYOUT ===
     dashboard = Table.grid(expand=True, padding=(0, 1))
     dashboard.add_column(justify="left")
     dashboard.add_column(justify="right")
 
-    # === HEADER TABLE ===
+    # === HEADER TABLE (BLACK TEXT) ===
     header_table = Table.grid(expand=True)
     header_table.add_column(justify="center")
     header_table.add_row(Text("SMART COIN TRADING BOT", style="black bold"))
@@ -1228,7 +1233,7 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
 
     header_panel = Panel(header_table, box=box.DOUBLE, padding=(1, 2))
     dashboard.add_row(header_panel)
-    dashboard.add_row("")
+    dashboard.add_row("")  # separator
 
     # === ALERT BARS ===
     price_alert_panel = Panel("", box=box.DOUBLE, style="", height=3)
@@ -1236,7 +1241,7 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     dashboard.add_row(price_alert_panel)
     dashboard.add_row(volume_alert_panel)
 
-    # === POSITIONS TABLE (EMPTY - will be rebuilt) ===
+    # === POSITIONS TABLE (EMPTY — WILL BE REBUILT) ===
     pos_table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="black bold")
     pos_table.add_column("SYMBOL", width=10)
     pos_table.add_column("QTY", justify="right", width=12)
@@ -1250,9 +1255,9 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     pos_table.add_column("STATUS", width=25)
 
     dashboard.add_row(pos_table)
-    dashboard.add_row("")
+    dashboard.add_row("")  # separator
 
-    # === LOG PANEL ===
+    # === LOG PANEL (WILL BE REBUILT) ===
     log_panel = Panel(
         "[bold]REALTIME LOG (last 15 lines)[/]",
         box=box.ROUNDED,
@@ -1260,7 +1265,10 @@ def build_dashboard_skeleton(bot) -> Tuple[Table, Table, Panel, Panel, Table]:
     )
     dashboard.add_row(log_panel)
 
+    # === SAVE GLOBAL REFERENCE ===
     dashboard_skeleton = dashboard
+
+    # === CLEAR STATE ===
     position_rows.clear()
     panel_rows.clear()
 
