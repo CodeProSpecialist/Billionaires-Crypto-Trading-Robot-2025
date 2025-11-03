@@ -45,6 +45,7 @@ from rich import box
 from rich.text import Text
 from rich.live import Live
 
+
 # === CONFIGURATION ===========================================================
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
@@ -1283,15 +1284,21 @@ def update_mutable_cells(
     pos_table: Table
 ):
     """
-    Rebuilds header and ENTIRE pos_table from scratch.
-    This is the only safe way with Rich.
+    Rebuilds:
+      - Header
+      - Positions table (with dynamic order book panels)
+      - Alert bars
+      - Log panel
+    NO ROW MUTATION. FULLY SAFE WITH RICH.
     """
     global dashboard_skeleton, price_alert_flash, volume_alert_flash
 
     if dashboard_skeleton is None:
         return
 
-    # === 1. REBUILD HEADER ===
+    # ===================================================================
+    # 1. REBUILD HEADER
+    # ===================================================================
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
     total_portfolio, _ = bot.calculate_total_portfolio_value()
@@ -1307,7 +1314,9 @@ def update_mutable_cells(
         style="black"
     ))
 
-    # === 2. REBUILD POSITIONS TABLE FROM SCRATCH ===
+    # ===================================================================
+    # 2. REBUILD POSITIONS TABLE FROM SCRATCH
+    # ===================================================================
     total_pnl = Decimal('0')
     new_rows = []
 
@@ -1319,19 +1328,22 @@ def update_mutable_cells(
         qty = float(pos.quantity)
         entry = float(pos.avg_entry_price)
 
+        # Get current price
         ob = bot.get_order_book_analysis(sym)
         cur_price = float(ob['best_bid'] or ob['best_ask'])
+
+        # Indicators
         rsi, _, _ = bot.get_rsi_and_trend(sym)
         mfi = bot.get_mfi(sym)
 
-        # PRICE ALERT
+        # === PRICE ALERT ===
         cache = price_alert_cache.get(sym, {})
         old_price = cache.get('last_price')
         if old_price and old_price > 0:
             trigger_price_alert(sym, old_price, cur_price, bot)
         price_alert_cache[sym] = {'last_price': cur_price}
 
-        # VOLUME ALERT
+        # === VOLUME ALERT ===
         try:
             with bot.api_lock:
                 bot.rate_manager.wait()
@@ -1340,15 +1352,18 @@ def update_mutable_cells(
             volumes = [float(k[5]) for k in klines]
             current_vol = volumes[-1]
             avg_vol = np.mean(volumes[:-1]) if len(volumes) > 1 else current_vol
+
             if sym not in volume_alert_cache:
                 volume_alert_cache[sym] = {'last_avg_vol': avg_vol, 'last_alert_ts': 0}
             else:
                 volume_alert_cache[sym]['last_avg_vol'] = avg_vol
-            trigger_volume_alert(sym, current_vol, avg_vol, bot)
-        except:
-            current_vol = 0.0
 
-        # P&L
+            trigger_volume_alert(sym, current_vol, avg_vol, bot)
+        except Exception as e:
+            current_vol = 0.0
+            logger.debug(f"Volume check failed {sym}: {e}")
+
+        # === P&L Calculation ===
         maker, taker = bot.get_trade_fees(sym)
         gross = (cur_price - entry) * qty
         fee_cost = (maker + taker) * cur_price * qty
@@ -1356,6 +1371,7 @@ def update_mutable_cells(
         pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100 if entry > 0 else 0
         total_pnl += net_profit
 
+        # === Styling ===
         vol_str = format_volume(current_vol)
         vol_style = "green" if current_vol > 100_000 else "bright_black"
         pnl_style = "green" if net_profit > 0 else "red"
@@ -1366,7 +1382,7 @@ def update_mutable_cells(
             "Monitoring"
         )
 
-        # Add position row
+        # === ADD POSITION ROW ===
         new_rows.append([
             sym,
             f"{qty:.6f}",
@@ -1380,13 +1396,13 @@ def update_mutable_cells(
             status
         ])
 
-        # Add order book panel if active
+        # === DYNAMIC ORDER BOOK PANEL ===
         if sym in trailing_buy_active or sym in trailing_sell_active:
             thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
             panel = _make_orderbook_panel(sym, bot, thread)
-            new_rows.append([panel])
+            new_rows.append([panel])  # Full row panel
 
-    # Add TOTAL row
+    # === ADD TOTAL P&L ROW ===
     pnl_style = "bold green" if total_pnl > 0 else "bold red"
     new_rows.append([
         Text("TOTAL NET P&L", style="black bold"),
@@ -1395,16 +1411,21 @@ def update_mutable_cells(
         ""
     ])
 
-    # === REPLACE pos_table content ===
+    # === REPLACE ALL ROWS IN pos_table ===
     pos_table.rows.clear()
     for row in new_rows:
         pos_table.add_row(*row)
 
-    # === ALERT PANELS ===
+    # ===================================================================
+    # 3. UPDATE ALERT PANELS
+    # ===================================================================
     if price_alert_flash:
         sym, direction, pct = price_alert_flash
         color = "green" if direction == "UP" else "red"
-        price_alert_panel.renderable = Text(f" {direction} {sym} {pct:+.2%} ", style=f"bold white on {color}")
+        price_alert_panel.renderable = Text(
+            f" {direction} {sym} {pct:+.2%} ",
+            style=f"bold white on {color}"
+        )
         price_alert_panel.style = f"on {color}"
     else:
         price_alert_panel.renderable = ""
@@ -1412,24 +1433,39 @@ def update_mutable_cells(
 
     if volume_alert_flash:
         sym, ratio = volume_alert_flash
-        volume_alert_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}x ", style="bold black on yellow")
+        volume_alert_panel.renderable = Text(
+            f" VOLUME {sym} {ratio:.1f}x ",
+            style="bold black on yellow"
+        )
         volume_alert_panel.style = "on yellow"
     else:
         volume_alert_panel.renderable = ""
         volume_alert_panel.style = ""
 
-    # === LOG PANEL ===
+    # ===================================================================
+    # 4. REBUILD LOG PANEL (NO MUTATION)
+    # ===================================================================
     log_lines = []
     while not log_queue.empty() and len(log_lines) < 15:
         try:
             log_lines.append(log_queue.get_nowait())
         except:
             break
+
     log_text = "[bold]REALTIME LOG (last 15 lines)[/]\n"
     for line in log_lines[-15:]:
         log_text += line[:140] + "\n"
+    log_text = log_text.rstrip()
+
+    new_log_panel = Panel(
+        log_text,
+        box=box.ROUNDED,
+        title=Text("Logs", style="black")
+    )
+
+    # Replace the last row in dashboard
     if len(dashboard_skeleton.rows) > 0:
-        dashboard_skeleton.rows[-1].cells[0].renderable = log_text.rstrip()
+        dashboard_skeleton.rows[-1] = new_log_panel
 
 # === MAIN ===
 def main():
