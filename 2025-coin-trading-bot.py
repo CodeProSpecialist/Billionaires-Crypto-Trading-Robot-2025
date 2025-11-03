@@ -5,7 +5,7 @@ SMART TRADING BOT for Binance.us – ORDER BOOK + INDICATORS
 - Sell at highest: order book buy pressure + MFI/RSI + volume climax
 - Trailing buy/sell with smart activation
 - Full dashboard + WhatsApp alerts
-- LIMIT → MARKET fallback after 5 min
+- LIMIT to MARKET fallback after 5 min
 - Fast-rising market sell
 - Realtime log window
 """
@@ -32,6 +32,14 @@ from binance.exceptions import BinanceAPIException
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
+
+# === RICH IMPORTS ===
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich import box
+from rich.text import Text
+from rich.live import Live
 
 # === CONFIGURATION ===========================================================
 API_KEY = os.getenv('BINANCE_API_KEY')
@@ -62,8 +70,8 @@ SHORT_TREND_WINDOW = 15
 
 # === ORDER BOOK & TRAILING ==================================================
 ORDER_BOOK_DEPTH = 50
-ORDER_BOOK_IMBALANCE_BUY = 0.65   # >65% ask vol → sell pressure → buy
-ORDER_BOOK_IMBALANCE_SELL = 0.35  # <35% ask vol → buy pressure → sell
+ORDER_BOOK_IMBALANCE_BUY = 0.65   # >65% ask vol to sell pressure to buy
+ORDER_BOOK_IMBALANCE_SELL = 0.35  # <35% ask vol to buy pressure to sell
 TRAILING_BUY_STEP_PCT = 0.002
 TRAILING_SELL_STEP_PCT = 0.002
 CANCEL_AFTER_HOURS = 2.0
@@ -82,10 +90,10 @@ MACD_SIGNAL = 9
 MOMENTUM_LOOKBACK_DAYS = 180
 MIN_MOMENTUM_GAIN = 0.25
 
-# === LIMIT → MARKET FALLBACK ================================================
+# === LIMIT to MARKET FALLBACK ================================================
 FALLBACK_TO_MARKET_AFTER = 300          # 5 minutes
-MAX_PRICE_DRIFT_PCT = 0.01              # 1% drift → skip market
-FAST_RISE_FOR_MARKET_SELL = 0.003       # 0.3% rise in 30s → market sell
+MAX_PRICE_DRIFT_PCT = 0.01              # 1% drift to skip market
+FAST_RISE_FOR_MARKET_SELL = 0.003       # 0.3% rise in 30s to market sell
 
 # === LOGGING ================================================================
 logger = logging.getLogger(__name__)
@@ -116,7 +124,6 @@ class QueueHandler(logging.Handler):
 queue_handler = QueueHandler()
 queue_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
 
-# Add all handlers (queue last so it doesn't interfere)
 logger.addHandler(main_handler)
 logger.addHandler(debug_handler)
 logger.addHandler(console_handler)
@@ -179,6 +186,9 @@ last_fill_check = 0
 last_trade_timestamp = 0
 last_cancel_check = 0
 
+# === RICH CONSOLE ===
+console = Console()
+
 # === HELPERS ================================================================
 def safe_float(v, default=0.0): 
     return float(v) if v and np.isfinite(float(v)) else default
@@ -231,7 +241,6 @@ def get_1h_high_low(bot, symbol) -> Tuple[float, float]:
         return 0.0, 0.0
 
 def price_change_last_n_sec(bot, symbol: str, seconds: int = 30) -> float:
-    """Return % change of the last price over the last `seconds` (positive = up)."""
     try:
         with bot.api_lock:
             bot.rate_manager.wait()
@@ -412,6 +421,8 @@ class BinanceTradingBot:
                     'sell_pressure' if ask_pct > ORDER_BOOK_IMBALANCE_BUY else
                     'balanced'
                 ),
+                'raw_bids': bids,
+                'raw_asks': asks,
                 'ts': now
             }
             with self.state_lock:
@@ -419,7 +430,7 @@ class BinanceTradingBot:
             return result
         except Exception as e:
             logger.error(f"Order book failed {symbol}: {e}")
-            return {'best_bid':0, 'best_ask':0, 'ask_pct':0.5, 'imbalance':'unknown', 'ts':now}
+            return {'best_bid':0, 'best_ask':0, 'ask_pct':0.5, 'imbalance':'unknown', 'raw_bids':[], 'raw_asks':[], 'ts':now}
 
     def get_rsi_and_trend(self, symbol):
         try:
@@ -679,12 +690,6 @@ class BinanceTradingBot:
             logger.error(f"Cancel check error: {e}")
 
     def check_unfilled_limit_orders(self):
-        """
-        Convert stale LIMIT orders (>5 min) to MARKET with drift & fast-rise logic.
-        - Cancels unfilled LIMIT orders older than FALLBACK_TO_MARKET_AFTER
-        - Skips market if price drift > MAX_PRICE_DRIFT_PCT
-        - For SELL: if price rises > FAST_RISE_FOR_MARKET_SELL in 30s → market sell immediately
-        """
         try:
             with self.api_lock:
                 self.rate_manager.wait()
@@ -696,13 +701,12 @@ class BinanceTradingBot:
                 sym = order['symbol']
                 order_id = order['orderId']
                 order_type = order['type']
-                side = order['side']  # 'BUY' or 'SELL'
+                side = order['side']
                 order_time = order['time']
                 qty = Decimal(order['origQty'])
                 filled = Decimal(order['executedQty'])
                 remaining = qty - filled
 
-                # Only process LIMIT orders that are completely unfilled
                 if order_type != 'LIMIT' or filled > 0:
                     continue
 
@@ -710,7 +714,6 @@ class BinanceTradingBot:
                 if age_sec < FALLBACK_TO_MARKET_AFTER:
                     continue
 
-                # === 1. Cancel the stale limit order ===
                 try:
                     with self.api_lock:
                         self.rate_manager.wait()
@@ -720,30 +723,27 @@ class BinanceTradingBot:
                     logger.error(f"Cancel stale {sym} {order_id}: {e}")
                     continue
 
-                logger.warning(f"[{sym}] Stale LIMIT {side} ID:{order_id} ({age_sec:.0f}s) → cancelled")
+                logger.warning(f"[{sym}] Stale LIMIT {side} ID:{order_id} ({age_sec:.0f}s) to cancelled")
 
-                # === 2. Drift guard: skip if price moved too far ===
                 limit_price = Decimal(order['price'])
                 ob = self.get_order_book_analysis(sym)
                 last_price = to_decimal(ob['best_bid'] if side == 'BUY' else ob['best_ask'])
                 if last_price <= 0:
-                    logger.warning(f"[{sym}] No valid market price → skip fallback")
+                    logger.warning(f"[{sym}] No valid market price to skip fallback")
                     continue
 
                 drift = abs((last_price - limit_price) / limit_price)
                 if drift > MAX_PRICE_DRIFT_PCT:
-                    logger.info(f"[{sym}] Price drift {drift:.2%} > {MAX_PRICE_DRIFT_PCT:.0%} → skip market")
+                    logger.info(f"[{sym}] Price drift {drift:.2%} > {MAX_PRICE_DRIFT_PCT:.0%} to skip market")
                     continue
 
-                # === 3. Fast-rising market sell (only for SELL side) ===
                 if side == 'SELL':
                     rise = price_change_last_n_sec(self, sym, seconds=30)
                     if rise > FAST_RISE_FOR_MARKET_SELL:
-                        logger.info(f"[{sym}] Fast rise {rise:.2%} → immediate market SELL")
+                        logger.info(f"[{sym}] Fast rise {rise:.2%} to immediate market SELL")
                         self.place_market_sell(sym, float(remaining))
-                        continue  # skip normal fallback
+                        continue
 
-                # === 4. Normal market fallback (remaining qty) ===
                 if remaining <= 0:
                     continue
 
@@ -759,8 +759,8 @@ class BinanceTradingBot:
                         )
                         self.rate_manager.update()
 
-                    logger.info(f"[{sym}] MARKET {market_side} {remaining} (limit → market fallback)")
-                    send_whatsapp_alert(f"{sym}: LIMIT stale → MARKET {market_side} {remaining}")
+                    logger.info(f"[{sym}] MARKET {market_side} {remaining} (limit to market fallback)")
+                    send_whatsapp_alert(f"{sym}: LIMIT stale to MARKET {market_side} {remaining}")
                     self.log_trade(symbol=sym, side=market_side, type='MARKET', qty=remaining, fallback=True)
 
                 except Exception as e:
@@ -1054,125 +1054,6 @@ def trailing_sell_scanner(bot):
             logger.critical(f"Trailing sell crash: {e}", exc_info=True)
             time.sleep(10)
 
-def print_professional_dashboard(client, bot):
-    try:
-        os.system('cls' if os.name == 'nt' else 'clear')
-        now = now_cst()
-        usdt_free = float(bot.get_balance('USDT'))
-        total_portfolio, _ = bot.calculate_total_portfolio_value()
-        total_portfolio = float(total_portfolio)
-
-        GREEN = "\033[32m"
-        RED = "\033[31m"
-        BOLD = "\033[1m"
-        YELLOW = "\033[33m"
-        CYAN = "\033[36m"
-        RESET = "\033[0m"
-
-        print(f"{'='*130}")
-        print(f"{BOLD}{' SMART COIN TRADING BOT ':^130}{RESET}")
-        print(f"{'='*130}\n")
-
-        print(f"{BOLD}{'Time (CST)':<20}{RESET} {now}")
-        print(f"{BOLD}{'Available USDT':<20}{RESET} ${usdt_free:,.6f}")
-        print(f"{BOLD}{'Portfolio Value':<20}{RESET} ${total_portfolio:,.6f}")
-        print(f"{BOLD}{'Trailing Buys':<20}{RESET} {len(trailing_buy_active)}")
-        print(f"{BOLD}{'Trailing Sells':<20}{RESET} {len(trailing_sell_active)}")
-        print(f"{'-'*130}\n")
-
-        # === POSITIONS TABLE ===
-        with DBManager() as sess:
-            db_positions = sess.query(Position).all()
-
-        if db_positions:
-            print(f"{BOLD}{'POSITIONS IN DATABASE':^130}{RESET}")
-            print(f"{'-'*130}")
-            print(f"{'SYMBOL':<10} {'QTY':>12} {'ENTRY':>12} {'CURRENT':>12} {'RSI':>6} {'MFI':>6} {'NET P&L%':>10} {'PROFIT':>10} {'STATUS':<25}")
-            print(f"{'-'*130}")
-            total_pnl = Decimal('0')
-            for pos in db_positions:
-                symbol = pos.symbol
-                qty = float(pos.quantity)
-                entry = float(pos.avg_entry_price)
-                ob = bot.get_order_book_analysis(symbol)
-                cur_price = float(ob['best_bid'] or ob['best_ask'])
-                rsi, _, _ = bot.get_rsi_and_trend(symbol)
-                mfi = bot.get_mfi(symbol)
-                rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
-                mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
-
-                maker, taker = bot.get_trade_fees(symbol)
-                gross = (cur_price - entry) * qty
-                fee_cost = (maker + taker) * cur_price * qty
-                net_profit = Decimal(str(gross - fee_cost))
-                pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
-                total_pnl += net_profit
-
-                status = ("Trailing Sell Active" if symbol in trailing_sell_active
-                          else "Trailing Buy Active" if symbol in trailing_buy_active
-                          else "Monitoring")
-                color = GREEN if net_profit > 0 else RED
-                print(f"{symbol:<10} {qty:>12.6f} {entry:>12.6f} {cur_price:>12.6f} {rsi_str} {mfi_str} {color}{pnl_pct:>9.2f}%{RESET} {color}{float(net_profit):>10.2f}{RESET} {status:<25}")
-
-            print(f"{'-'*130}")
-            pnl_color = GREEN if total_pnl > 0 else RED
-            print(f"{BOLD}{'TOTAL NET P&L (after fees)':<50}{RESET} {pnl_color}${float(total_pnl):>14,.2f}{RESET}\n")
-        else:
-            print(f"{YELLOW} No active positions.\n{RESET}")
-
-        # === TRAILING BUY ORDERS - LIVE ACTION ===
-        if trailing_buy_active:
-            print(f"{BOLD}{'TRAILING BUY ORDERS - LIVE':^130}{RESET}")
-            print(f"{'-'*130}")
-            print(f"{'SYMBOL':<12} {'TARGET PRICE':>15} {'BEST BID':>12} {'BUY %':>8} {'SELL %':>8} {'IMBALANCE':<20}")
-            print(f"{'-'*130}")
-            for sym in sorted(trailing_buy_active.keys()):
-                data = trailing_buy_active[sym]
-                ob = bot.get_order_book_analysis(sym)
-                best_bid = ob['best_bid']
-                ask_pct = ob['ask_pct']
-                bid_pct = 1.0 - ask_pct
-                target_price = Decimal(str(data.get('last_price', best_bid)))
-                color = GREEN if bid_pct > 0.6 else YELLOW if bid_pct > 0.4 else RED
-                imbalance = "STRONG BUY" if bid_pct > 0.7 else "BUY PRESSURE" if bid_pct > 0.5 else "NEUTRAL"
-                print(f"{sym:<12} {float(target_price):>15.6f} {float(best_bid):>12.6f} {color}{bid_pct:>7.1%}{RESET} {ask_pct:>7.1%} {imbalance:<20}")
-            print(f"{'-'*130}\n")
-
-        # === TRAILING SELL ORDERS - LIVE ACTION ===
-        if trailing_sell_active:
-            print(f"{BOLD}{'TRAILING SELL ORDERS - LIVE':^130}{RESET}")
-            print(f"{'-'*130}")
-            print(f"{'SYMBOL':<12} {'TARGET PRICE':>15} {'BEST ASK':>12} {'BUY %':>8} {'SELL %':>8} {'IMBALANCE':<20}")
-            print(f"{'-'*130}")
-            for sym in sorted(trailing_sell_active.keys()):
-                data = trailing_sell_active[sym]
-                ob = bot.get_order_book_analysis(sym)
-                best_ask = ob['best_ask']
-                ask_pct = ob['ask_pct']
-                bid_pct = 1.0 - ask_pct
-                target_price = Decimal(str(data.get('last_price', best_ask)))
-                color = GREEN if ask_pct > 0.6 else YELLOW if ask_pct > 0.4 else RED
-                imbalance = "STRONG SELL" if ask_pct > 0.7 else "SELL PRESSURE" if ask_pct > 0.5 else "NEUTRAL"
-                print(f"{sym:<12} {float(target_price):>15.6f} {float(best_ask):>12.6f} {bid_pct:>7.1%} {color}{ask_pct:>7.1%}{RESET} {imbalance:<20}")
-            print(f"{'-'*130}\n")
-
-        # === REALTIME LOG WINDOW - 80 LINES ===
-        print(f"{'='*130}")
-        print(f"{BOLD}REALTIME LOG (last 80 lines){RESET}")
-        print(f"{'-'*130}")
-        lines = []
-        while not log_queue.empty() and len(lines) < 80:
-            lines.append(log_queue.get_nowait())
-        # Keep only last 80
-        recent_lines = lines[-80:]
-        for line in recent_lines:
-            # Truncate long lines
-            print(line[:128])
-        print(f"{'='*130}\n")
-
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-
 def send_whatsapp_alert(msg):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
         try:
@@ -1180,6 +1061,173 @@ def send_whatsapp_alert(msg):
         except: 
             pass
 
+# === RICH DASHBOARD FUNCTIONS ===
+def _make_orderbook_panel(symbol: str, bot, thread_type: str) -> Panel:
+    ob = bot.get_order_book_analysis(symbol)
+    raw_bids = ob.get('raw_bids', [])[:5]
+    raw_asks = ob.get('raw_asks', [])[:5]
+    ask_pct = ob['ask_pct']
+    bid_pct = 1.0 - ask_pct
+
+    top = Table.grid(expand=True, padding=0)
+    top.add_column(width=28, justify="center")
+    top.add_column(width=12, justify="right")
+    top.add_column(width=12, justify="left")
+    top.add_column(width=28, justify="center")
+
+    buy_bar = "[green]" + "█" * int(28 * bid_pct) + "[/]"
+    sell_bar = "[red]" + "█" * int(28 * ask_pct) + "[/]"
+
+    top.add_row(buy_bar, f"{bid_pct:.1%}", f"{ask_pct:.1%}", sell_bar)
+
+    ladder = Table.grid(expand=True, padding=(0,1))
+    ladder.add_column(width=10, justify="right")
+    ladder.add_column(width=8, justify="right")
+    ladder.add_column(width=28, justify="right")
+    ladder.add_column(width=28, justify="left")
+    ladder.add_column(width=8, justify="left")
+    ladder.add_column(width=10, justify="left")
+
+    max_vol = max(
+        max(Decimal(b[1]) for b in raw_bids) if raw_bids else Decimal('0'),
+        max(Decimal(a[1]) for a in raw_asks) if raw_asks else Decimal('0')
+    ) or Decimal('1')
+
+    for i in range(5):
+        b_price = b_qty = b_bar = ""
+        a_price = a_qty = a_bar = ""
+
+        if i < len(raw_bids):
+            b_price = f"{float(raw_bids[i][0]):.6f}"
+            b_qty = f"{float(raw_bids[i][1]):.6f}"
+            b_bar = "[green]" + "█" * int(28 * Decimal(raw_bids[i][1]) / max_vol) + "[/]"
+
+        if i < len(raw_asks):
+            a_price = f"{float(raw_asks[i][0]):.6f}"
+            a_qty = f"{float(raw_asks[i][1]):.6f}"
+            a_bar = "[red]" + "█" * int(28 * Decimal(raw_asks[i][1]) / max_vol) + "[/]"
+
+        ladder.add_row(b_price, b_qty, b_bar, a_bar, a_qty, a_price)
+
+    content = Table.grid(expand=True)
+    content.add_row(top)
+    content.add_row(ladder)
+
+    title = f"{symbol} Order Book ({thread_type})"
+    return Panel(content, title=title, border_style="bright_black", padding=(0,1))
+
+def make_dashboard(bot) -> Table:
+    dashboard = Table.grid(expand=True, padding=(0, 1))
+    dashboard.add_column(justify="left")
+    dashboard.add_column(justify="right")
+
+    now = now_cst()
+    usdt_free = float(bot.get_balance('USDT'))
+    total_portfolio, _ = bot.calculate_total_portfolio_value()
+    total_portfolio = float(total_portfolio)
+
+    # === HEADER ===
+    header = Table.grid(expand=True)
+    header.add_column(justify="center")
+    header.add_row(Text("SMART COIN TRADING BOT", style="bold magenta"))
+    header.add_row(f"Time (CST): {now}")
+    header.add_row(f"Available USDT: ${usdt_free:,.6f}")
+    header.add_row(f"Portfolio Value: ${total_portfolio:,.6f}")
+    header.add_row(f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}")
+    dashboard.add_row(Panel(header, box=box.DOUBLE, padding=(1, 2)))
+    dashboard.add_row("")  # separator
+
+    # === POSITIONS ===
+    with DBManager() as sess:
+        db_positions = sess.query(Position).all()
+
+    if db_positions:
+        pos_section = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+        pos_section.add_column("SYMBOL", width=10)
+        pos_section.add_column("QTY", justify="right", width=12)
+        pos_section.add_column("ENTRY", justify="right", width=12)
+        pos_section.add_column("CURRENT", justify="right", width=12)
+        pos_section.add_column("RSI", justify="right", width=6)
+        pos_section.add_column("MFI", justify="right", width=6)
+        pos_section.add_column("P&L%", justify="right", width=10)
+        pos_section.add_column("PROFIT $", justify="right", width=10)
+        pos_section.add_column("STATUS", width=25)
+
+        total_pnl = Decimal('0')
+
+        for pos in db_positions:
+            symbol = pos.symbol
+            qty = float(pos.quantity)
+            entry = float(pos.avg_entry_price)
+
+            ob = bot.get_order_book_analysis(symbol)
+            cur_price = float(ob['best_bid'] or ob['best_ask'])
+            rsi, _, _ = bot.get_rsi_and_trend(symbol)
+            mfi = bot.get_mfi(symbol)
+
+            rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+            mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
+
+            maker, taker = bot.get_trade_fees(symbol)
+            gross = (cur_price - entry) * qty
+            fee_cost = (maker + taker) * cur_price * qty
+            net_profit = Decimal(str(gross - fee_cost))
+            pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+            total_pnl += net_profit
+
+            status = (
+                "Trailing Sell Active" if symbol in trailing_sell_active else
+                "Trailing Buy Active" if symbol in trailing_buy_active else
+                "Monitoring"
+            )
+            pnl_style = "green" if net_profit > 0 else "red"
+
+            pos_section.add_row(
+                symbol,
+                f"{qty:.6f}",
+                f"{entry:.6f}",
+                f"{cur_price:.6f}",
+                rsi_str,
+                mfi_str,
+                Text(f"{pnl_pct:+.2f}%", style=pnl_style),
+                Text(f"{float(net_profit):+.2f}", style=pnl_style),
+                status
+            )
+
+            if symbol in trailing_buy_active or symbol in trailing_sell_active:
+                thread = "BUY THREAD" if symbol in trailing_buy_active else "SELL THREAD"
+                panel = _make_orderbook_panel(symbol, bot, thread)
+                pos_section.add_row(panel, colspan=9)
+
+        pnl_style = "bold green" if total_pnl > 0 else "bold red"
+        pos_section.add_row(
+            Text("TOTAL NET P&L", style="bold"),
+            "", "", "", "", "", "", "",
+            Text(f"${float(total_pnl):+.2f}", style=pnl_style)
+        )
+
+        dashboard.add_row(pos_section)
+    else:
+        dashboard.add_row(Panel("[yellow]No active positions.[/]", box=box.ROUNDED))
+
+    dashboard.add_row("")  # separator
+
+    # === LOGS ===
+    log_lines = []
+    while not log_queue.empty() and len(log_lines) < 15:
+        log_lines.append(log_queue.get_nowait())
+
+    log_table = Table.grid(expand=True)
+    log_table.add_column()
+    log_table.add_row("[bold]REALTIME LOG (last 15 lines)[/]")
+    for line in log_lines[-15:]:
+        log_table.add_row(line[:140])
+
+    dashboard.add_row(log_table)
+
+    return dashboard
+
+# === MAIN ===
 def main():
     if not API_KEY or not API_SECRET:
         logger.critical("API keys missing")
@@ -1191,15 +1239,19 @@ def main():
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    last_dash = time.time()
-    while True:
-        bot.check_fills_and_update_db()
-        bot.cancel_old_orders()
-        bot.check_unfilled_limit_orders()
-        if time.time() - last_dash >= 30:
-            print_professional_dashboard(bot.client, bot)
-            last_dash = time.time()
-        time.sleep(1)
+    # === LIVE DASHBOARD – 8-SECOND REFRESH ===
+    with Live(make_dashboard(bot), refresh_per_second=0.125, console=console) as live:
+        last_dash = time.time()
+        while True:
+            bot.check_fills_and_update_db()
+            bot.cancel_old_orders()
+            bot.check_unfilled_limit_orders()
+
+            if time.time() - last_dash >= 8:
+                live.update(make_dashboard(bot))
+                last_dash = time.time()
+
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()
