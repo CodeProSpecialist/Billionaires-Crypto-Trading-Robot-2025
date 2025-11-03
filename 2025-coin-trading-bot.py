@@ -1282,34 +1282,49 @@ def update_mutable_cells(
     header_table: Table,
     price_alert_panel: Panel,
     volume_alert_panel: Panel,
-    pos_table: Table
+    pos_table: RichTable  # type: ignore
 ):
+    """
+    Updates all dynamic parts of the dashboard.
+    Rebuilds header and positions table — safest way with Rich.
+    """
     global dashboard_skeleton, position_rows, panel_rows
     global price_alert_flash, volume_alert_flash
 
     if dashboard_skeleton is None or pos_table is None:
         return
 
-    # === UPDATE HEADER ===
+    # === 1. UPDATE HEADER (Rebuild) ===
     now = now_cst()
     usdt_free = float(bot.get_balance('USDT'))
     total_portfolio, _ = bot.calculate_total_portfolio_value()
     total_portfolio = float(total_portfolio)
 
-    header_table.rows[1].cells[0] = Text(f"Time (CST): {now}", style="black")
-    header_table.rows[2].cells[0] = Text(f"Available USDT: ${usdt_free:,.6f}", style="black")
-    header_table.rows[3].cells[0] = Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black")
-    header_table.rows[4].cells[0] = Text(
+    header_table.rows.clear()
+    header_table.add_row(Text("SMART COIN TRADING BOT", style="black bold"))
+    header_table.add_row(Text(f"Time (CST): {now}", style="black"))
+    header_table.add_row(Text(f"Available USDT: ${usdt_free:,.6f}", style="black"))
+    header_table.add_row(Text(f"Portfolio Value: ${total_portfolio:,.6f}", style="black"))
+    header_table.add_row(Text(
         f"Trailing Buys: {len(trailing_buy_active)} | Trailing Sells: {len(trailing_sell_active)}",
         style="black"
-    )
+    ))
 
-    # === POSITIONS & ALERTS ===
+    # === 2. REBUILD POSITIONS TABLE ===
     total_pnl = Decimal('0')
     active_symbols = set()
 
     with DBManager() as sess:
         db_positions = sess.query(Position).all()
+
+    # Clear all rows except header and TOTAL row
+    while len(pos_table.rows) > 1:  # Keep header + TOTAL
+        pos_table.rows.pop(0)
+
+    position_rows.clear()
+    panel_rows.clear()
+
+    insert_idx = 0  # Start after header
 
     for pos in db_positions:
         sym = pos.symbol
@@ -1329,7 +1344,7 @@ def update_mutable_cells(
             trigger_price_alert(sym, old_price, cur_price, bot)
         price_alert_cache[sym] = {'last_price': cur_price}
 
-        # === VOLUME ALERT + CURRENT VOLUME ===
+        # === VOLUME ALERT ===
         try:
             with bot.api_lock:
                 bot.rate_manager.wait()
@@ -1349,6 +1364,7 @@ def update_mutable_cells(
             current_vol = 0.0
             logger.debug(f"Volume check failed {sym}: {e}")
 
+        # === P&L & STYLING ===
         rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
         mfi_str = f"{mfi:5.1f}" if mfi else "N/A"
 
@@ -1356,69 +1372,47 @@ def update_mutable_cells(
         gross = (cur_price - entry) * qty
         fee_cost = (maker + taker) * cur_price * qty
         net_profit = Decimal(str(gross - fee_cost))
-        pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100
+        pnl_pct = ((cur_price - entry) / entry - (maker + taker)) * 100 if entry > 0 else 0
         total_pnl += net_profit
 
         vol_str = format_volume(current_vol)
         vol_style = "green" if current_vol > 100_000 else "bright_black"
+        pnl_style = "green" if net_profit > 0 else "red"
 
         status = (
             "Trailing Sell Active" if sym in trailing_sell_active else
             "Trailing Buy Active" if sym in trailing_buy_active else
             "Monitoring"
         )
-        pnl_style = "green" if net_profit > 0 else "red"
 
-        row_idx = position_rows.get(sym)
-        if row_idx is not None:
-            row = pos_table.rows[row_idx]
-            row.cells[1] = f"{qty:.6f}"
-            row.cells[2] = f"{entry:.6f}"
-            row.cells[3] = f"{cur_price:.6f}"
-            row.cells[4] = rsi_str
-            row.cells[5] = mfi_str
-            row.cells[6] = Text(f"{pnl_pct:+.2f}%", style=pnl_style)
-            row.cells[7] = Text(f"{float(net_profit):+.2f}", style=pnl_style)
-            row.cells[8] = Text(vol_str, style=vol_style)
-            row.cells[9] = status
+        # === INSERT POSITION ROW ===
+        position_rows[sym] = insert_idx
+        pos_table.insert_row(
+            insert_idx,
+            [
+                sym,
+                f"{qty:.6f}",
+                f"{entry:.6f}",
+                f"{cur_price:.6f}",
+                rsi_str,
+                mfi_str,
+                Text(f"{pnl_pct:+.2f}%", style=pnl_style),
+                Text(f"{float(net_profit):+.2f}", style=pnl_style),
+                Text(vol_str, style=vol_style),
+                status
+            ]
+        )
+        insert_idx += 1
 
         # === DYNAMIC ORDER BOOK PANEL ===
-        is_active = sym in trailing_buy_active or sym in trailing_sell_active
-        panel_row_idx = panel_rows.get(sym)
-
-        if is_active and panel_row_idx is None:
-            insert_idx = row_idx + 1
+        if sym in trailing_buy_active or sym in trailing_sell_active:
             thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
             panel = _make_orderbook_panel(sym, bot, thread)
             pos_table.insert_row(insert_idx, [panel])
-            for s, idx in list(panel_rows.items()):
-                if idx >= insert_idx:
-                    panel_rows[s] = idx + 1
             panel_rows[sym] = insert_idx
+            insert_idx += 1
 
-        elif not is_active and panel_row_idx is not None:
-            pos_table.remove_row(panel_row_idx)
-            del panel_rows[sym]
-            for s, idx in list(panel_rows.items()):
-                if idx > panel_row_idx:
-                    panel_rows[s] = idx - 1
-
-        elif is_active and panel_row_idx is not None:
-            thread = "BUY THREAD" if sym in trailing_buy_active else "SELL THREAD"
-            panel = _make_orderbook_panel(sym, bot, thread)
-            pos_table.rows[panel_row_idx].cells[0] = panel
-
-    # === CLEAN STALE PANELS ===
-    for sym in list(panel_rows.keys()):
-        if sym not in active_symbols:
-            idx = panel_rows[sym]
-            pos_table.remove_row(idx)
-            del panel_rows[sym]
-            for s, i in list(panel_rows.items()):
-                if i > idx:
-                    panel_rows[s] = i - 1
-
-    # === TOTAL P&L ROW ===
+    # === UPDATE TOTAL P&L ROW (last row) ===
     total_row_idx = len(pos_table.rows) - 1
     pnl_style = "bold green" if total_pnl > 0 else "bold red"
     pos_table.rows[total_row_idx].cells[8] = Text(f"${float(total_pnl):+.2f}", style=pnl_style)
@@ -1436,7 +1430,7 @@ def update_mutable_cells(
     # === VOLUME ALERT PANEL ===
     if volume_alert_flash:
         sym, ratio = volume_alert_flash
-        volume_alert_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}× ", style="bold black on yellow")
+        volume_alert_panel.renderable = Text(f" VOLUME {sym} {ratio:.1f}x ", style="bold black on yellow")
         volume_alert_panel.style = "on yellow"
     else:
         volume_alert_panel.renderable = ""
