@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binance.US Dynamic Trailing Bot – MULTI-THREADED (Rate-Limit & Depth Aware)
+    Dynamic Trailing Bot – MULTI-THREADED (Rate-Limit & Depth Aware)
 - 1 extra thread for buy scanning
 - 1 extra thread for sell scanning
 - 1 thread for all trailing buys
@@ -952,7 +952,7 @@ def print_professional_dashboard(bot):
         os.system('cls' if os.name == 'nt' else 'clear')
 
         print(DIVIDER)
-        print(f"{BOLD}{'COIN TRADING BOT':^120}{RESET}")
+        print(f"{BOLD}{'SMART COIN TRADING BOT':^120}{RESET}")
         print(DIVIDER)
 
         now_str = now_cst()
