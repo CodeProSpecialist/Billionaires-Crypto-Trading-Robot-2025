@@ -273,6 +273,60 @@ class BinanceTradingBot:
             sess.commit()
         self.load_state_from_db()
 
+    # --------------------------------------------------------------------- #
+    # NEW: validate_and_adjust_order (replaces old helper)
+    # --------------------------------------------------------------------- #
+    def validate_and_adjust_order(self, symbol, side, order_type, quantity, price):
+        """
+        Validate and adjust quantity and price according to symbol filters.
+        Returns: (adjusted_dict, error_msg) or (None, error_msg)
+        """
+        try:
+            with self.api_lock:
+                self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+                info = self.client.get_symbol_info(symbol)
+                self.rate_manager.update_current()
+
+            # Extract filters
+            lot_filter = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+            price_filter = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
+
+            step_size = Decimal(lot_filter['stepSize'])
+            tick_size = Decimal(price_filter['tickSize'])
+            min_qty = Decimal(lot_filter.get('minQty', '0'))
+            min_notional = Decimal('0')
+            for f in info['filters']:
+                if f['filterType'] == 'MIN_NOTIONAL':
+                    min_notional = Decimal(f['notional'])
+                    break
+
+            # Adjust quantity
+            qty = to_decimal(quantity)
+            if qty < min_qty:
+                return None, f"Quantity {qty} < min {min_qty}"
+            qty = (qty // step_size) * step_size
+            if qty <= 0:
+                return None, "Adjusted quantity is zero"
+
+            # Adjust price
+            prc = to_decimal(price)
+            prc = (prc // tick_size) * tick_size
+            if prc <= 0:
+                return None, "Adjusted price is zero"
+
+            # Check min notional
+            if min_notional > 0 and qty * prc < min_notional:
+                return None, f"Notional {qty * prc} < min {min_notional}"
+
+            return {
+                'quantity': float(qty),
+                'price': float(prc)
+            }, None
+
+        except Exception as e:
+            logger.error(f"Filter validation error {symbol}: {e}")
+            return None, str(e)
+
     def load_state_from_db(self):
         with DBManager() as sess:
             for p in sess.query(Position).all():
@@ -778,8 +832,10 @@ class BinanceTradingBot:
                 send_whatsapp_alert(f"MARKET BUY {symbol} @ {fill:.6f}")
             else:
                 qty = alloc / price
-                adj, err = validate_and_adjust_order(self, symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price)
-                if not adj or err: return
+                adj, err = self.validate_and_adjust_order(symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price)
+                if not adj or err:
+                    logger.warning(f"Buy validation failed: {err}")
+                    return
                 order = self.place_limit_buy_with_tracking(symbol, str(adj['price']), adj['quantity'])
                 if order:
                     with self.state_lock:
@@ -888,8 +944,10 @@ class BinanceTradingBot:
             else:
                 tick = self.get_tick_size(symbol)
                 price = ((price // tick) + 1) * tick
-                adj, _ = validate_and_adjust_order(self, symbol, 'SELL', ORDER_TYPE_LIMIT, qty, price)
-                if not adj: return
+                adj, err = self.validate_and_adjust_order(symbol, 'SELL', ORDER_TYPE_LIMIT, qty, price)
+                if not adj or err:
+                    logger.warning(f"Sell validation failed: {err}")
+                    return
                 order = self.place_limit_sell_with_tracking(symbol, str(adj['price']), adj['quantity'])
                 if order:
                     with self.state_lock:
@@ -982,23 +1040,6 @@ def place_infinity_grid(bot, symbol):
         send_whatsapp_alert(f"GRID {symbol} | {grid_count} levels | ${usdt_per_grid}")
 
 # === HELPER FUNCTIONS =======================================================
-def validate_and_adjust_order(bot, symbol, side, order_type, quantity, price):
-    try:
-        with bot.api_lock:
-            bot.rate_manager.wait_if_needed('REQUEST_WEIGHT')
-            info = bot.client.get_symbol_info(symbol)
-            bot.rate_manager.update_current()
-        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-        price_f = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
-        step = Decimal(lot['stepSize'])
-        tick = Decimal(price_f['tickSize'])
-        qty = (quantity // step) * step
-        price = (price // tick) * tick
-        return {'quantity': float(qty), 'price': float(price)}, None
-    except Exception as e:
-        logger.error(f"Filter error {symbol}: {e}")
-        return None, "Filter error"
-
 def send_whatsapp_alert(message: str):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
         try:
@@ -1011,8 +1052,6 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # === DASHBOARD ==============================================================
-# **INFINITY GRID PRO DASHBOARD**  
-
 def print_professional_dashboard(bot):
     try:
         GREEN  = "\033[32m"
@@ -1028,12 +1067,10 @@ def print_professional_dashboard(bot):
 
         os.system('cls' if os.name == 'nt' else 'clear')
 
-        # === BLACK HEADER ===
         print(DIVIDER)
         print(f"{BOLD}{BLACK}{'INFINITY GRID + TRAILING HYBRID BOT':^120}{RESET}")
         print(DIVIDER)
 
-        # === TIME & BALANCE ===
         now_str = now_cst()
         usdt_free = bot.get_balance('USDT')
         total_port, _ = bot.calculate_total_portfolio_value()
@@ -1047,7 +1084,6 @@ def print_professional_dashboard(bot):
         print(f"Active Trailing Orders: {tbuy_cnt} buys, {tsel_cnt} sells")
         print(f"Active Grid Orders: {grid_count} ($5 each)")
 
-        # === STRATEGY MODE (NEW) ===
         balance = float(usdt_free)
         mode = "TRAILING MOMENTUM"
         grid_levels = 0
@@ -1064,7 +1100,6 @@ def print_professional_dashboard(bot):
         mode_color = GREEN if grid_count > 0 else YELLOW if tbuy_cnt + tsel_cnt > 0 else RED
         print(f"{BOLD}Strategy Mode:{RESET} {mode_color}{mode}{RESET}")
 
-        # === DEPTH IMBALANCE BARS (Top 10 by Volume) ===
         print(f"\n{BOLD}DEPTH IMBALANCE BARS (Top 10 by Volume){RESET}")
 
         sorted_symbols = sorted(
@@ -1100,7 +1135,6 @@ def print_professional_dashboard(bot):
 
         print(DIVIDER)
 
-        # === ORDER BOOK LADDER (Top 3 Grid or Volume Coins) ===
         print(f"{BOLD}ORDER BOOK LADDER (Top 3 Active Coins){RESET}")
         ladder_symbols = list(active_grid_symbols.keys())[:3]
         if not ladder_symbols:
@@ -1126,7 +1160,6 @@ def print_professional_dashboard(bot):
 
         print(DIVIDER)
 
-        # === CURRENT POSITIONS & P&L ===
         print(f"{BOLD}{'CURRENT POSITIONS & P&L':^120}{RESET}")
         print(f"{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}")
 
@@ -1150,7 +1183,6 @@ def print_professional_dashboard(bot):
             pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100 if entry > 0 else 0.0
             total_pnl += Decimal(str(net))
 
-            # === STATUS LOGIC ===
             status = "24/7 Monitoring"
             if sym in trailing_sell_active:
                 state = trailing_sell_active[sym]
@@ -1171,7 +1203,6 @@ def print_professional_dashboard(bot):
             print(f"{sym:<10} {qty:>12.6f} {entry:>12.6f} {cur:>12.6f} "
                   f"{rsi_str} {pct_color}{pnl_pct:>7.2f}%{RESET} {pnl_color}{net:>9.2f}{RESET} {status:<30}")
 
-        # Fill empty rows
         for _ in range(len(positions_list), 15):
             print(" " * 120)
 
@@ -1180,7 +1211,6 @@ def print_professional_dashboard(bot):
         print(f"TOTAL UNREALIZED PROFIT & LOSS: {total_pnl_color}${float(total_pnl):>12,.2f}{RESET}")
         print(DIVIDER)
 
-        # === MARKET OVERVIEW ===
         print(f"{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
 
         valid_cnt = len(valid_symbols_dict)
@@ -1190,7 +1220,6 @@ def print_professional_dashboard(bot):
         print(f"Average 24h Volume: ${avg_vol:,.0f}")
         print(f"Price Range: ${MIN_PRICE} to ${MAX_PRICE}")
 
-        # === Coin Buy List ===
         watch_items = []
         for sym in valid_symbols_dict:
             ob = bot.get_order_book_analysis(sym)
@@ -1215,7 +1244,6 @@ def print_professional_dashboard(bot):
     except Exception as e:
         logger.error(f"Dashboard print failed: {e}", exc_info=True)
         print(f"{RED}DASHBOARD ERROR: {e}{RESET}")
-        
 
 # === THREADS ================================================================
 def buy_scanner(bot):
@@ -1304,23 +1332,19 @@ def main():
             bot.check_and_process_filled_orders()
             now = time.time()
 
-            # === GRID MODE ===
             if now - last_grid_check > 60:
                 grid_count = calculate_grid_count(bot)
                 if grid_count > 0:
-                    # Only place on top 3 volatile coins
                     candidates = sorted(valid_symbols_dict.items(), key=lambda x: x[1]['volume'], reverse=True)[:3]
                     for sym, _ in candidates:
                         if sym not in active_grid_symbols:
                             place_infinity_grid(bot, sym)
                 else:
-                    # Below $40 → disable grid, keep trailing
                     for sym in list(active_grid_symbols.keys()):
                         active_grid_symbols.pop(sym, None)
                         send_whatsapp_alert(f"GRID OFF: {sym} (<$40)")
                 last_grid_check = now
 
-            # === DASHBOARD ===
             if now - last_dashboard >= 45:
                 print_professional_dashboard(bot)
                 last_dashboard = now
