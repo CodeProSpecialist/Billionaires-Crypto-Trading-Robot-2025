@@ -1322,47 +1322,34 @@ def sync_on_startup_and_daily(bot):
         except Exception as e:
             logger.error(f"Daily sync failed: {e}", exc_info=True)
 
+
 # === MAIN ===================================================================
 def main():
-    # --------------------------------------------------------------------- #
-    # 1. DB is created the moment the module is imported
-    #    (Base.metadata.create_all(engine) runs at import time)
-    # --------------------------------------------------------------------- #
     logger.info("Database file/tables ready (binance_trades.db)")
 
-    # --------------------------------------------------------------------- #
-    # 2. Wait 8 seconds before the first API sync
-    # --------------------------------------------------------------------- #
-    logger.info("Waiting 8 seconds before initial Binance sync...")
+    # 1. Wait 8 seconds after DB creation
+    logger.info("Waiting 8 seconds before starting bot...")
     time.sleep(8)
 
-    # --------------------------------------------------------------------- #
-    # 3. Initialise the bot – this also runs sync_positions_from_binance()
-    # --------------------------------------------------------------------- #
-    bot = BinanceTradingBot()                     # <-- creates client, rate‑manager, locks
-    logger.info("Bot object created – positions synced from Binance")
+    # 2. Create bot (syncs current balances via sync_positions_from_binance)
+    bot = BinanceTradingBot()
+    logger.info("Bot initialized – current positions synced from Binance")
 
-    # --------------------------------------------------------------------- #
-    # 4. Run the *first* fill‑check right now (captures any missed trades)
-    # --------------------------------------------------------------------- #
-    logger.info("Running initial fill‑check sync with Binance...")
-    bot.check_fills_and_update_db()
-    logger.info("Initial fill‑check completed")
-
-    # --------------------------------------------------------------------- #
-    # 5. Start all background workers
-    # --------------------------------------------------------------------- #
+    # 3. Start background scanner threads
     threading.Thread(target=smart_buy_scanner,   args=(bot,), daemon=True).start()
     threading.Thread(target=smart_sell_scanner,  args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    # Daily sync (first run already done above – this thread will run again in ~24 h)
+    # 4. CRITICAL: Start the daily + startup sync thread
+    #     → Handles: 
+    #        • Immediate fill sync on *this* startup
+    #        • Daily sync every 24h
+    #        • Safe restarts (sync runs again on next launch)
     threading.Thread(target=sync_on_startup_and_daily, args=(bot,), daemon=True).start()
+    logger.info("Daily sync thread started (initial sync running now)")
 
-    # --------------------------------------------------------------------- #
-    # 6. Normal main‑loop (order housekeeping + dashboard)
-    # --------------------------------------------------------------------- #
+    # 5. Main housekeeping loop
     last_dash = time.time()
     while True:
         bot.cancel_old_orders()
