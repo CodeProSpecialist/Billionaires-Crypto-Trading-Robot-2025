@@ -1,4 +1,4 @@
-# 🚀 SMART COIN TRADING BOT: Binance.US Edition 🚀
+# 🚀 SMART COIN TRADING BOT for Binance.US Edition 🚀
 **Skyrocketing Wealth Creation with Precision Automation**  
 
 *****
@@ -14,135 +14,92 @@ finished on 11-3-2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-**SMART COIN TRADING BOT**  
-**THE MOST ADVANCED MULTI-THREADED BINANCE.US BOT ON EARTH**
+# Binance.US Dynamic Trailing Bot – **MULTI-THREADED, RATE-LIMIT & DEPTH AWARE**
+
+> **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book Intelligence, and Institutional-Grade Risk Controls**
 
 ---
 
-SMART COIN TRADING BOT 
-The Only Bot That Buys at the Bottom, Sells at the Top — With Proof
+## Features at a Glance
 
-“I don’t guess. I know when to buy and sell.”
-That’s what this bot says — in real time, 24/7, on Binance.US.
-
-## Goal
-- **Buy at the absolute lowest price**
-  - Waits for:
-    - Order book sell pressure  
-    - RSI/MFI oversold  
-    - Volume surge  
-    - Price dip  
-
-- **Sell at the absolute highest price**
-  - Triggers only on:
-    - Buy pressure climax  
-    - RSI/MFI overbought  
-    - Volume explosion  
-
-- **Never misses the move**
-  - Trailing limit orders ratchet up/down  
-  - Never sells too early, never buys chasing  
-
-- **No spam. No noise.**
-  - 6+ confirmations before any trade  
-  - Institutional-grade precision  
+| Feature | Description |
+|--------|-------------|
+| **4 Dedicated Threads** | 1 for buy scanning, 1 for sell scanning, 1 for trailing buys, 1 for trailing sells |
+| **20-Level Order Book Depth** | Full VWAP, imbalance, skew, and pressure analysis |
+| **Candlestick Pattern Detection** | Integrated TA-Lib patterns (Hammer, Engulfing, Doji, etc.) |
+| **Custom 24h Price Tracking** | Accurate high/low/avg with 1-minute granularity |
+| **Thread-Safe & Rate-Limit Aware** | Smart retry logic, header-based throttling, 429/418 handling |
+| **Professional Dashboard** | Real-time P&L, positions, market overview, and buy signals |
+| **SQLite Trade & Position DB** | Full audit trail, auto-import of existing holdings |
+| **WhatsApp Alerts** | Instant execution & event notifications via CallMeBot |
+| **Dynamic Trailing Logic** | Buy on dips, sell on peaks — with stall detection & flash move triggers |
 
 ---
 
-# THE TECH THAT MAKES IT UNSTOPPABLE
+## Why This Bot Stands Out
 
-| **Feature** | **Why It Wins** |
-|--------------|----------------|
-| **20-Level Order Book Engine** | Sees real liquidity walls and imbalance — not just best bid/ask |
-| **RSI + MFI + MACD + Volume Surge** | 4-layer confirmation — no false signals |
-| **Price Trend Monitoring** | 15-minute momentum filter — catches reversals early |
-| **Smart Trailing Activation** | Only starts trailing when all stars align — saves API, avoids chop |
-| **Binance.US Compliant** | PRICE_FILTER, LOT_SIZE, rate limits — never gets banned |
-| **Auto-Cancel Old Orders (>2h)** | Keeps your account clean and fast |
-| **Full Dashboard + WhatsApp Alerts** | You’re always in control — even from your phone |
+```text
+Most bots trade blindly. This one *watches the market like a hawk*.
+	•	Order Book Pressure Spikes → Detects panic selling or FOMO buying
+	•	Rapid Price Moves (1.5% in <5s) → Instant market entry/exit
+	•	15-Minute Stall Protection → Prevents capital lockup
+	•	0.8% Net Profit Target → Disciplined exits after fees
+	•	RSI + Bollinger + MACD + Patterns → Multi-layer confirmation
+	•	Risk Per Trade: 10% → Configurable, balanced exposure
 
----
+Live Dashboard (Terminal)
+====================================================================================================
+                                        SMART COIN TRADING BOT                                          
+====================================================================================================
+Current Time: 2025-11-04 14:32:10 CST
+Available USDT: $1,248.392100
+Total Portfolio Value: $3,892.41
+Active Trailing Orders: 2 buys, 3 sells
+====================================================================================================
+                                        CURRENT POSITIONS                                          
+SYMBOL      QUANTITY    ENTRY PRICE   CURRENT PRICE        RSI   P&L %     PROFIT            STATUS
+BTCUSDT     0.012300     68240.0000      69120.5000       68.2   +1.25%    +$10.82     Trailing Sell
+ETHUSDT     0.451200     2420.1000       2398.7000       42.1   -0.88%     -$9.61     Trailing Buy
+...
+====================================================================================================
+TOTAL UNREALIZED PROFIT & LOSS: +$142.33
+====================================================================================================
+                                        MARKET OVERVIEW                                            
+Number of Valid Symbols: 87
+Average 24h Volume: $124,102,334
+Price Range: $0.01 to $1000.00
+Coin Buy List: SOL(32) | ADA(29) | XRP(34) | DOGE(31) | AVAX(28)
+====================================================================================================
 
-# REAL EXAMPLE: HOW IT TRADES
-
-## BUY SIGNAL (DIP HUNTING)
-**Pair:** BTCUSDT  
-- **Order Book:** 68% ask volume → sell pressure  
-- **RSI:** 32 *(oversold)*  
-- **MFI:** 24 *(oversold)*  
-- **Volume:** 3.1× surge  
-- **Price:** Down 1.8% from 1h high  
-- **Trend:** Bearish  
-- **MACD:** Below signal  
-
-**→ TRAILING BUY ACTIVATED @ $60,200**  
-- Bot places limit buy 0.2% lower each time price drops  
-- **Buys at the exact bottom — no FOMO**
-
----
-
-## SELL SIGNAL (CLIMAX EXIT)
-**Pair:** ETHUSDT  
-- **Order Book:** 32% ask volume → buy pressure  
-- **RSI:** 68 *(overbought)*  
-- **MFI:** 78 *(overbought)*  
-- **Volume:** 4.2× surge  
-- **Price:** Up 3.1% from 1h low  
-- **Profit:** +1.8%  
-- **MACD:** Above signal  
-
-**→ TRAILING SELL ACTIVATED @ $4,120**  
-- Bot raises sell order 0.2% higher each time price climbs  
-- **Sells at the peak — locks in max profit**
-
----
-
-# PROVEN SAFETY & PERFORMANCE
-
-| **Feature** | **Status** |
-|--------------|------------|
-| No martingale, no leverage | **Safe** |
-| Risk per trade: 10% of free USDT | **Controlled** |
-| Min $5 USDT / $5 coin value | **No dust** |
-| Min $0.25 net profit per trade | **Profitable** |
-| Auto-sync with Binance | **Accurate** |
-| Thread-safe, rate-limited | **Stable** |
-| SQLite trade logging | **Auditable** |
+How It Works
+Buy Logic
+	1	Scans all valid USDT pairs (> $100k 24h volume)
+	2	Detects sell pressure spike + RSI ≤ 35 + bullish trend
+	3	Starts dynamic trailing buy:
+	◦	Tracks lowest price
+	◦	Buys on 3% bounce or pressure drop
+	◦	Market buy on 1% flash crash
+Sell Logic
+	1	Monitors open positions
+	2	Waits for 0.8% net profit + RSI ≥ 65 + bearish trend
+	3	Starts dynamic trailing sell:
+	◦	Tracks peak price
+	◦	Sells on 0.5% pullback or buy pressure collapse
+	◦	Market sell on stall > 15 min
 
 
-# WHY 99% OF BOTS FAIL — AND THIS ONE WINS
+Safety & Compliance
+	•	Binance.US Only (tld=‘us’)
+	•	No leverage, no futures
+	•	Rate limits respected (weight + order count)
+	•	All trades logged to SQLite
+	•	No external dependencies beyond Binance
 
-| **Most Bots** | **THIS BOT** |
-|----------------|--------------|
-| Buy on green candle | Waits for 6 confirmations |
-| Sell on red candle | Sells only at climax |
-| Use 1 indicator | Uses order book + 5 indicators |
-| Spam limit orders | Smart activation + trailing |
-| Get rate-limited | Built-in RateManager |
-| No alerts | WhatsApp + Dashboard |
+Get It Now
+Ready-to-run. No config files. Just set API keys and go.
 
----
+Built for traders who demand precision. Powered by real-time depth, not hype.
 
-# WHO THIS IS FOR
-
-- Swing traders who want **precision entries/exits**
-- HODLers who want to **buy dips automatically**
-- Algo traders who want **institutional-grade logic**
-- Anyone **tired of emotional trading**
-
-
-
-Just add your Binance.US API keys + CallMeBot → RUN
-
-READY TO TRADE LIKE A HEDGE FUND?
-This isn’t a toy. It’s a weapon.
-Buy low. Sell high. Let the order book do the work.
-
-SMART COIN TRADING BOT 
-“I don’t predict the market. I read it.”
-
-
-## **PLUG & PLAY – 60 SECONDS TO LIVE**
 
 ```bash
 # 1. Install
