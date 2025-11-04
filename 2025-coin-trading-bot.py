@@ -1041,23 +1041,21 @@ def print_professional_dashboard(bot):
             reverse=True
         )[:10]
 
-        BAR_WIDTH = 50  # Wider bar for clarity
+        BAR_WIDTH = 50
 
         for sym, info in sorted_symbols:
             ob = bot.get_order_book_analysis(sym)
             pct_bid = ob['pct_bid']
             pct_ask = 100 - pct_bid
 
-            # Scale to BAR_WIDTH
-            bid_blocks = max(0, min(BAR_WIDTH, int(pct_bid / 2)))   # 2% per block
+            bid_blocks = max(0, min(BAR_WIDTH, int(pct_bid / 2)))
             ask_blocks = max(0, min(BAR_WIDTH, int(pct_ask / 2)))
 
-            # Build tug-of-war bar
             bid_bar = GREEN + "█" * bid_blocks + RESET
             ask_bar = RED + "█" * ask_blocks + RESET
             neutral = "░" * (BAR_WIDTH - bid_blocks - ask_blocks)
-            bar = bid_bar + neutral + ask_bar[::-1]  # reverse ask bar
-            bar = (bar + "░" * BAR_WIDTH)[:BAR_WIDTH]  # ensure exact width
+            bar = bid_bar + neutral + ask_bar[::-1]
+            bar = (bar + "░" * BAR_WIDTH)[:BAR_WIDTH]
 
             bias = ("strong bid wall" if pct_bid > 60 else
                     "strong ask pressure" if pct_bid < 40 else
@@ -1065,8 +1063,8 @@ def print_professional_dashboard(bot):
 
             coin = sym.replace("USDT", "")
             print(f"{coin:<9} |{bar}|  {pct_bid:>3.0f}% bid / {pct_ask:>3.0f}% ask")
-            print(f"{'':<9}   {bias:<20}")  # Bias text under bar
-            print()  # Extra blank line
+            print(f"{'':<9}   {bias:<20}")
+            print()
 
         print(DIVIDER)
 
@@ -1094,6 +1092,7 @@ def print_professional_dashboard(bot):
             pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
             total_pnl += Decimal(str(net))
 
+            # === FIXED BLOCK ===
             status = "Held"
             if sym in trailing_sell_active:
                 state = trailing_sell_active[sym]
@@ -1103,7 +1102,7 @@ def print_professional_dashboard(bot):
                 status = f"Trailing Sell (Stop: {float(stop):.6f})"
             elif sym in trailing_buy_active:
                 state = trailing_buy_active[sym]
-                low = stateLowest_price']
+                low = state['lowest_price']  # ← FIXED: was stateLowest_price']
                 ob_data = bot.get_order_book_analysis(sym)
                 entry = bot.get_dynamic_entry(sym, low, ob_data)
                 status = f"Trailing Buy (Entry: {float(entry):.6f})"
@@ -1154,7 +1153,6 @@ def print_professional_dashboard(bot):
         if len(watch_str) > 100: watch_str = watch_str[:97] + "..."
         print(f"\nCoin Buy List: {watch_str}")
 
-        # === FINAL DIVIDER ===
         print(DIVIDER)
 
     except Exception as e:
