@@ -1324,19 +1324,46 @@ def sync_on_startup_and_daily(bot):
 
 # === MAIN ===================================================================
 def main():
-    bot = BinanceTradingBot()
+    # --------------------------------------------------------------------- #
+    # 1. DB is created the moment the module is imported
+    #    (Base.metadata.create_all(engine) runs at import time)
+    # --------------------------------------------------------------------- #
+    logger.info("Database file/tables ready (binance_trades.db)")
 
-    # Background scanner threads
+    # --------------------------------------------------------------------- #
+    # 2. Wait 8 seconds before the first API sync
+    # --------------------------------------------------------------------- #
+    logger.info("Waiting 8 seconds before initial Binance sync...")
+    time.sleep(8)
+
+    # --------------------------------------------------------------------- #
+    # 3. Initialise the bot – this also runs sync_positions_from_binance()
+    # --------------------------------------------------------------------- #
+    bot = BinanceTradingBot()                     # <-- creates client, rate‑manager, locks
+    logger.info("Bot object created – positions synced from Binance")
+
+    # --------------------------------------------------------------------- #
+    # 4. Run the *first* fill‑check right now (captures any missed trades)
+    # --------------------------------------------------------------------- #
+    logger.info("Running initial fill‑check sync with Binance...")
+    bot.check_fills_and_update_db()
+    logger.info("Initial fill‑check completed")
+
+    # --------------------------------------------------------------------- #
+    # 5. Start all background workers
+    # --------------------------------------------------------------------- #
     threading.Thread(target=smart_buy_scanner,   args=(bot,), daemon=True).start()
     threading.Thread(target=smart_sell_scanner,  args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    # NEW: Startup + daily sync in its own thread
+    # Daily sync (first run already done above – this thread will run again in ~24 h)
     threading.Thread(target=sync_on_startup_and_daily, args=(bot,), daemon=True).start()
 
+    # --------------------------------------------------------------------- #
+    # 6. Normal main‑loop (order housekeeping + dashboard)
+    # --------------------------------------------------------------------- #
     last_dash = time.time()
-
     while True:
         bot.cancel_old_orders()
         bot.check_unfilled_limit_orders()
