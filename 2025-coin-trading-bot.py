@@ -5,10 +5,11 @@
 - 1 extra thread for sell scanning
 - 1 thread for all trailing buys
 - 1 thread for all trailing sells
-- Full 20-level order book depth analysis (VWAP, imbalance, skew, pressure)
+- Full 50-level order book depth analysis (VWAP, imbalance, skew, pressure)
 - Thread-safe, rate-limit aware, professional dashboard
 - Integrated candlestick pattern detection for enhanced trend analysis
 - Price history tracking for custom 24h high/low/avg calculations
+- ATR + Order-Book Hybrid Trailing Stops (Sell) & Entries (Buy)
 """
 
 import os
@@ -64,13 +65,14 @@ ORDERBOOK_BUY_PRESSURE_SPIKE = 0.65
 ORDERBOOK_BUY_PRESSURE_DROP = 0.55
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
-ORDER_BOOK_LIMIT = 20
-ORDER_BOOK_LEVELS = 20
+ORDER_BOOK_LIMIT = 50
+ORDER_BOOK_LEVELS = 50
 DEPTH_IMBALANCE_THRESHOLD = 2.0
 POLL_INTERVAL = 1.0
 STALL_THRESHOLD_SECONDS = 15 * 60  # 15 minutes
 RAPID_DROP_THRESHOLD = 0.01  # 1.0%
 RAPID_DROP_WINDOW = 5.0      # seconds
+ATR_TRAIL_MULTIPLIER_BUY = 1.0  # 1.0 × ATR min trail
 
 # === CONSTANTS ==============================================================
 HUNDRED = Decimal('100')
@@ -106,7 +108,7 @@ last_price_cache: Dict[str, Tuple[float, float]] = {}
 trailing_buy_active: Dict[str, dict] = {}
 trailing_sell_active: Dict[str, dict] = {}
 buy_cooldown: Dict[str, float] = {}
-price_history: Dict[str, deque] = {}  # symbol: deque of (timestamp, close_price) for 24h tracking, maxlen=1440 for 1m data
+price_history: Dict[str, deque] = {}  # symbol: deque of (timestamp, close_price) for 24h tracking
 
 # === SAFE MATH ==============================================================
 def safe_float(value, default=0.0) -> float:
@@ -382,7 +384,9 @@ class BinanceTradingBot:
             'depth_skew':   depth_skew,
             'weighted_pressure': weighted_pressure,
             'mid_price':    float(mid_price),
-            'ts':           now
+            'ts':           now,
+            'raw_bids':     [(Decimal(p), Decimal(q)) for p, q in bids],
+            'raw_asks':     [(Decimal(p), Decimal(q)) for p, q in asks]
         }
 
         with self.state_lock:
@@ -651,45 +655,91 @@ class BinanceTradingBot:
         logger.info(f"Trailing BUY started for {symbol}")
         send_whatsapp_alert(f"TRAILING BUY ACTIVE: {symbol}")
 
+    @retry_custom
+    def get_ATR(self, symbol: str, period: int = 14) -> float:
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            klines = self.client.get_klines(symbol=symbol, interval='1m', limit=period + 1)
+            self.rate_manager.update_current()
+        highs = np.array([safe_float(k[2]) for k in klines])
+        lows = np.array([safe_float(k[3]) for k in klines])
+        closes = np.array([safe_float(k[4]) for k in klines])
+        if len(highs) < period:
+            return 0.0
+        atr = talib.ATR(highs, lows, closes, timeperiod=period)[-1]
+        return safe_float(atr)
+
+    def get_dynamic_stop(self, symbol: str, current_high_price: Decimal, ob: dict) -> Decimal:
+        strong_bids = [(p, q) for p, q in ob['raw_bids'] if p < current_high_price]
+        if not strong_bids:
+            return current_high_price * Decimal('0.995')
+        wall_price, _ = max(strong_bids, key=lambda x: x[1])
+        stop_price = wall_price * Decimal('0.999')
+        atr_value = self.get_ATR(symbol)
+        if atr_value > 0:
+            atr_decimal = to_decimal(atr_value)
+            min_trail_dist = (atr_decimal / current_high_price) * Decimal('1.0')
+            min_stop = current_high_price * (Decimal('1') - min_trail_dist)
+            if stop_price > min_stop:
+                stop_price = min_stop
+        return stop_price
+
+    def get_dynamic_entry(self, symbol: str, current_low_price: Decimal, ob: dict) -> Decimal:
+        strong_asks = [(p, q) for p, q in ob['raw_asks'] if p > current_low_price]
+        if not strong_asks:
+            return current_low_price * Decimal('1.005')
+        wall_price, _ = max(strong_asks, key=lambda x: x[1])
+        entry_price = wall_price * Decimal('1.001')
+        atr_value = self.get_ATR(symbol)
+        if atr_value > 0:
+            atr_decimal = to_decimal(atr_value)
+            min_trail_dist = (atr_decimal / current_low_price) * Decimal(str(ATR_TRAIL_MULTIPLIER_BUY))
+            min_entry = current_low_price * (Decimal('1') + min_trail_dist)
+            if entry_price < min_entry:
+                entry_price = min_entry
+        return entry_price
+
     def process_trailing_buy(self, symbol):
         with self.state_lock:
-            if symbol not in trailing_buy_active: return
+            if symbol not in trailing_buy_active:
+                return
             state = trailing_buy_active[symbol]
         try:
             ob = self.get_order_book_analysis(symbol)
-            bid = ob['best_bid']
-            if bid <= ZERO: return
+            ask = ob['best_ask']
+            if ask <= ZERO:
+                return
 
             now = time.time()
             with self.state_lock:
                 if symbol not in last_price_cache:
-                    last_price_cache[symbol] = (float(bid), now)
+                    last_price_cache[symbol] = (float(ask), now)
                 else:
                     lp, lt = last_price_cache[symbol]
                     if now - lt < RAPID_DROP_WINDOW:
-                        drop = (lp - float(bid)) / lp
+                        drop = (lp - float(ask)) / lp
                         if drop >= RAPID_DROP_THRESHOLD:
                             self.place_buy_at_price(symbol, None, force_market=True)
                             if symbol in trailing_buy_active:
                                 del trailing_buy_active[symbol]
                             return
-                    last_price_cache[symbol] = (float(bid), now)
+                    last_price_cache[symbol] = (float(ask), now)
 
-            if is_fast_move(float(bid), lp, lt, direction='up', threshold_pct=0.5):
+            if is_fast_move(float(ask), lp, lt, direction='up', threshold_pct=0.5):
                 self.place_buy_at_price(symbol, None, force_market=True)
                 with self.state_lock:
                     trailing_buy_active.pop(symbol, None)
                 return
 
-            if is_fast_move(float(bid), lp, lt, direction='down', threshold_pct=1.5):
+            if is_fast_move(float(ask), lp, lt, direction='down', threshold_pct=1.5):
                 self.place_buy_at_price(symbol, None, force_market=True)
                 with self.state_lock:
                     trailing_buy_active.pop(symbol, None)
                 return
 
             with self.state_lock:
-                if bid < state['lowest_price']:
-                    state['lowest_price'] = bid
+                if ask < state['lowest_price']:
+                    state['lowest_price'] = ask
                 trailing_buy_active[symbol] = state
 
             rsi, trend, low24 = self.get_rsi_and_trend(symbol)
@@ -703,21 +753,31 @@ class BinanceTradingBot:
                 hist = list(sell_pressure_history[symbol])
 
             custom_low, _, _ = self.get_24h_price_stats(symbol)
-            if custom_low and bid > Decimal(str(custom_low)) * Decimal('1.02'):
+            if custom_low and ask > Decimal(str(custom_low)) * Decimal('1.02'):
+                return
+
+            dynamic_entry = self.get_dynamic_entry(symbol, state['lowest_price'], ob)
+            if ask >= dynamic_entry:
+                logger.info(f"DYNAMIC ENTRY HIT: {symbol} @ {ask:.6f} (above wall @ {dynamic_entry:.6f})")
+                send_whatsapp_alert(f"DYNAMIC ENTRY {symbol} @ {ask:.6f}")
+                self.place_buy_at_price(symbol, ask)
+                with self.state_lock:
+                    if symbol in trailing_buy_active:
+                        del trailing_buy_active[symbol]
                 return
 
             if len(hist) >= 3:
                 peak = max(hist)
                 cur = hist[-1]
                 if peak >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and cur <= peak * 0.9:
-                    self.place_buy_at_price(symbol, bid)
+                    self.place_buy_at_price(symbol, ask)
                     with self.state_lock:
                         if symbol in trailing_buy_active:
                             del trailing_buy_active[symbol]
                     return
 
-            if bid > state['lowest_price'] * Decimal('1.003'):
-                self.place_buy_at_price(symbol, bid)
+            if ask > state['lowest_price'] * Decimal('1.003'):
+                self.place_buy_at_price(symbol, ask)
                 with self.state_lock:
                     if symbol in trailing_buy_active:
                         del trailing_buy_active[symbol]
@@ -814,6 +874,16 @@ class BinanceTradingBot:
             if rsi is None or rsi < RSI_OVERBOUGHT or trend != 'bearish':
                 return
 
+            dynamic_stop = self.get_dynamic_stop(symbol, state['peak_price'], ob)
+            if bid < dynamic_stop:
+                logger.info(f"DYNAMIC STOP HIT: {symbol} @ {bid:.6f} (below wall @ {dynamic_stop:.6f})")
+                send_whatsapp_alert(f"DYNAMIC STOP HIT {symbol} @ {bid:.6f}")
+                self.place_sell_at_price(symbol, bid)
+                with self.state_lock:
+                    if symbol in trailing_sell_active:
+                        del trailing_sell_active[symbol]
+                return
+
             with self.state_lock:
                 if symbol not in buy_pressure_history:
                     buy_pressure_history[symbol] = deque(maxlen=5)
@@ -829,13 +899,6 @@ class BinanceTradingBot:
                         if symbol in trailing_sell_active:
                             del trailing_sell_active[symbol]
                     return
-
-            if bid < state['peak_price'] * Decimal('0.995'):
-                self.place_sell_at_price(symbol, bid)
-                with self.state_lock:
-                    if symbol in trailing_sell_active:
-                        del trailing_sell_active[symbol]
-                return
 
             if self._detect_stall(symbol, bid):
                 logger.info(f"STALLED 15 min {symbol} @ {bid:.6f} → MARKET SELL")
@@ -945,6 +1008,7 @@ def print_professional_dashboard(bot):
     try:
         GREEN  = "\033[32m"
         RED    = "\033[31m"
+        YELLOW = "\033[33m"
         BOLD   = "\033[1m"
         RESET  = "\033[0m"
         DIVIDER = "=" * 120
@@ -990,9 +1054,21 @@ def print_professional_dashboard(bot):
             pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100
             total_pnl += Decimal(str(net))
 
-            status = ("Trailing Sell" if sym in trailing_sell_active
-                      else "Trailing Buy" if sym in trailing_buy_active
-                      else "24/7 Monitoring")
+            status = "Held"
+            if sym in trailing_sell_active:
+                state = trailing_sell_active[sym]
+                peak = state['peak_price']
+                ob_data = bot.get_order_book_analysis(sym)
+                stop = bot.get_dynamic_stop(sym, peak, ob_data)
+                status = f"Trailing Sell (Stop: {float(stop):.6f})"
+            elif sym in trailing_buy_active:
+                state = trailing_buy_active[sym]
+                low = state['lowest_price']
+                ob_data = bot.get_order_book_analysis(sym)
+                entry = bot.get_dynamic_entry(sym, low, ob_data)
+                status = f"Trailing Buy (Entry: {float(entry):.6f})"
+            else:
+                status = "24/7 Monitoring"
 
             pnl_color = GREEN if net > 0 else RED
             pct_color = GREEN if pnl_pct > 0 else RED
@@ -1034,7 +1110,27 @@ def print_professional_dashboard(bot):
 
         watch_str = " | ".join(watch_items[:18]) if watch_items else "No active buy signals"
         if len(watch_str) > 100: watch_str = watch_str[:97] + "..."
-        print(f"Coin Buy List: {watch_str}")
+        print(f"\nCoin Buy List: {watch_str}")
+
+        print(f"\n{BOLD}DEPTH IMBALANCE BARS (Top 10 by Volume){RESET}")
+
+        sorted_symbols = sorted(
+            valid_symbols_dict.items(),
+            key=lambda x: x[1]['volume'],
+            reverse=True
+        )[:10]
+
+        for sym, info in sorted_symbols:
+            ob = bot.get_order_book_analysis(sym)
+            pct_bid = ob['pct_bid']
+            blocks = max(0, min(25, int(pct_bid / 4)))
+            bar = "█" * blocks + "░" * (25 - blocks)
+            color = GREEN if pct_bid > 55 else RED if pct_bid < 45 else YELLOW
+            bias = ("strong bid wall" if pct_bid > 60 else
+                    "strong ask pressure" if pct_bid < 40 else
+                    "balanced")
+            coin = sym.replace("USDT", "")
+            print(f"{coin:<9} |{color}{bar}{RESET}|  {pct_bid:>4.0f}% bid  ({bias})")
 
         print(DIVIDER)
 
