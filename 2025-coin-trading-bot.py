@@ -202,27 +202,27 @@ def to_decimal(v):
 def now_cst(): 
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-def format_volume(vol_usdt: float) -> str:
+def format_volume(vol_usdt: float) -> float:
     """
-    Returns volume with B/M/K suffix, max 12 characters:
-        1.23B  (6 chars)
-        12.3M  (6 chars)
-        1.23K  (6 chars)
-        500    (3 chars)
-    Perfect for:  f"{vol_str:>12}"
+    Returns the volume as a float in USD, rounded appropriately.
+    Returns 0.0 if no valid volume data is provided (None, NaN, or negative/zero).
     """
+    # Handle invalid or missing data
+    if vol_usdt is None or vol_usdt != vol_usdt:  # NaN check
+        return 0.0
+
     vol = abs(vol_usdt)
 
     if vol >= 1_000_000_000:  # Billions
-        return f"{vol/1_000_000_000:.2f}B"   # 1.23B → 6 chars
+        return round(vol / 1_000_000_000, 2) * 1_000_000_000
     if vol >= 1_000_000:      # Millions
-        return f"{vol/1_000_000:.2f}M"      # 12.3M → 6 chars
+        return round(vol / 1_000_000, 2) * 1_000_000
     if vol >= 1_000:          # Thousands
-        return f"{vol/1_000:.2f}K"          # 1.23K → 6 chars
+        return round(vol / 1_000, 2) * 1_000
 
-    # < 1,000 → show in hundreds
+    # Below 1,000: round to nearest 100
     hundreds = int(round(vol / 100.0))
-    return f"{hundreds * 100}"              # 500 → 3 chars
+    return hundreds * 100.0              # 500 → 3 chars
 
 # === RATE MANAGER ===========================================================
 class RateManager:
