@@ -47,29 +47,6 @@ Most bots trade blindly. This one *watches the market like a hawk*.
 	•	RSI + Bollinger + MACD + Patterns → Multi-layer confirmation
 	•	Risk Per Trade: 10% → Configurable, balanced exposure
 
-Live Dashboard (Terminal)
-====================================================================================================
-                                        SMART COIN TRADING BOT                                          
-====================================================================================================
-Current Time: 2025-11-04 14:32:10 CST
-Available USDT: $1,248.392100
-Total Portfolio Value: $3,892.41
-Active Trailing Orders: 2 buys, 3 sells
-====================================================================================================
-                                        CURRENT POSITIONS                                          
-SYMBOL      QUANTITY    ENTRY PRICE   CURRENT PRICE        RSI   P&L %     PROFIT            STATUS
-BTCUSDT     0.012300     68240.0000      69120.5000       68.2   +1.25%    +$10.82     Trailing Sell
-ETHUSDT     0.451200     2420.1000       2398.7000       42.1   -0.88%     -$9.61     Trailing Buy
-...
-====================================================================================================
-TOTAL UNREALIZED PROFIT & LOSS: +$142.33
-====================================================================================================
-                                        MARKET OVERVIEW                                            
-Number of Valid Symbols: 87
-Average 24h Volume: $124,102,334
-Price Range: $0.01 to $1000.00
-Coin Buy List: SOL(32) | ADA(29) | XRP(34) | DOGE(31) | AVAX(28)
-====================================================================================================
 
 How It Works
 Buy Logic
