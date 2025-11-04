@@ -1322,35 +1322,63 @@ def sync_on_startup_and_daily(bot):
         except Exception as e:
             logger.error(f"Daily sync failed: {e}", exc_info=True)
 
+# --------------------------------------------------------------------- #
+# Put this right after the DB section (replace the old create_all line)
+# --------------------------------------------------------------------- #
+def ensure_database_ready():
+    """Create DB + tables only if the file does not exist. Always wait until ready."""
+    db_path = "binance_trades.db"
+
+    if os.path.exists(db_path):
+        logger.info(f"Database already exists: {os.path.abspath(db_path)}")
+    else:
+        logger.info("Creating database file and tables...")
+        Base.metadata.create_all(engine)   # <-- creates file + tables
+        # Wait until file appears on disk
+        start = time.time()
+        while not os.path.exists(db_path):
+            if time.time() - start > 10:
+                logger.error("DB file not created after 10s")
+                sys.exit(1)
+            time.sleep(0.1)
+        logger.info(f"Database created: {os.path.abspath(db_path)}")
+
+    # Optional: quick sanity check that tables exist
+    try:
+        with DBManager() as sess:
+            sess.execute("SELECT 1 FROM trades LIMIT 1")
+            sess.execute("SELECT 1 FROM positions LIMIT 1")
+        logger.info("Database tables verified.")
+    except Exception as e:
+        logger.warning(f"Table check failed (will proceed anyway): {e}")
+
 
 # === MAIN ===================================================================
 def main():
-    logger.info("Database file/tables ready (binance_trades.db)")
+    # 1. Ensure DB exists (create only if missing)
+    ensure_database_ready()
 
-    # 1. Wait 8 seconds after DB creation
+    # 2. Wait 8 seconds after DB is confirmed
     logger.info("Waiting 8 seconds before starting bot...")
     time.sleep(8)
 
-    # 2. Create bot (syncs current balances via sync_positions_from_binance)
+    # 3. Initialize bot (syncs current balances)
     bot = BinanceTradingBot()
-    logger.info("Bot initialized – current positions synced from Binance")
+    logger.info("Bot initialized – positions synced from Binance")
 
-    # 3. Start background scanner threads
+    # 4. Start background threads
     threading.Thread(target=smart_buy_scanner,   args=(bot,), daemon=True).start()
     threading.Thread(target=smart_sell_scanner,  args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    # 4. CRITICAL: Start the daily + startup sync thread
-    #     → Handles: 
-    #        • Immediate fill sync on *this* startup
-    #        • Daily sync every 24h
-    #        • Safe restarts (sync runs again on next launch)
+    # Daily + startup sync (runs immediately on this launch)
     threading.Thread(target=sync_on_startup_and_daily, args=(bot,), daemon=True).start()
-    logger.info("Daily sync thread started (initial sync running now)")
+    logger.info("Background threads started (initial fill sync running)")
 
-    # 5. Main housekeeping loop
+    # 5. Main loop
     last_dash = time.time()
+    logger.info("Entering main housekeeping loop...")
     while True:
         bot.cancel_old_orders()
         bot.check_unfilled_limit_orders()
@@ -1360,3 +1388,6 @@ def main():
             last_dash = time.time()
 
         time.sleep(1)
+
+if __name__ == "__main__":
+    main()
