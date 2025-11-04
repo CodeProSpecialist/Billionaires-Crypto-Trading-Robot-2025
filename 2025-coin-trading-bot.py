@@ -1003,6 +1003,7 @@ def send_whatsapp_alert(message: str):
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
+
 # === DASHBOARD ==============================================================
 def print_professional_dashboard(bot):
     try:
@@ -1015,6 +1016,7 @@ def print_professional_dashboard(bot):
 
         os.system('cls' if os.name == 'nt' else 'clear')
 
+        # === HEADER ===
         print(DIVIDER)
         print(f"{BOLD}{'SMART COIN TRADING BOT':^120}{RESET}")
         print(DIVIDER)
@@ -1029,8 +1031,40 @@ def print_professional_dashboard(bot):
         print(f"Available USDT: ${usdt_free:,.6f}")
         print(f"Total Portfolio Value: ${total_port:,.6f}")
         print(f"Active Trailing Orders: {tbuy_cnt} buys, {tsel_cnt} sells")
+
+        # === DEPTH IMBALANCE BARS (NOW AT TOP) ===
+        print(f"\n{BOLD}DEPTH IMBALANCE BARS (Top 10 by Volume){RESET}")
+
+        sorted_symbols = sorted(
+            valid_symbols_dict.items(),
+            key=lambda x: x[1]['volume'],
+            reverse=True
+        )[:10]
+
+        for sym, info in sorted_symbols:
+            ob = bot.get_order_book_analysis(sym)
+            pct_bid = ob['pct_bid']
+            pct_ask = 100 - pct_bid
+
+            bid_blocks = max(0, min(25, int(pct_bid / 4)))
+            ask_blocks = max(0, min(25, int(pct_ask / 4)))
+
+            bid_bar = GREEN + "█" * bid_blocks + RESET
+            ask_bar = RED + "█" * ask_blocks + RESET
+            neutral = "░" * (25 - bid_blocks - ask_blocks)
+            bar = bid_bar + neutral + ask_bar[::-1]
+            bar = (bar + "░" * 25)[:25]
+
+            bias = ("strong bid wall" if pct_bid > 60 else
+                    "strong ask pressure" if pct_bid < 40 else
+                    "balanced")
+
+            coin = sym.replace("USDT", "")
+            print(f"{coin:<9} |{bar}|  {pct_bid:>3.0f}% bid / {pct_ask:>3.0f}% ask  ({bias})")
+
         print(DIVIDER)
 
+        # === CURRENT POSITIONS ===
         print(f"{BOLD}{'CURRENT POSITIONS':^120}{RESET}")
         print(f"{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}")
 
@@ -1084,6 +1118,7 @@ def print_professional_dashboard(bot):
         print(f"TOTAL UNREALIZED PROFIT & LOSS: {total_pnl_color}${float(total_pnl):>12,.2f}{RESET}")
         print(DIVIDER)
 
+        # === MARKET OVERVIEW ===
         print(f"{BOLD}{'MARKET OVERVIEW':^120}{RESET}")
 
         valid_cnt = len(valid_symbols_dict)
@@ -1093,6 +1128,7 @@ def print_professional_dashboard(bot):
         print(f"Average 24h Volume: ${avg_vol:,.0f}")
         print(f"Price Range: ${MIN_PRICE} to ${MAX_PRICE}")
 
+        # === Coin Buy List ===
         watch_items = []
         for sym in valid_symbols_dict:
             ob = bot.get_order_book_analysis(sym)
@@ -1112,30 +1148,12 @@ def print_professional_dashboard(bot):
         if len(watch_str) > 100: watch_str = watch_str[:97] + "..."
         print(f"\nCoin Buy List: {watch_str}")
 
-        print(f"\n{BOLD}DEPTH IMBALANCE BARS (Top 10 by Volume){RESET}")
-
-        sorted_symbols = sorted(
-            valid_symbols_dict.items(),
-            key=lambda x: x[1]['volume'],
-            reverse=True
-        )[:10]
-
-        for sym, info in sorted_symbols:
-            ob = bot.get_order_book_analysis(sym)
-            pct_bid = ob['pct_bid']
-            blocks = max(0, min(25, int(pct_bid / 4)))
-            bar = "█" * blocks + "░" * (25 - blocks)
-            color = GREEN if pct_bid > 55 else RED if pct_bid < 45 else YELLOW
-            bias = ("strong bid wall" if pct_bid > 60 else
-                    "strong ask pressure" if pct_bid < 40 else
-                    "balanced")
-            coin = sym.replace("USDT", "")
-            print(f"{coin:<9} |{color}{bar}{RESET}|  {pct_bid:>4.0f}% bid  ({bias})")
-
+        # === FINAL DIVIDER (before logs) ===
         print(DIVIDER)
 
     except Exception as e:
         logger.error(f"Dashboard print failed: {e}")
+
 
 # === THREADS ================================================================
 def buy_scanner(bot):
