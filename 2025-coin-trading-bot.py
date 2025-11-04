@@ -1295,18 +1295,32 @@ def _make_orderbook_panel_ascii(symbol: str, bot, thread_type: str) -> List[str]
     lines.append("─" * 78)
     return lines
 
-def daily_sync_task(bot):
-    """Run full fill sync once every 24 hours."""
+def sync_on_startup_and_daily(bot):
+    """
+    1. Run a full fill-sync **immediately** when the bot starts.
+    2. Then sleep 24 h and repeat forever (daily audit).
+    """
+    # --- 1. FIRST-TIME SYNC (runs right now) ---
+    try:
+        logger.info("INITIAL STARTUP SYNC: Checking for missed fills...")
+        bot.check_fills_and_update_db()
+        logger.info("Initial startup sync completed.")
+    except Exception as e:
+        logger.error(f"Initial sync failed: {e}", exc_info=True)
+
+    # --- 2. DAILY SYNC LOOP ---
     while True:
         try:
-            logger.info("Starting daily Binance fill sync (24h audit)...")
-            bot.check_fills_and_update_db()  # Full sync with API
+            # Sleep until next full 24 h mark (aligned to UTC midnight for consistency)
+            seconds_until_midnight = 24 * 3600 - (time.time() % (24 * 3600))
+            logger.info(f"Next daily sync in {seconds_until_midnight / 3600:.1f}h (at UTC midnight)")
+            time.sleep(seconds_until_midnight)
+
+            logger.info("DAILY SYNC: Auditing Binance fills...")
+            bot.check_fills_and_update_db()
             logger.info("Daily sync completed.")
         except Exception as e:
             logger.error(f"Daily sync failed: {e}", exc_info=True)
-        
-        # Sleep 24 hours
-        time.sleep(24 * 60 * 60)
 
 # === MAIN ===================================================================
 def main():
@@ -1318,18 +1332,16 @@ def main():
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
 
-    # NEW: Daily sync thread (once per day)
-    threading.Thread(target=daily_sync_task, args=(bot,), daemon=True).start()
+    # NEW: Startup + daily sync in its own thread
+    threading.Thread(target=sync_on_startup_and_daily, args=(bot,), daemon=True).start()
 
     last_dash = time.time()
 
     while True:
-        # Only run these two frequently
         bot.cancel_old_orders()
         bot.check_unfilled_limit_orders()
 
-        # Dashboard
-        if time.time() - last_dash >= 3:
+        if time.time() - last_dash >= 8:
             update_ascii_dashboard(bot)
             last_dash = time.time()
 
