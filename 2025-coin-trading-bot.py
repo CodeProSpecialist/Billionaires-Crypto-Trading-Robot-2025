@@ -1329,7 +1329,7 @@ def main():
         bot.check_unfilled_limit_orders()
 
         # Dashboard
-        if time.time() - last_dash >= 8:
+        if time.time() - last_dash >= 3:
             update_ascii_dashboard(bot)
             last_dash = time.time()
 
