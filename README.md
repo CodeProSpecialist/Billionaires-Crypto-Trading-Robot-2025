@@ -25,8 +25,6 @@ The Only Bot That Buys at the Bottom, Sells at the Top — With Proof
 “I don’t guess. I know when to buy and sell.”
 That’s what this bot says — in real time, 24/7, on Binance.US.
 
-# WHAT IT DOES (IN 60 SECONDS)
-
 ## Goal
 - **Buy at the absolute lowest price**
   - Waits for:
@@ -55,7 +53,7 @@ That’s what this bot says — in real time, 24/7, on Binance.US.
 
 | **Feature** | **Why It Wins** |
 |--------------|----------------|
-| **50-Level Order Book Engine** | Sees real liquidity walls and imbalance — not just best bid/ask |
+| **20-Level Order Book Engine** | Sees real liquidity walls and imbalance — not just best bid/ask |
 | **RSI + MFI + MACD + Volume Surge** | 4-layer confirmation — no false signals |
 | **Price Trend Monitoring** | 15-minute momentum filter — catches reversals early |
 | **Smart Trailing Activation** | Only starts trailing when all stars align — saves API, avoids chop |
