@@ -1295,27 +1295,42 @@ def _make_orderbook_panel_ascii(symbol: str, bot, thread_type: str) -> List[str]
     lines.append("─" * 78)
     return lines
 
+def daily_sync_task(bot):
+    """Run full fill sync once every 24 hours."""
+    while True:
+        try:
+            logger.info("Starting daily Binance fill sync (24h audit)...")
+            bot.check_fills_and_update_db()  # Full sync with API
+            logger.info("Daily sync completed.")
+        except Exception as e:
+            logger.error(f"Daily sync failed: {e}", exc_info=True)
+        
+        # Sleep 24 hours
+        time.sleep(24 * 60 * 60)
+
 # === MAIN ===================================================================
 def main():
     bot = BinanceTradingBot()
 
-    threading.Thread(target=smart_buy_scanner, args=(bot,), daemon=True).start()
-    threading.Thread(target=smart_sell_scanner, args=(bot,), daemon=True).start()
+    # Background scanner threads
+    threading.Thread(target=smart_buy_scanner,   args=(bot,), daemon=True).start()
+    threading.Thread(target=smart_sell_scanner,  args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_sell_scanner, args=(bot,), daemon=True).start()
+
+    # NEW: Daily sync thread (once per day)
+    threading.Thread(target=daily_sync_task, args=(bot,), daemon=True).start()
 
     last_dash = time.time()
 
     while True:
-        bot.check_fills_and_update_db()
+        # Only run these two frequently
         bot.cancel_old_orders()
         bot.check_unfilled_limit_orders()
 
+        # Dashboard
         if time.time() - last_dash >= 8:
             update_ascii_dashboard(bot)
             last_dash = time.time()
 
         time.sleep(1)
-
-if __name__ == "__main__":
-    main()
