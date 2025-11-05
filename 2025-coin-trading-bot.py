@@ -1487,6 +1487,7 @@ def main():
     last_dashboard = 0
     last_grid_check = 0
     last_sync = 0
+    last_pos_sync = 0   # renamed – only for balance/position sync
     last_cancel = 0
 
     while True:
