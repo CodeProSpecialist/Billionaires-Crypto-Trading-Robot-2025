@@ -310,7 +310,7 @@ def send_whatsapp_alert(message: str):
 # === MAIN BOT CLASS =========================================================
 class BinanceTradingBot:
     def __init__(self):
-        self.client = Client(API_KEY, API_SECRET)
+        self.client = Client(API_KEY, API_SECRET, tld='us')
         self.rate_manager = RateManager()
         self.api_lock = threading.Lock()
         self.state_lock = threading.Lock()
