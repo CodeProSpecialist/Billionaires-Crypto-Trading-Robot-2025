@@ -3,7 +3,7 @@
     INFINITY GRID + TRAILING HYBRID BOT – Binance Spot
     • Configureable $ dollar amount per grid to buy
     • 4–16 grids based on balance
-    • Grid orders NEVER cancel (infinity mode)
+    • Grid orders do not cancel for 12 hours (infinity mode)
     • Fallback to trailing momentum if < $40
     • Full dashboard, DB, alerts, rate-limit safe
     • Configureable MINIMUM NOTIONAL $ dollar amount FOR ALL BUY & SELL ORDERS
