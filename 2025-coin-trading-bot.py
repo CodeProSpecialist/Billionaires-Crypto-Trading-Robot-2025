@@ -8,6 +8,7 @@ Exchange: Binance.US (Spot Trading Only - No Futures/Margin)
 """
 
 import os
+import sys
 import time
 import json
 import logging
@@ -32,9 +33,13 @@ from binance.exceptions import BinanceAPIException, BinanceOrderException
 # === CONFIGURATION ===
 getcontext().prec = 28
 
-# Binance.US API - Get from https://www.binance.us/en/account (API Management)
-API_KEY = "YOUR_BINANCE_US_API_KEY"
-API_SECRET = "YOUR_BINANCE_US_SECRET_KEY"
+# Binance.US API - Get from https://www.binance.us/en/account (API Management) 
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_API_SECRET')
+
+if not API_KEY or not API_SECRET:
+    print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET env vars")
+    sys.exit(1)
 # No testnet for Binance.US; use small amounts for testing
 
 # Trading Parameters (Adjusted for Binance.US: Spot only, fewer pairs, lower volumes)
