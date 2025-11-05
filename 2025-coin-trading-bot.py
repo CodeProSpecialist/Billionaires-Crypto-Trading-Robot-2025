@@ -1416,7 +1416,7 @@ def buy_scanner(bot):
                 time.sleep(POLL_INTERVAL / max(1, len(valid_symbols_dict)))
         except Exception as e:
             logger.critical(f"Buy scanner error: {e}", exc_info=True)
-            time.sleep(10)
+            time.sleep(60)
 
 def sell_scanner(bot):
     while True:
@@ -1438,7 +1438,7 @@ def sell_scanner(bot):
                 time.sleep(POLL_INTERVAL / max(1, len(valid_symbols_dict)))
         except Exception as e:
             logger.critical(f"Sell scanner error: {e}", exc_info=True)
-            time.sleep(10)
+            time.sleep(60)
 
 def trailing_buy_processor(bot):
     while True:
@@ -1449,7 +1449,7 @@ def trailing_buy_processor(bot):
             time.sleep(POLL_INTERVAL)
         except Exception as e:
             logger.critical(f"Trailing buy processor error: {e}", exc_info=True)
-            time.sleep(10)
+            time.sleep(60)
 
 def trailing_sell_processor(bot):
     while True:
@@ -1460,7 +1460,7 @@ def trailing_sell_processor(bot):
             time.sleep(POLL_INTERVAL)
         except Exception as e:
             logger.critical(f"Trailing sell processor error: {e}", exc_info=True)
-            time.sleep(10)
+            time.sleep(60)
 
 # === MAIN ===================================================================
 def main():
@@ -1504,18 +1504,18 @@ def main():
                         send_whatsapp_alert(f"GRID OFF: {sym} (<$40)")
                 last_grid_check = now
 
-            if now - last_dashboard >= 15:
+            if now - last_dashboard >= 30:
                 print_professional_dashboard(bot)
                 last_dashboard = now
 
-            time.sleep(15.0)
+            time.sleep(30.0)
 
         except KeyboardInterrupt:
             print("\nShutting down...")
             break
         except Exception as e:
             logger.critical(f"Main loop error: {e}", exc_info=True)
-            time.sleep(10)
+            time.sleep(300)
 
 if __name__ == "__main__":
     main()
