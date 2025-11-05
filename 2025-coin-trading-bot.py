@@ -290,6 +290,7 @@ class BinanceTradingBot:
         self.rate_manager = RateManager(self.client)
         self.api_lock = threading.Lock()
         self.state_lock = threading.Lock()
+        self.symbols_initialised = False 
         with DBManager() as sess:
             self.import_owned_assets_to_db(sess)
             sess.commit()
