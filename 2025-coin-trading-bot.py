@@ -1504,11 +1504,11 @@ def main():
                         send_whatsapp_alert(f"GRID OFF: {sym} (<$40)")
                 last_grid_check = now
 
-            if now - last_dashboard >= 10:
+            if now - last_dashboard >= 15:
                 print_professional_dashboard(bot)
                 last_dashboard = now
 
-            time.sleep(1.0)
+            time.sleep(15.0)
 
         except KeyboardInterrupt:
             print("\nShutting down...")
