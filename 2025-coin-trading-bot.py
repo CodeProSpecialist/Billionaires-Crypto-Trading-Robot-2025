@@ -996,7 +996,7 @@ class BinanceTradingBot:
         if not hist or cur_price > hist[-1][1]:
             hist.append((now, cur_price))
         cutoff = now - STALL_THRESHOLD_SECONDS
-        histатор = [(t, p) for t, p in hist if t > cutoff]
+        hist = [(t, p) for t, p in hist if t > cutoff]
         with self.state_lock:
             state['price_peaks_history'] = hist
             trailing_sell_active[symbol] = state
@@ -1110,13 +1110,12 @@ def place_infinity_grid(bot, symbol):
         'placed_at': time.time()
     }
 
+    # Place all grid buy orders first
     for i in range(1, grid_count + 1):
         buy_price = mid_price * (Decimal('1') - GRID_INTERVAL_PCT * i)
-        sell_price = mid_price * (Decimal('1') + GRID_INTERVAL_PCT * i)
 
         tick = bot.get_tick_size(symbol)
         buy_price = (buy_price // tick) * tick
-        sell_price = (sell_price // tick) * tick
 
         if buy_notional_ok(symbol, buy_price, base_qty):
             order_buy = bot.place_limit_buy_with_tracking(
@@ -1127,14 +1126,22 @@ def place_infinity_grid(bot, symbol):
         else:
             logger.info(f"GRID BUY SKIPPED {symbol}: notional {buy_price*base_qty:.2f} USDT < $5")
 
-        if can_sell and sell_notional_ok(symbol, sell_price, base_qty):
-            order_sell = bot.place_limit_sell_with_tracking(
-                symbol, str(sell_price), float(base_qty)
-            )
-            if order_sell:
-                grid_state['sell_orders'].append(str(order_sell['orderId']))
-        else:
-            logger.info(f"GRID SELL SKIPPED {symbol}: notional {sell_price*base_qty:.2f} USDT < $5")
+    # Then place all grid sell orders
+    if can_sell:
+        for i in range(1, grid_count + 1):
+            sell_price = mid_price * (Decimal('1') + GRID_INTERVAL_PCT * i)
+
+            tick = bot.get_tick_size(symbol)
+            sell_price = (sell_price // tick) * tick
+
+            if sell_notional_ok(symbol, sell_price, base_qty):
+                order_sell = bot.place_limit_sell_with_tracking(
+                    symbol, str(sell_price), float(base_qty)
+                )
+                if order_sell:
+                    grid_state['sell_orders'].append(str(order_sell['orderId']))
+            else:
+                logger.info(f"GRID SELL SKIPPED {symbol}: notional {sell_price*base_qty:.2f} USDT < $5")
 
     if grid_state['buy_orders']:
         active_grid_symbols[symbol] = grid_state
