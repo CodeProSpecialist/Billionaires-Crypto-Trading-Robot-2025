@@ -352,6 +352,10 @@ class BinanceTradingBot:
 
     @retry_custom
     def fetch_and_validate_usdt_pairs(self) -> Dict[str, dict]:
+        if self.symbols_initialised:
+            logger.debug("Symbol list already loaded – skipping refresh.")
+            return valid_symbols_dict
+            
         global valid_symbols_dict
         with self.api_lock:
             self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
