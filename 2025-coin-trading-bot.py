@@ -70,6 +70,11 @@ STALL_THRESHOLD_SECONDS = 15 * 60  # 15 minutes
 RAPID_DROP_THRESHOLD = 0.01  # 1.0%
 RAPID_DROP_WINDOW = 5.0      # seconds
 ATR_TRAIL_MULTIPLIER_BUY = Decimal('1.0')
+BB_PERIOD = 20
+BB_DEV = 2
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 # === CONSTANTS ==============================================================
 HUNDRED = Decimal('100')
@@ -479,8 +484,8 @@ class BinanceTradingBot:
         rsi = talib.RSI(closes, timeperiod=RSI_PERIOD)[-1]
         if not np.isfinite(rsi):
             return None, "unknown", None
-        upper, middle, lower = talib.BBANDS(closes, timeperiod=20, nbdevup=2, nbdevdn=2)
-        macd, sig, _ = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
+        upper, middle, lower = talib.BBANDS(closes, timeperiod=BB_PERIOD, nbdevup=BB_DEV, nbdevdn=BB_DEV)
+        macd, sig, _ = talib.MACD(closes, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
 
         pattern_score = 0
         pattern_score += talib.CDLHAMMER(opens, highs, lows, closes)[-1]
@@ -634,14 +639,8 @@ class BinanceTradingBot:
                             self.record_trade(sess, po.symbol, po.side, fill_price,
                                               to_decimal(o['executedQty']), po.binance_order_id, po)
                             sess.delete(po)
-                            action = "BUY" if po.side == 'buy' else "SELL"
-                            logger.info(f"{action} FILLED: {po.symbol} @ {fill_price}")
-                            send_whatsapp_alert(f"{action} {po.symbol} @ {fill_price:.6f}")
-                            with self.state_lock:
-                                if po.side == 'buy' and po.symbol in trailing_buy_active:
-                                    del trailing_buy_active[po.symbol]
-                                if po.side == 'sell' and po.symbol in trailing_sell_active:
-                                    del trailing_sell_active[po.symbol]
+                        elif o['status'] in {'CANCELLED', 'EXPIRED'}:
+                            sess.delete(po)
                     except Exception as e:
                         logger.debug(f"Order check error: {e}")
         except Exception as e:
@@ -656,7 +655,7 @@ class BinanceTradingBot:
             if not pos:
                 maker, _ = self.get_trade_fees(symbol)
                 pos = Position(symbol=symbol, quantity=qty, avg_entry_price=price,
-                               buy_fee_rate=to_decimal(maker))
+                               buy_fee_rate=maker)
                 sess.add(pos)
             else:
                 total = pos.quantity * pos.avg_entry_price + qty * price
@@ -674,7 +673,7 @@ class BinanceTradingBot:
         with self.state_lock:
             return time.time() - buy_cooldown.get(symbol, 0) >= 15 * 60
 
-    def record_buy_placed(self, symbol: str):
+    def record_buy_placed(self, symbol):
         with self.state_lock:
             buy_cooldown[symbol] = time.time()
 
@@ -694,19 +693,8 @@ class BinanceTradingBot:
         with self.state_lock:
             return list(trailing_sell_active.keys())
 
-    def start_trailing_buy(self, symbol):
-        with self.state_lock:
-            if symbol in trailing_buy_active: return
-            trailing_buy_active[symbol] = {
-                'lowest_price': Decimal('inf'),
-                'last_buy_order_id': None,
-                'start_time': time.time()
-            }
-        logger.info(f"Trailing BUY started for {symbol}")
-        send_whatsapp_alert(f"TRAILING BUY ACTIVE: {symbol}")
-
     @retry_custom
-    def get_ATR(self, symbol: str, period: int = 14) -> float:
+    def get_ATR(self, symbol, period=14):
         with self.api_lock:
             self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             klines = self.client.get_klines(symbol=symbol, interval='1m', limit=period + 1)
@@ -714,22 +702,22 @@ class BinanceTradingBot:
         highs = np.array([safe_float(k[2]) for k in klines])
         lows = np.array([safe_float(k[3]) for k in klines])
         closes = np.array([safe_float(k[4]) for k in klines])
-        if len(highs) < period:
+        if len(highs) < period + 1:
             return 0.0
         atr = talib.ATR(highs, lows, closes, timeperiod=period)[-1]
         return safe_float(atr)
 
-    def get_dynamic_stop(self, symbol: str, current_high_price: Decimal, ob: dict) -> Decimal:
-        strong_bids = [(p, q) for p, q in ob['raw_bids'] if p < current_high_price]
+    def get_dynamic_stop(self, symbol: str, current_peak_price: Decimal, ob: dict) -> Decimal:
+        strong_bids = [(p, q) for p, q in ob['raw_bids'] if p < current_peak_price]
         if not strong_bids:
-            return current_high_price * Decimal('0.995')
+            return current_peak_price * Decimal('0.995')
         wall_price, _ = max(strong_bids, key=lambda x: x[1])
         stop_price = wall_price * Decimal('0.999')
         atr_value = self.get_ATR(symbol)
         if atr_value > 0:
             atr_decimal = to_decimal(atr_value)
-            min_trail_dist = (atr_decimal / current_high_price) * Decimal('1.0')
-            min_stop = current_high_price * (Decimal('1') - min_trail_dist)
+            min_trail_dist = (atr_decimal / current_peak_price) * Decimal('1.0')
+            min_stop = current_peak_price * (Decimal('1') - min_trail_dist)
             if stop_price > min_stop:
                 stop_price = min_stop
         return stop_price
@@ -748,6 +736,19 @@ class BinanceTradingBot:
             if entry_price < min_entry:
                 entry_price = min_entry
         return entry_price
+
+    def start_trailing_buy(self, symbol):
+        with self.state_lock:
+            if symbol in trailing_buy_active: return
+            ob = self.get_order_book_analysis(symbol)
+            ask = ob['best_ask']
+            trailing_buy_active[symbol] = {
+                'lowest_price': ask,
+                'last_buy_order_id': None,
+                'start_time': time.time()
+            }
+        logger.info(f"Trailing BUY started for {symbol} @ {ask:.6f}")
+        send_whatsapp_alert(f"TRAILING BUY ACTIVE: {symbol} @ {ask:.6f}")
 
     def process_trailing_buy(self, symbol):
         with self.state_lock:
@@ -775,13 +776,32 @@ class BinanceTradingBot:
                             return
                     last_price_cache[symbol] = (float(ask), now)
 
-            if ask < state['lowest_price']:
-                state['lowest_price'] = ask
+            if is_fast_move(float(ask), lp, lt, direction='up', threshold_pct=0.5):
+                self.place_buy_at_price(symbol, None, force_market=True)
+                with self.state_lock:
+                    trailing_buy_active.pop(symbol, None)
+                return
+
+            if is_fast_move(float(ask), lp, lt, direction='down', threshold_pct=1.5):
+                self.place_buy_at_price(symbol, None, force_market=True)
+                with self.state_lock:
+                    trailing_buy_active.pop(symbol, None)
+                return
+
+            with self.state_lock:
+                if ask < state['lowest_price']:
+                    state['lowest_price'] = ask
                 trailing_buy_active[symbol] = state
 
             rsi, trend, low24 = self.get_rsi_and_trend(symbol)
             if rsi is None or rsi > RSI_OVERSOLD or trend != 'bullish':
                 return
+
+            with self.state_lock:
+                if symbol not in sell_pressure_history:
+                    sell_pressure_history[symbol] = deque(maxlen=5)
+                sell_pressure_history[symbol].append(ob['pct_ask'])
+                hist = list(sell_pressure_history[symbol])
 
             custom_low, _, _ = self.get_24h_price_stats(symbol)
             if custom_low and ask > Decimal(str(custom_low)) * Decimal('1.02'):
@@ -789,11 +809,23 @@ class BinanceTradingBot:
 
             dynamic_entry = self.get_dynamic_entry(symbol, state['lowest_price'], ob)
             if ask >= dynamic_entry:
+                logger.info(f"DYNAMIC ENTRY HIT: {symbol} @ {ask:.6f} (above wall @ {dynamic_entry:.6f})")
+                send_whatsapp_alert(f"DYNAMIC ENTRY {symbol} @ {ask:.6f}")
                 self.place_buy_at_price(symbol, ask)
                 with self.state_lock:
                     if symbol in trailing_buy_active:
                         del trailing_buy_active[symbol]
                 return
+
+            if len(hist) >= 3:
+                peak = max(hist)
+                cur = hist[-1]
+                if peak >= ORDERBOOK_SELL_PRESSURE_THRESHOLD * 100 and cur <= peak * 0.9:
+                    self.place_buy_at_price(symbol, ask)
+                    with self.state_lock:
+                        if symbol in trailing_buy_active:
+                            del trailing_buy_active[symbol]
+                    return
 
             if ask > state['lowest_price'] * Decimal('1.003'):
                 self.place_buy_at_price(symbol, ask)
@@ -832,7 +864,7 @@ class BinanceTradingBot:
                 send_whatsapp_alert(f"MARKET BUY {symbol} @ {fill:.6f}")
             else:
                 qty = alloc / price
-                adj, err = self.validate_and_adjust_order(symbol, 'BUY', ORDER_TYPE_LIMIT, qty, price)
+                adj, err = self.validate_and_adjust_order(symbol, 'BUY', 'LIMIT', qty, price)
                 if not adj or err:
                     logger.warning(f"Buy validation failed: {err}")
                     return
@@ -875,9 +907,16 @@ class BinanceTradingBot:
             bid = ob['best_bid']
             if bid <= ZERO: return
 
-            if bid > state['peak_price']:
-                state['peak_price'] = bid
+            with self.state_lock:
+                if bid > state['peak_price']:
+                    state['peak_price'] = bid
                 trailing_sell_active[symbol] = state
+
+            if is_fast_move(float(bid), float(state['peak_price']), state['start_time'], direction='down', threshold_pct=0.5):
+                self.place_sell_at_price(symbol, None, force_market=True)
+                with self.state_lock:
+                    trailing_sell_active.pop(symbol, None)
+                return
 
             maker, taker = self.get_trade_fees(symbol)
             net = (bid - state['entry_price']) / state['entry_price'] - Decimal(str(maker)) - Decimal(str(taker))
@@ -895,6 +934,22 @@ class BinanceTradingBot:
                     if symbol in trailing_sell_active:
                         del trailing_sell_active[symbol]
                 return
+
+            with self.state_lock:
+                if symbol not in buy_pressure_history:
+                    buy_pressure_history[symbol] = deque(maxlen=5)
+                buy_pressure_history[symbol].append(ob['pct_bid'])
+                hist = list(buy_pressure_history[symbol])
+
+            if len(hist) >= 3:
+                peak = max(hist)
+                cur = hist[-1]
+                if peak >= ORDERBOOK_BUY_PRESSURE_SPIKE * 100 and cur <= ORDERBOOK_BUY_PRESSURE_DROP * 100:
+                    self.place_sell_at_price(symbol, bid)
+                    with self.state_lock:
+                        if symbol in trailing_sell_active:
+                            del trailing_sell_active[symbol]
+                    return
 
             if self._detect_stall(symbol, bid):
                 self.place_sell_at_price(symbol, None, force_market=True)
@@ -944,7 +999,7 @@ class BinanceTradingBot:
             else:
                 tick = self.get_tick_size(symbol)
                 price = ((price // tick) + 1) * tick
-                adj, err = self.validate_and_adjust_order(symbol, 'SELL', ORDER_TYPE_LIMIT, qty, price)
+                adj, err = self.validate_and_adjust_order(symbol, 'SELL', 'LIMIT', qty, price)
                 if not adj or err:
                     logger.warning(f"Sell validation failed: {err}")
                     return
@@ -1040,6 +1095,14 @@ def place_infinity_grid(bot, symbol):
         send_whatsapp_alert(f"GRID {symbol} | {grid_count} levels | ${usdt_per_grid}")
 
 # === HELPER FUNCTIONS =======================================================
+def is_fast_move(current_price, last_price, last_time, direction='up', threshold_pct=0.5, window_sec=30):
+    now = time.time()
+    if now - last_time > window_sec: return False
+    change = (current_price - last_price) / last_price * 100
+    if direction == 'up' and change >= threshold_pct: return True
+    if direction == 'down' and change <= -threshold_pct: return True
+    return False
+
 def send_whatsapp_alert(message: str):
     if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
         try:
@@ -1050,6 +1113,49 @@ def send_whatsapp_alert(message: str):
 
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def cancel_all_unfilled(bot):
+    # Cancel grid orders
+    with bot.state_lock:
+        for sym, state in list(active_grid_symbols.items()):
+            for oid in state['buy_orders'] + state['sell_orders']:
+                try:
+                    with bot.api_lock:
+                        bot.rate_manager.wait_if_needed('ORDERS')
+                        bot.client.cancel_order(symbol=sym, orderId=oid)
+                        bot.rate_manager.update_current()
+                except Exception as e:
+                    logger.debug(f"Cancel grid order {oid} failed: {e}")
+    
+    # Cancel trailing buy orders
+    with bot.state_lock:
+        for sym, state in list(trailing_buy_active.items()):
+            if 'last_buy_order_id' in state and state['last_buy_order_id']:
+                try:
+                    with bot.api_lock:
+                        bot.rate_manager.wait_if_needed('ORDERS')
+                        bot.client.cancel_order(symbol=sym, orderId=state['last_buy_order_id'])
+                        bot.rate_manager.update_current()
+                except Exception as e:
+                    logger.debug(f"Cancel trailing buy {sym} failed: {e}")
+
+    # Cancel trailing sell orders
+    with bot.state_lock:
+        for sym, state in list(trailing_sell_active.items()):
+            if 'last_sell_order_id' in state and state['last_sell_order_id']:
+                try:
+                    with bot.api_lock:
+                        bot.rate_manager.wait_if_needed('ORDERS')
+                        bot.client.cancel_order(symbol=sym, orderId=state['last_sell_order_id'])
+                        bot.rate_manager.update_current()
+                except Exception as e:
+                    logger.debug(f"Cancel trailing sell {sym} failed: {e}")
+
+    # Clear active grids to re-place
+    with bot.state_lock:
+        active_grid_symbols.clear()
+
+    logger.info("All unfilled orders cancelled.")
 
 # === DASHBOARD ==============================================================
 def print_professional_dashboard(bot):
@@ -1326,11 +1432,16 @@ def main():
 
     last_dashboard = 0
     last_grid_check = 0
+    last_cancel = 0
 
     while True:
         try:
             bot.check_and_process_filled_orders()
             now = time.time()
+
+            if now - last_cancel > 43200:  # 12 hours
+                cancel_all_unfilled(bot)
+                last_cancel = now
 
             if now - last_grid_check > 60:
                 grid_count = calculate_grid_count(bot)
