@@ -856,3 +856,91 @@ class SmartTradingBot:
             logger.error(f"Sell failed: {e}")
             return None
 
+    # ==============================================================
+    # === STRATEGY LOGIC ============================================
+    # ==============================================================
+
+    def get_top_priority_coins(self, limit: int = MAX_SCALED_COINS) -> List[str]:
+        priorities = []
+        for sym in list(self.valid_symbols)[:50]:
+            ob = self.get_order_book_analysis(sym)
+            if ob['best_bid'] == 0: continue
+            rsi, trend, _ = self.get_rsi_and_trend(sym)
+            momentum_ok, _, lookback, _ = self.get_macd_bullish_with_histogram(sym)
+            low, _, pct_change = self.get_24h_price_stats(sym)
+
+            score = 0
+            if rsi and rsi <= RSI_OVERSOLD and trend == 'bullish':
+                score += 30
+            if momentum_ok and lookback <= 4:
+                score += 40
+            if ob['weighted_pressure'] < -0.001:
+                score += 20
+            if pct_change and pct_change > -5:
+                score += 10
+
+            if score > 50:
+                priorities.append((sym, score))
+
+        priorities.sort(key=lambda x: x[1], reverse=True)
+        return [p[0] for p in priorities[:limit]]
+
+    def place_scaled_grids(self):
+        top_coins = self.get_top_priority_coins()
+        balance = float(self.get_balance('USDT'))
+        levels = min(8, int(balance // 25))
+
+        for sym in top_coins:
+            if sym in self.active_grid_symbols or balance < 50:
+                continue
+
+            ob = self.get_order_book_analysis(sym)
+            current_price = ob['mid_price']
+            if current_price < 0.0001 or current_price > 10000:
+                continue
+
+            grid = {
+                'symbol': sym,
+                'base_price': current_price,
+                'levels': levels,
+                'grid_pct': 0.01,
+                'buy_orders': [],
+                'sell_orders': []
+            }
+
+            for i in range(1, levels + 1):
+                buy_price = current_price * (1 - i * grid['grid_pct'])
+                qty = GRID_SIZE_USDT / buy_price
+                qty = self.round_qty(qty, sym)
+                order_id = self.place_limit_buy(sym, qty, buy_price)
+                if order_id:
+                    grid['buy_orders'].append({'price': buy_price, 'qty': qty, 'id': order_id})
+
+            self.active_grid_symbols[sym] = grid
+            balance -= levels * GRID_SIZE_USDT
+
+        self.save_state()
+
+    def manage_trailing_stops(self):
+        for sym, state in list(trailing_sell_active.items()):
+            ob = self.get_order_book_analysis(sym)
+            current = ob['best_bid']
+            peak = float(state['peak_price'])
+            trail_stop = peak * (1 - TRAILING_STOP_PCT)
+            if current <= trail_stop:
+                with DBManager() as sess:
+                    pos = sess.query(Position).filter_by(symbol=sym, status='open').first()
+                    if pos:
+                        self.place_market_sell(sym, float(pos.quantity))
+                        pos.status = 'closed'
+                        del trailing_sell_active[sym]
+        self.save_state()
+
+
+# ==============================================================
+# === MAIN ======================================================
+# ==============================================================
+
+if __name__ == "__main__":
+    bot = SmartTradingBot()
+    bot.run()
