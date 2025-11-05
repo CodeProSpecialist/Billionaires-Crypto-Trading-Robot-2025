@@ -6,6 +6,7 @@
     • Grid orders NEVER cancel (infinity mode)
     • Fallback to trailing momentum if < $40
     • Full dashboard, DB, alerts, rate-limit safe
+    • $5 MINIMUM NOTIONAL FOR ALL BUY & SELL ORDERS
 """
 
 import os
@@ -43,6 +44,8 @@ if not API_KEY or not API_SECRET:
 
 # Grid Config
 GRID_SIZE_USDT = Decimal('5.0')
+MIN_SELL_NOTIONAL_USDT = Decimal('5.0')
+MIN_BUY_NOTIONAL_USDT = Decimal('5.0')  # <-- NEW
 GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5%
 MIN_BUFFER_USDT = Decimal('20.0')
 MAX_GRIDS_HIGH_BALANCE = 16
@@ -111,7 +114,7 @@ trailing_buy_active: Dict[str, dict] = {}
 trailing_sell_active: Dict[str, dict] = {}
 buy_cooldown: Dict[str, float] = {}
 price_history: Dict[str, deque] = {}
-active_grid_symbols: Dict[str, dict] = {}  # Infinity grid state
+active_grid_symbols: Dict[str, dict] = {}
 
 # === SAFE MATH ==============================================================
 def safe_float(value, default=0.0) -> float:
@@ -125,6 +128,17 @@ def to_decimal(value) -> Decimal:
         return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
     except:
         return ZERO
+
+# === NOTIONAL GUARDS ========================================================
+def sell_notional_ok(symbol: str, price: Decimal, qty: Decimal) -> bool:
+    if price <= ZERO or qty <= ZERO:
+        return False
+    return price * qty >= MIN_SELL_NOTIONAL_USDT
+
+def buy_notional_ok(symbol: str, price: Decimal, qty: Decimal) -> bool:
+    if price <= ZERO or qty <= ZERO:
+        return False
+    return price * qty >= MIN_BUY_NOTIONAL_USDT
 
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
@@ -278,21 +292,13 @@ class BinanceTradingBot:
             sess.commit()
         self.load_state_from_db()
 
-    # --------------------------------------------------------------------- #
-    # NEW: validate_and_adjust_order (replaces old helper)
-    # --------------------------------------------------------------------- #
     def validate_and_adjust_order(self, symbol, side, order_type, quantity, price):
-        """
-        Validate and adjust quantity and price according to symbol filters.
-        Returns: (adjusted_dict, error_msg) or (None, error_msg)
-        """
         try:
             with self.api_lock:
                 self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
                 info = self.client.get_symbol_info(symbol)
                 self.rate_manager.update_current()
 
-            # Extract filters
             lot_filter = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
             price_filter = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
 
@@ -305,7 +311,6 @@ class BinanceTradingBot:
                     min_notional = Decimal(f['notional'])
                     break
 
-            # Adjust quantity
             qty = to_decimal(quantity)
             if qty < min_qty:
                 return None, f"Quantity {qty} < min {min_qty}"
@@ -313,13 +318,11 @@ class BinanceTradingBot:
             if qty <= 0:
                 return None, "Adjusted quantity is zero"
 
-            # Adjust price
             prc = to_decimal(price)
             prc = (prc // tick_size) * tick_size
             if prc <= 0:
                 return None, "Adjusted price is zero"
 
-            # Check min notional
             if min_notional > 0 and qty * prc < min_notional:
                 return None, f"Notional {qty * prc} < min {min_notional}"
 
@@ -855,15 +858,27 @@ class BinanceTradingBot:
                         Decimal(str(bal - MIN_BALANCE)))
 
             if force_market or price is None:
+                ob = self.get_order_book_analysis(symbol)
+                ask = Decimal(str(ob['best_ask'])) if ob['best_ask'] else ZERO
+                if ask <= ZERO:
+                    return
+                market_qty = alloc / ask if ask > 0 else ZERO
+                if not buy_notional_ok(symbol, ask, market_qty):
+                    logger.info(f"MARKET BUY SKIPPED {symbol}: notional {ask*market_qty:.2f} USDT < $5")
+                    return
+
                 with self.api_lock:
                     self.rate_manager.wait_if_needed('ORDERS')
                     order = self.client.order_market_buy(symbol=symbol, quoteOrderQty=float(alloc))
                     self.rate_manager.update_current()
-                fill = Decimal(order['fills'][0]['price']) if order['fills'] else Decimal('0')
+                fill = Decimal(order['fills'][0]['price']) if order['fills'] else ZERO
                 logger.info(f"MARKET BUY {symbol} @ {fill}")
                 send_whatsapp_alert(f"MARKET BUY {symbol} @ {fill:.6f}")
             else:
                 qty = alloc / price
+                if not buy_notional_ok(symbol, price, qty):
+                    logger.info(f"TRAILING BUY SKIPPED {symbol}: notional {price*qty:.2f} USDT < $5")
+                    return
                 adj, err = self.validate_and_adjust_order(symbol, 'BUY', 'LIMIT', qty, price)
                 if not adj or err:
                     logger.warning(f"Buy validation failed: {err}")
@@ -979,6 +994,13 @@ class BinanceTradingBot:
         with self.state_lock:
             state = trailing_sell_active.get(symbol, {})
         try:
+            qty = state['qty']
+
+            if not force_market and price is not None:
+                if not sell_notional_ok(symbol, price, Decimal(str(qty))):
+                    logger.info(f"TRAILING SELL SKIPPED {symbol}: notional {price*Decimal(str(qty)):.2f} USDT < $5")
+                    return
+
             if state.get('last_sell_order_id') and not force_market:
                 try:
                     with self.api_lock:
@@ -987,8 +1009,13 @@ class BinanceTradingBot:
                         self.rate_manager.update_current()
                 except: pass
 
-            qty = state['qty']
             if force_market or price is None:
+                ob = self.get_order_book_analysis(symbol)
+                bid = Decimal(str(ob['best_bid'])) if ob['best_bid'] else ZERO
+                if not sell_notional_ok(symbol, bid, Decimal(str(qty))):
+                    logger.info(f"MARKET SELL SKIPPED {symbol}: notional {bid*Decimal(str(qty)):.2f} USDT < $5")
+                    return
+
                 with self.api_lock:
                     self.rate_manager.wait_if_needed('ORDERS')
                     order = self.client.order_market_sell(symbol=symbol, quantity=float(qty))
@@ -1074,20 +1101,28 @@ def place_infinity_grid(bot, symbol):
         buy_price = (buy_price // tick) * tick
         sell_price = (sell_price // tick) * tick
 
-        order_buy = bot.place_limit_buy_with_tracking(
-            symbol, str(buy_price), float(base_qty)
-        )
-        if order_buy:
-            grid_state['buy_orders'].append(str(order_buy['orderId']))
+        buy_price_dec = buy_price
+        if buy_notional_ok(symbol, buy_price_dec, base_qty):
+            order_buy = bot.place_limit_buy_with_tracking(
+                symbol, str(buy_price), float(base_qty)
+            )
+            if order_buy:
+                grid_state['buy_orders'].append(str(order_buy['orderId']))
+        else:
+            logger.info(f"GRID BUY SKIPPED {symbol}: notional {buy_price_dec*base_qty:.2f} USDT < $5")
 
         with DBManager() as sess:
             pos = sess.query(Position).filter_by(symbol=symbol).first()
             if pos and float(pos.quantity) >= float(base_qty):
-                order_sell = bot.place_limit_sell_with_tracking(
-                    symbol, str(sell_price), float(base_qty)
-                )
-                if order_sell:
-                    grid_state['sell_orders'].append(str(order_sell['orderId']))
+                sell_price_dec = sell_price
+                if sell_notional_ok(symbol, sell_price_dec, base_qty):
+                    order_sell = bot.place_limit_sell_with_tracking(
+                        symbol, str(sell_price), float(base_qty)
+                    )
+                    if order_sell:
+                        grid_state['sell_orders'].append(str(order_sell['orderId']))
+                else:
+                    logger.info(f"GRID SELL SKIPPED {symbol}: notional {sell_price_dec*base_qty:.2f} USDT < $5")
 
     if grid_state['buy_orders']:
         active_grid_symbols[symbol] = grid_state
@@ -1115,7 +1150,6 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def cancel_all_unfilled(bot):
-    # Cancel grid orders
     with bot.state_lock:
         for sym, state in list(active_grid_symbols.items()):
             for oid in state['buy_orders'] + state['sell_orders']:
@@ -1127,7 +1161,6 @@ def cancel_all_unfilled(bot):
                 except Exception as e:
                     logger.debug(f"Cancel grid order {oid} failed: {e}")
     
-    # Cancel trailing buy orders
     with bot.state_lock:
         for sym, state in list(trailing_buy_active.items()):
             if 'last_buy_order_id' in state and state['last_buy_order_id']:
@@ -1139,7 +1172,6 @@ def cancel_all_unfilled(bot):
                 except Exception as e:
                     logger.debug(f"Cancel trailing buy {sym} failed: {e}")
 
-    # Cancel trailing sell orders
     with bot.state_lock:
         for sym, state in list(trailing_sell_active.items()):
             if 'last_sell_order_id' in state and state['last_sell_order_id']:
@@ -1151,7 +1183,6 @@ def cancel_all_unfilled(bot):
                 except Exception as e:
                     logger.debug(f"Cancel trailing sell {sym} failed: {e}")
 
-    # Clear active grids to re-place
     with bot.state_lock:
         active_grid_symbols.clear()
 
@@ -1349,7 +1380,7 @@ def print_professional_dashboard(bot):
 
     except Exception as e:
         logger.error(f"Dashboard print failed: {e}", exc_info=True)
-        print(f"{RED}DASHBOARD ERROR: {e}{RESET}")
+        print(f"{RED}DASHBOARD ERROR: { | {RESET}")
 
 # === THREADS ================================================================
 def buy_scanner(bot):
