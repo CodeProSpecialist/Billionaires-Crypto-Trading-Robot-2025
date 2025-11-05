@@ -20,6 +20,9 @@ import requests
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
+
+from colorama import init, Fore, Style
+
 from collections import deque
 import threading
 import pytz
@@ -883,21 +886,247 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Sell failed: {e}")
 
-    # === DASHBOARD ==========================================================
-    def print_professional_dashboard(self):
-        print("\n" + "="*120)
-        print(f" BINANCE GRID + TRAILING BOT | {datetime.now(CST_TZ):%Y-%m-%d %H:%M:%S CST} ")
-        print("="*120)
-        usdt = self.get_balance('USDT')
-        print(f"USDT: ${float(usdt):.2f} | GRID: {'ON' if usdt >= 40 else 'OFF'}")
-        print(f"ACTIVE GRIDS: {len(active_grid_symbols)}")
-        print("-"*120)
-        print("SYMBOL        | GRID | SCORE | STATUS")
-        print("-"*120)
-        for sym, data in active_grid_symbols.items():
-            score = data.get('score', 0)
-            print(f"{sym:<12} | {data['grid_count']:>4} | {score:>5.2f} | ACTIVE")
-        print("="*120)
+    # === PROFESSIONAL DASHBOARD =====================================================
+
+# Initialize colorama for cross-platform colored output
+init(autoreset=True)
+
+# ANSI Color & Style Constants
+class Color:
+    GREEN   = Fore.GREEN + Style.BRIGHT
+    RED     = Fore.RED + Style.BRIGHT
+    YELLOW  = Fore.YELLOW + Style.BRIGHT
+    CYAN    = Fore.CYAN + Style.BRIGHT
+    MAGENTA = Fore.MAGENTA + Style.BRIGHT
+    WHITE   = Fore.WHITE + Style.BRIGHT
+    GRAY    = Fore.LIGHTBLACK_EX
+    RESET   = Style.RESET_ALL
+    BOLD    = Style.BRIGHT
+    DIM     = Style.DIM
+
+DIVIDER = "=" * 120
+
+
+def print_professional_dashboard(bot) -> None:
+    """Prints a live, real-time professional trading dashboard."""
+    try:
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        # === HEADER ===
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}{Color.WHITE}{'INFINITY GRID + TRAILING HYBRID BOT':^120}{Color.RESET}")
+        print(Color.CYAN + DIVIDER)
+
+        # === CORE METRICS ===
+        now_str = now_cst()
+        usdt_free = bot.get_balance('USDT')
+        total_port, _ = bot.calculate_total_portfolio_value()
+        tbuy_cnt = len(trailing_buy_active)
+        tsel_cnt = len(trailing_sell_active)
+        grid_count = sum(len(s['buy_orders']) for s in active_grid_symbols.values())
+
+        print(f"{Color.GRAY}Time (CST):{Color.RESET} {Color.YELLOW}{now_str}{Color.RESET}")
+        print(f"{Color.GRAY}Free USDT:{Color.RESET}  ${Color.GREEN}{float(usdt_free):,.6f}{Color.RESET}")
+        print(f"{Color.GRAY}Portfolio:{Color.RESET}  ${Color.CYAN}{total_port:,.6f}{Color.RESET}")
+        print(f"{Color.GRAY}Trailing: {Color.MAGENTA}{tbuy_cnt}{Color.RESET} buys, {Color.MAGENTA}{tsel_cnt}{Color.RESET} sells")
+        print(f"{Color.GRAY}Grid Orders:{Color.RESET} {Color.YELLOW}{grid_count}{Color.RESET} × $5")
+
+        # === STRATEGY MODE ===
+        balance = float(usdt_free)
+        mode, grid_levels = _determine_strategy_mode(balance, grid_count, tbuy_cnt + tsel_cnt)
+        mode_color = Color.GREEN if "GRID" in mode else Color.YELLOW if tbuy_cnt + tsel_cnt > 0 else Color.RED
+        print(f"\n{Color.BOLD}Strategy Mode:{Color.RESET} {mode_color}{mode}{Color.RESET}")
+
+        # === DEPTH IMBALANCE BARS ===
+        print(f"\n{Color.BOLD}DEPTH IMBALANCE (Top 10 by 24h Volume){Color.RESET}")
+        _print_depth_imbalance_bars(bot)
+
+        # === ORDER BOOK LADDER ===
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}ORDER BOOK LADDER (Top 3 Active){Color.RESET}")
+        _print_order_book_ladders(bot)
+
+        # === POSITIONS & P&L ===
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}{'CURRENT POSITIONS & P&L':^120}{Color.RESET}")
+        total_pnl = _print_positions_table(bot)
+
+        # === MARKET OVERVIEW & SIGNALS ===
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}{'MARKET OVERVIEW':^120}{Color.RESET}")
+        _print_market_overview_and_signals(bot)
+
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}TOTAL UNREALIZED P&L: {Color.GREEN if total_pnl > 0 else Color.RED}${float(total_pnl):,.2f}{Color.RESET}")
+        print(Color.CYAN + DIVIDER)
+
+    except Exception as e:
+        print(f"{Color.RED}DASHBOARD ERROR: {e}{Color.RESET}")
+
+
+def _determine_strategy_mode(balance: float, grid_count: int, trailing_count: int) -> Tuple[str, int]:
+    """Determine current bot strategy mode based on balance and activity."""
+    if balance >= 80:
+        levels = min(16, int((balance - 20) // 5))
+        return f"INFINITY GRID ({levels} levels)", levels
+    elif balance >= 60:
+        levels = min(10, max(6, int((balance - 20) // 5)))
+        return f"INFINITY GRID ({levels} levels)", levels
+    elif balance >= 40:
+        return "INFINITY GRID (4 levels)", 4
+    else:
+        return "TRAILING MOMENTUM", 0
+
+
+def _print_depth_imbalance_bars(bot) -> None:
+    """Print top 10 symbols with depth imbalance bars."""
+    sorted_symbols = sorted(
+        valid_symbols_dict.items(),
+        key=lambda x: x[1]['volume'],
+        reverse=True
+    )[:10]
+
+    BAR_WIDTH = 50
+    for sym, info in sorted_symbols:
+        ob = bot.get_order_book_analysis(sym)
+        pct_bid = ob['pct_bid']
+        pct_ask = 100 - pct_bid
+
+        bid_blocks = int(pct_bid / 2)
+        ask_blocks = int(pct_ask / 2)
+        neutral = BAR_WIDTH - bid_blocks - ask_blocks
+
+        bar = (Color.GREEN + "█" * bid_blocks +
+               Color.GRAY + "░" * max(0, neutral) +
+               Color.RED + "█" * ask_blocks + Color.RESET)
+
+        bias = ("strong bid wall" if pct_bid > 60 else
+                "strong ask pressure" if pct_bid < 40 else
+                "balanced")
+
+        coin = sym.replace("USDT", "")
+        print(f"{Color.CYAN}{coin:<8}{Color.RESET} |{bar}| {Color.GREEN}{pct_bid:>3.0f}%{Color.RESET} / {Color.RED}{pct_ask:>3.0f}%{Color.RESET}")
+        print(f"{'':<10} {Color.DIM}{bias}{Color.RESET}")
+        print()
+
+
+def _print_order_book_ladders(bot) -> None:
+    """Print order book ladder for top 3 active symbols."""
+    ladder_symbols = list(active_grid_symbols.keys())[:3]
+    if not ladder_symbols:
+        ladder_symbols = [s for s, _ in sorted(valid_symbols_dict.items(), key=lambda x: x[1]['volume'], reverse=True)[:3]]
+
+    for sym in ladder_symbols:
+        ob = bot.get_order_book_analysis(sym)
+        bids = ob.get('raw_bids', [])[:5]
+        asks = ob.get('raw_asks', [])[:5]
+        mid = ob['mid_price']
+
+        coin = sym.replace("USDT", "")
+        print(f"  {Color.MAGENTA}{coin:>8}{Color.RESET} | Mid: ${Color.YELLOW}{mid:,.6f}{Color.RESET}")
+        print(f"    {Color.GREEN}BIDS{' ' * 22}|{' ' * 27}ASKS{Color.RESET}")
+        print(f"    {'-' * 27} | {'-' * 27}")
+        for i in range(5):
+            bid_price = float(bids[i][0]) if i < len(bids) else 0.0
+            bid_qty = float(bids[i][1]) if i < len(bids) else 0.0
+            ask_price = float(asks[i][0]) if i < len(asks) else 0.0
+            ask_qty = float(asks[i][1]) if i < len(asks) else 0.0
+            print(f"    {Color.GREEN}{bid_price:>10.6f} x {bid_qty:>7.2f}{Color.RESET} | "
+                  f"{Color.RED}{ask_price:<10.6f} x {ask_qty:>7.2f}{Color.RESET}")
+        print()
+
+
+def _print_positions_table(bot) -> Decimal:
+    """Print positions table and return total P&L."""
+    print(f"{'SYM':<8} {'QTY':>10} {'ENTRY':>12} {'CUR':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS'}")
+    print("-" * 120)
+
+    with DBManager() as sess:
+        positions_list = sess.query(Position).all()[:15]
+
+    total_pnl = Decimal('0')
+    for pos in positions_list:
+        sym = pos.symbol
+        qty = float(pos.quantity)
+        entry = float(pos.avg_entry_price)
+        ob = bot.get_order_book_analysis(sym)
+        cur = float(ob['best_bid'] or ob['best_ask'] or 0)
+        rsi, _, _ = bot.get_rsi_and_trend(sym)
+        rsi_str = f"{rsi:5.1f}" if rsi else "N/A"
+
+        maker, taker = bot.get_trade_fees(sym)
+        gross = (cur - entry) * qty
+        fee = (maker + taker) * cur * qty
+        net = Decimal(str(gross - fee))
+        total_pnl += net
+
+        pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100 if entry > 0 else 0.0
+
+        status = "Monitoring"
+        if sym in trailing_sell_active:
+            state = trailing_sell_active[sym]
+            peak = float(state['peak_price'])
+            ob_data = bot.get_order_book_analysis(sym)
+            stop = bot.get_dynamic_stop(sym, Decimal(str(peak)), ob_data)
+            status = f"Trail Sell @ {float(stop):.6f}"
+        elif sym in trailing_buy_active:
+            state = trailing_buy_active[sym]
+            low = float(state['lowest_price'])
+            ob_data = bot.get_order_book_analysis(sym)
+            entry_trail = bot.get_dynamic_entry(sym, Decimal(str(low)), ob_data)
+            status = f"Trail Buy @ {float(entry_trail):.6f}"
+
+        pnl_color = Color.GREEN if net > 0 else Color.RED
+        pct_color = Color.GREEN if pnl_pct > 0 else Color.RED
+
+        print(f"{Color.CYAN}{sym:<8}{Color.RESET} "
+              f"{qty:>10.6f} {entry:>12.6f} {cur:>12.6f} "
+              f"{Color.YELLOW}{rsi_str}{Color.RESET} "
+              f"{pct_color}{pnl_pct:>7.2f}%{Color.RESET} "
+              f"{pnl_color}{net:>9.2f}{Color.RESET} "
+              f"{Color.DIM}{status}{Color.RESET}")
+
+    # Fill empty rows
+    for _ in range(len(positions_list), 15):
+        print(" " * 120)
+
+    return total_pnl
+
+
+def _print_market_overview_and_signals(bot) -> None:
+    """Print market stats and smart buy signals."""
+    valid_cnt = len(valid_symbols_dict)
+    avg_vol = sum(s['volume'] for s in valid_symbols_dict.values()) / valid_cnt if valid_cnt else 0
+
+    print(f"Valid Symbols: {Color.CYAN}{valid_cnt}{Color.RESET}")
+    print(f"Avg 24h Volume: ${Color.YELLOW}{avg_vol:,.0f}{Color.RESET}")
+    print(f"Price Range: ${Color.GRAY}{MIN_PRICE}{Color.RESET} → ${Color.GRAY}{MAX_PRICE}{Color.RESET}")
+
+    # Smart Buy Signals
+    watch_items = []
+    for sym in valid_symbols_dict:
+        ob = bot.get_order_book_analysis(sym)
+        rsi, trend, _ = bot.get_rsi_and_trend(sym)
+        bid = ob.get('best_bid')
+        if not bid or not rsi: continue
+
+        custom_low, _, _ = bot.get_24h_price_stats(sym)
+        if not custom_low: continue
+
+        strong_buy = (ob['depth_skew'] == 'strong_ask' and
+                      ob['imbalance_ratio'] <= 0.5 and
+                      ob['weighted_pressure'] < -0.002)
+
+        if (rsi <= RSI_OVERSOLD and trend == 'bullish' and
+            bid <= Decimal(str(custom_low)) * Decimal('1.01') and strong_buy):
+            coin = sym.replace('USDT', '')
+            watch_items.append(f"{coin}({rsi:.0f})")
+
+    signal_str = " | ".join(watch_items[:18]) if watch_items else "No strong buy signals"
+    if len(signal_str) > 100:
+        signal_str = signal_str[:97] + "..."
+
+    print(f"\n{Color.BOLD}Smart Buy Signals:{Color.RESET} {Color.GREEN}{signal_str}{Color.RESET}")
 
     # === MAIN LOOP ==========================================================
 def main():
