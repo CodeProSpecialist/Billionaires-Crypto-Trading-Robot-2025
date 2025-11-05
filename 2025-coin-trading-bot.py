@@ -1456,7 +1456,7 @@ def main():
                         send_whatsapp_alert(f"GRID OFF: {sym} (<$40)")
                 last_grid_check = now
 
-            if now - last_dashboard >= 45:
+            if now - last_dashboard >= 10:
                 print_professional_dashboard(bot)
                 last_dashboard = now
 
