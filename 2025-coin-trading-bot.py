@@ -1466,8 +1466,14 @@ def trailing_sell_processor(bot):
 def main():
     bot = BinanceTradingBot()
     bot.fetch_and_validate_usdt_pairs()
-    bot.sync_positions_from_binance()  # Initial sync
-
+    
+    # ---- ONE-TIME ONLY ----
+    if not bot.symbols_initialised:
+        bot.fetch_and_validate_usdt_pairs()
+        bot.sync_positions_from_binance()      # still needed once
+        bot.symbols_initialised = True
+    # -----------------------
+    
     threading.Thread(target=buy_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=sell_scanner, args=(bot,), daemon=True).start()
     threading.Thread(target=trailing_buy_processor, args=(bot,), daemon=True).start()
