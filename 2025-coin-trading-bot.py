@@ -1380,7 +1380,7 @@ def print_professional_dashboard(bot):
 
     except Exception as e:
         logger.error(f"Dashboard print failed: {e}", exc_info=True)
-        print(f"{RED}DASHBOARD ERROR: { | {RESET}")
+        print(f"{RED}DASHBOARD ERROR: {e}{RESET}")
 
 # === THREADS ================================================================
 def buy_scanner(bot):
