@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
     INFINITY GRID + TRAILING HYBRID BOT – Binance Spot
-    • Configurable $ dollar amount per grid to buy
+    • Configureable $ dollar amount per grid to buy
     • 4–16 grids based on balance
     • Grid orders NEVER cancel (infinity mode)
     • Fallback to trailing momentum if < $40
     • Full dashboard, DB, alerts, rate-limit safe
-    • Configurable MINIMUM NOTIONAL $ dollar amount FOR ALL BUY & SELL ORDERS
+    • Configureable MINIMUM NOTIONAL $ dollar amount FOR ALL BUY & SELL ORDERS
     • REAL-TIME BALANCE CHECKS BEFORE EVERY ORDER
 """
 
