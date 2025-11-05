@@ -1493,10 +1493,14 @@ def main():
         try:
             bot.check_and_process_filled_orders()
             now = time.time()
-
-            if now - last_sync > 600:
+            # the 3 lines below only sync cash balances
+            # because syncing positions more 
+            # than 1 time freezes up the sqlalchemy database 
+            # ( we do not need to sync owned 
+            # positions because it freezes the main loop )
+            if now - last_pos_sync > 600:
                 bot.sync_positions_from_binance()
-                last_sync = now
+                last_pos_sync = now
 
             if now - last_cancel > 43200:  # 12 hours
                 cancel_all_unfilled(bot)
