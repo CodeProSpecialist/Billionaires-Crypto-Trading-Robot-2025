@@ -45,7 +45,7 @@ if not API_KEY or not API_SECRET:
 
 # Grid Config
 GRID_SIZE_USDT = Decimal('5.0')
-MIN_SELL_NOTIONAL_USDT = Decimal('5.0')
+MIN_SELL_NOTIONAL_USDT = Decimal('3.25')
 MIN_BUY_NOTIONAL_USDT = Decimal('1.25')
 GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5%
 MIN_BUFFER_USDT = Decimal('8.0')
