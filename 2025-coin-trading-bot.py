@@ -546,209 +546,216 @@ class SmartTradingBot:
         # Similar for trailing buys...
 
     # === DASHBOARD ===
-    def print_professional_dashboard(self) -> None:
-        """Print live dashboard."""
-        try:
-            os.system('cls' if os.name == 'nt' else 'clear')
 
-            # Colors
-            class Color:
-                GREEN   = Fore.GREEN + Style.BRIGHT
-                RED     = Fore.RED + Style.BRIGHT
-                YELLOW  = Fore.YELLOW + Style.BRIGHT
-                CYAN    = Fore.CYAN + Style.BRIGHT
-                MAGENTA = Fore.MAGENTA + Style.BRIGHT
-                WHITE   = Fore.WHITE + Style.BRIGHT
-                GRAY    = Fore.LIGHTBLACK_EX
-                RESET   = Style.RESET_ALL
-                BOLD    = Style.BRIGHT
-                DIM     = Style.DIM
+# Initialize colorama (call once at startup)
+init(autoreset=True)  # Auto-resets colors after each print
 
-            DIVIDER = "=" * 120
+def print_professional_dashboard(self) -> None:
+    """Print live dashboard."""
+    try:
+        os.system('cls' if os.name == 'nt' else 'clear')
 
-            print(Color.CYAN + DIVIDER)
-            print(f"{Color.BOLD}{Color.WHITE}{'INFINITY GRID + TRAILING HYBRID BOT - BINANCE.US':^120}{Color.RESET}")
-            print(Color.CYAN + DIVIDER)
+        # Colors (using colorama correctly)
+        class Color:
+            GREEN   = Fore.GREEN + Style.BRIGHT
+            RED     = Fore.RED + Style.BRIGHT
+            YELLOW  = Fore.YELLOW + Style.BRIGHT
+            CYAN    = Fore.CYAN + Style.BRIGHT
+            MAGENTA = Fore.MAGENTA + Style.BRIGHT
+            WHITE   = Fore.WHITE + Style.BRIGHT
+            GRAY    = Fore.LIGHTBLACK_EX      # Fixed: GRAY → LIGHTBLACK_EX
+            RESET   = Style.RESET_ALL
+            BOLD    = Style.BRIGHT
+            DIM     = Style.DIM
 
-            now_str = now_cst()
-            usdt_free = self.get_balance('USDT')
-            total_port, _ = self.calculate_total_portfolio_value()
-            tbuy_cnt = len(trailing_buy_active)
-            tsel_cnt = len(trailing_sell_active)
-            grid_count = sum(len(s['buy_orders']) for s in active_grid_symbols.values())
+        DIVIDER = "=" * 120
 
-            print(f"{Color.GRAY}Time (CST):{Color.RESET} {Color.YELLOW}{now_str}{Color.RESET}")
-            print(f"{Color.GRAY}Free USDT:{Color.RESET}  ${Color.GREEN}{float(usdt_free):,.2f}{Color.RESET}")
-            print(f"{Color.GRAY}Portfolio:{Color.RESET}  ${Color.CYAN}{float(total_port):,.2f}{Color.RESET}")
-            print(f"{Color.GRAY}Trailing: {Color.MAGENTA}{tbuy_cnt}{Color.RESET} buys, {Color.MAGENTA}{tsel_cnt}{Color.RESET} sells")
-            print(f"{Color.GRAY}Grid Orders:{Color.RESET} {Color.YELLOW}{grid_count}{Color.RESET} × $5")
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}{Color.WHITE}{'INFINITY GRID + TRAILING HYBRID BOT - BINANCE.US':^120}{Color.RESET}")
+        print(Color.CYAN + DIVIDER)
 
-            balance = float(usdt_free)
-            mode, grid_levels = self._determine_strategy_mode(balance, grid_count, tbuy_cnt + tsel_cnt)
-            mode_color = Color.GREEN if "GRID" in mode else Color.YELLOW if tbuy_cnt + tsel_cnt > 0 else Color.RED
-            print(f"\n{Color.BOLD}Strategy Mode:{Color.RESET} {mode_color}{mode}{Color.RESET}")
+        now_str = now_cst()
+        usdt_free = self.get_balance('USDT')
+        total_port, _ = self.calculate_total_portfolio_value()
+        tbuy_cnt = len(trailing_buy_active)
+        tsel_cnt = len(trailing_sell_active)
+        grid_count = sum(len(s['buy_orders']) for s in active_grid_symbols.values())
 
-            # Depth Imbalance Bars (Top 10)
-            print(f"\n{Color.BOLD}DEPTH IMBALANCE (Top 10 by Volume){Color.RESET}")
-            self._print_depth_imbalance_bars()
+        print(f"{Color.GRAY}Time (CST):{Color.RESET} {Color.YELLOW}{now_str}{Color.RESET}")
+        print(f"{Color.GRAY}Free USDT:{Color.RESET}  ${Color.GREEN}{float(usdt_free):,.2f}{Color.RESET}")
+        print(f"{Color.GRAY}Portfolio:{Color.RESET}  ${Color.CYAN}{float(total_port):,.2f}{Color.RESET}")
+        print(f"{Color.GRAY}Trailing: {Color.MAGENTA}{tbuy_cnt}{Color.RESET} buys, {Color.MAGENTA}{tsel_cnt}{Color.RESET} sells")
+        print(f"{Color.GRAY}Grid Orders:{Color.RESET} {Color.YELLOW}{grid_count}{Color.RESET} × $5")
 
-            # Order Book Ladder
-            print(Color.CYAN + DIVIDER)
-            print(f"{Color.BOLD}ORDER BOOK LADDER (Top 3 Active){Color.RESET}")
-            self._print_order_book_ladders()
+        balance = float(usdt_free)
+        mode, grid_levels = self._determine_strategy_mode(balance, grid_count, tbuy_cnt + tsel_cnt)
+        mode_color = Color.GREEN if "GRID" in mode else Color.YELLOW if tbuy_cnt + tsel_cnt > 0 else Color.RED
+        print(f"\n{Color.BOLD}Strategy Mode:{Color.RESET} {mode_color}{mode}{Color.RESET}")
 
-            # Positions & P&L
-            print(Color.CYAN + DIVIDER)
-            print(f"{Color.BOLD}{'CURRENT POSITIONS & P&L':^120}{Color.RESET}")
-            total_pnl = self._print_positions_table()
+        # Depth Imbalance Bars (Top 10)
+        print(f"\n{Color.BOLD}DEPTH IMBALANCE (Top 10 by Volume){Color.RESET}")
+        self._print_depth_imbalance_bars()
 
-            # Market Overview
-            print(Color.CYAN + DIVIDER)
-            print(f"{Color.BOLD}{'MARKET OVERVIEW':^120}{Color.RESET}")
-            self._print_market_overview_and_signals()
+        # Order Book Ladder
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}ORDER BOOK LADDER (Top 3 Active){Color.RESET}")
+        self._print_order_book_ladders()
 
-            print(Color.CYAN + DIVIDER)
-            total_pnl_color = Color.GREEN if total_pnl > 0 else Color.RED
-            print(f"{Color.BOLD}TOTAL UNREALIZED P&L: {total_pnl_color}${float(total_pnl):,.2f}{Color.RESET}")
-            print(Color.CYAN + DIVIDER)
+        # Positions & P&L
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}{'CURRENT POSITIONS & P&L':^120}{Color.RESET}")
+        total_pnl = self._print_positions_table()
 
-        except Exception as e:
-            logger.error(f"Dashboard error: {e}")
-            print(f"{Fore.RED}DASHBOARD ERROR: {e}{Style.RESET_ALL}")
+        # Market Overview
+        print(Color.CYAN + DIVIDER)
+        print(f"{Color.BOLD}{'MARKET OVERVIEW':^120}{Color.RESET}")
+        self._print_market_overview_and_signals()
 
-    def _determine_strategy_mode(self, balance: float, grid_count: int, trailing_count: int) -> Tuple[str, int]:
-        if balance >= 80:
-            levels = min(8, int((balance - 20) // 5))  # Reduced for US
-            return f"INFINITY GRID ({levels} levels)", levels
-        elif balance >= 60:
-            levels = min(6, max(4, int((balance - 20) // 5)))
-            return f"INFINITY GRID ({levels} levels)", levels
-        elif balance >= 40:
-            return "INFINITY GRID (3 levels)", 3
-        else:
-            return "TRAILING MOMENTUM", 0
+        print(Color.CYAN + DIVIDER)
+        total_pnl_color = Color.GREEN if total_pnl > 0 else Color.RED
+        print(f"{Color.BOLD}TOTAL UNREALIZED P&L: {total_pnl_color}${float(total_pnl):,.2f}{Color.RESET}")
+        print(Color.CYAN + DIVIDER)
 
-    def _print_depth_imbalance_bars(self) -> None:
-        # Simplified: Sort by assumed volume (fetch if needed)
-        sorted_symbols = sorted(self.valid_symbols_dict.keys())[:10]
-        BAR_WIDTH = 50
-        for sym in sorted_symbols:
-            ob = self.get_order_book_analysis(sym)
-            pct_bid = ob['pct_bid']
-            pct_ask = 100 - pct_bid
-            bid_blocks = int(pct_bid / 2)
-            ask_blocks = int(pct_ask / 2)
-            neutral = BAR_WIDTH - bid_blocks - ask_blocks
-            bar = (Fore.GREEN + "█" * bid_blocks +
-                   Fore.LIGHTBLACK_EX + "░" * max(0, neutral) +
-                   Fore.RED + "█" * ask_blocks + Style.RESET_ALL)
-            bias = ("strong bid wall" if pct_bid > 60 else
-                    "strong ask pressure" if pct_bid < 40 else "balanced")
-            coin = sym.replace("USDT", "")
-            print(f"{Fore.CYAN}{coin:<8}{Style.RESET_ALL} |{bar}| {Fore.GREEN}{pct_bid:>3.0f}%{Style.RESET_ALL} / {Fore.RED}{pct_ask:>3.0f}%{Style.RESET_ALL}")
-            print(f"{'':<10} {Style.DIM}{bias}{Style.RESET_ALL}")
-            print()
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        print(f"{Fore.RED}DASHBOARD ERROR: {e}{Style.RESET_ALL}")
 
-    def _print_order_book_ladders(self) -> None:
-        ladder_symbols = list(active_grid_symbols.keys())[:3] or list(self.valid_symbols)[:3]
-        for sym in ladder_symbols:
-            ob = self.get_order_book_analysis(sym)
-            bids = ob.get('raw_bids', [])[:5]
-            asks = ob.get('raw_asks', [])[:5]
-            mid = ob['mid_price']
-            coin = sym.replace("USDT", "")
-            print(f"  {Fore.MAGENTA}{coin:>8}{Style.RESET_ALL} | Mid: ${Fore.YELLOW}{mid:,.4f}{Style.RESET_ALL}")
-            print(f"    {Fore.GREEN}BIDS{' ' * 22}|{' ' * 27}ASKS{Style.RESET_ALL}")
-            print(f"    {'-' * 27} | {'-' * 27}")
-            for i in range(5):
-                bid_price = float(bids[i][0]) if i < len(bids) else 0.0
-                bid_qty = float(bids[i][1]) if i < len(bids) else 0.0
-                ask_price = float(asks[i][0]) if i < len(asks) else 0.0
-                ask_qty = float(asks[i][1]) if i < len(asks) else 0.0
-                print(f"    {Fore.GREEN}{bid_price:>10.4f} x {bid_qty:>7.2f}{Style.RESET_ALL} | "
-                      f"{Fore.RED}{ask_price:<10.4f} x {ask_qty:>7.2f}{Style.RESET_ALL}")
-            print()
 
-    def _print_positions_table(self) -> Decimal:
-        print(f"{'SYM':<8} {'QTY':>10} {'ENTRY':>12} {'CUR':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS'}")
-        print("-" * 120)
+def _determine_strategy_mode(self, balance: float, grid_count: int, trailing_count: int) -> Tuple[str, int]:
+    if balance >= 80:
+        levels = min(8, int((balance - 20) // 5))  # Reduced for US
+        return f"INFINITY GRID ({levels} levels)", levels
+    elif balance >= 60:
+        levels = min(6, max(4, int((balance - 20) // 5)))
+        return f"INFINITY GRID ({levels} levels)", levels
+    elif balance >= 40:
+        return "INFINITY GRID (3 levels)", 3
+    else:
+        return "TRAILING MOMENTUM", 0
 
-        with DBManager() as sess:
-            positions_list = sess.query(Position).filter_by(status='open').all()[:15]
 
-        total_pnl = Decimal('0')
-        for pos in positions_list:
-            sym = pos.symbol
-            qty = float(pos.quantity)
-            entry = float(pos.avg_entry_price)
-            ob = self.get_order_book_analysis(sym)
-            cur = float(ob['best_bid'] or ob['best_ask'] or 0)
-            rsi, _, _ = self.get_rsi_and_trend(sym)
-            rsi_str = f"{rsi:5.1f}" if rsi else "N/A "
+def _print_depth_imbalance_bars(self) -> None:
+    sorted_symbols = sorted(self.valid_symbols_dict.keys())[:10]
+    BAR_WIDTH = 50
+    for sym in sorted_symbols:
+        ob = self.get_order_book_analysis(sym)
+        pct_bid = ob['pct_bid']
+        pct_ask = 100 - pct_bid
+        bid_blocks = int(pct_bid / 2)
+        ask_blocks = int(pct_ask / 2)
+        neutral = BAR_WIDTH - bid_blocks - ask_blocks
+        bar = (Fore.GREEN + "█" * bid_blocks +
+               Fore.LIGHTBLACK_EX + "░" * max(0, neutral) +
+               Fore.RED + "█" * ask_blocks + Style.RESET_ALL)
+        bias = ("strong bid wall" if pct_bid > 60 else
+                "strong ask pressure" if pct_bid < 40 else "balanced")
+        coin = sym.replace("USDT", "")
+        print(f"{Fore.CYAN}{coin:<8}{Style.RESET_ALL} |{bar}| {Fore.GREEN}{pct_bid:>3.0f}%{Style.RESET_ALL} / {Fore.RED}{pct_ask:>3.0f}%{Style.RESET_ALL}")
+        print(f"{'':<10} {Style.DIM}{bias}{Style.RESET_ALL}")
+        print()
 
-            maker, taker = self.get_trade_fees(sym)
-            gross = (cur - entry) * qty
-            fee = (maker + taker) * cur * qty  # Approx round-trip
-            net = gross - fee
-            total_pnl += Decimal(str(net))
 
-            pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100 if entry > 0 else 0.0
+def _print_order_book_ladders(self) -> None:
+    ladder_symbols = list(active_grid_symbols.keys())[:3] or list(self.valid_symbols)[:3]
+    for sym in ladder_symbols:
+        ob = self.get_order_book_analysis(sym)
+        bids = ob.get('raw_bids', [])[:5]
+        asks = ob.get('raw_asks', [])[:5]
+        mid = ob['mid_price']
+        coin = sym.replace("USDT", "")
+        print(f"  {Fore.MAGENTA}{coin:>8}{Style.RESET_ALL} | Mid: ${Fore.YELLOW}{mid:,.4f}{Style.RESET_ALL}")
+        print(f"    {Fore.GREEN}BIDS{' ' * 22}|{' ' * 27}ASKS{Style.RESET_ALL}")
+        print(f"    {'-' * 27} | {'-' * 27}")
+        for i in range(5):
+            bid_price = float(bids[i][0]) if i < len(bids) else 0.0
+            bid_qty = float(bids[i][1]) if i < len(bids) else 0.0
+            ask_price = float(asks[i][0]) if i < len(asks) else 0.0
+            ask_qty = float(asks[i][1]) if i < len(asks) else 0.0
+            print(f"    {Fore.GREEN}{bid_price:>10.4f} x {bid_qty:>7.2f}{Style.RESET_ALL} | "
+                  f"{Fore.RED}{ask_price:<10.4f} x {ask_qty:>7.2f}{Style.RESET_ALL}")
+        print()
 
-            status = "Spot Hold"
-            if sym in trailing_sell_active:
-                state = trailing_sell_active[sym]
-                peak = float(state['peak_price'])
-                stop = peak * (1 - TRAILING_STOP_PCT)
-                status = f"Trail Sell @ {stop:.4f}"
 
-            pnl_color = Fore.GREEN if net > 0 else Fore.RED
-            pct_color = Fore.GREEN if pnl_pct > 0 else Fore.RED
+def _print_positions_table(self) -> Decimal:
+    print(f"{'SYM':<8} {'QTY':>10} {'ENTRY':>12} {'CUR':>12} {'RSI':>6} {'P&L%':>8} {'PROFIT':>10} {'STATUS'}")
+    print("-" * 120)
 
-            print(f"{Fore.CYAN}{sym:<8}{Style.RESET_ALL} "
-                  f"{qty:>10.6f} {entry:>12.4f} {cur:>12.4f} "
-                  f"{Fore.YELLOW}{rsi_str}{Style.RESET_ALL} "
-                  f"{pct_color}{pnl_pct:>7.2f}%{Style.RESET_ALL} "
-                  f"{pnl_color}{net:>9.2f}{Style.RESET_ALL} "
-                  f"{Style.DIM}{status}{Style.RESET_ALL}")
+    with DBManager() as sess:
+        positions_list = sess.query(Position).filter_by(status='open').all()[:15]
 
-        for _ in range(len(positions_list), 15):
-            print(" " * 120)
+    total_pnl = Decimal('0')
+    for pos in positions_list:
+        sym = pos.symbol
+        qty = float(pos.quantity)
+        entry = float(pos.avg_entry_price)
+        ob = self.get_order_book_analysis(sym)
+        cur = float(ob['best_bid'] or ob['best_ask'] or 0)
+        rsi, _, _ = self.get_rsi_and_trend(sym)
+        rsi_str = f"{rsi:5.1f}" if rsi else "N/A "
 
-        return total_pnl
+        maker, taker = self.get_trade_fees(sym)
+        gross = (cur - entry) * qty
+        fee = (maker + taker) * cur * qty  # Approx round-trip
+        net = gross - fee
+        total_pnl += Decimal(str(net))
 
-    def _print_market_overview_and_signals(self) -> None:
-        valid_cnt = len(self.valid_symbols)
-        # Avg vol placeholder - fetch if needed
-        avg_vol = 1000000.0  # Dummy
+        pnl_pct = ((cur - entry) / entry - (maker + taker)) * 100 if entry > 0 else 0.0
 
-        print(f"Valid USDT Pairs: {Fore.CYAN}{valid_cnt}{Style.RESET_ALL}")
-        print(f"Avg 24h Volume: ${Fore.YELLOW}{avg_vol:,.0f}{Style.RESET_ALL}")
-        print(f"Price Range: ${Fore.GRAY}{MIN_PRICE}{Style.RESET_ALL} → ${Fore.GRAY}{MAX_PRICE}{Style.RESET_ALL}")
+        status = "Spot Hold"
+        if sym in trailing_sell_active:
+            state = trailing_sell_active[sym]
+            peak = float(state['peak_price'])
+            stop = peak * (1 - TRAILING_STOP_PCT)
+            status = f"Trail Sell @ {stop:.4f}"
 
-        # Buy Signals
-        watch_items = []
-        for sym in list(self.valid_symbols)[:20]:
-            ob = self.get_order_book_analysis(sym)
-            rsi, trend, _ = self.get_rsi_and_trend(sym)
-            if not rsi:
-                continue
-            low, _, _ = self.get_24h_price_stats(sym)
-            if not low:
-                continue
-            strong_buy = (ob['depth_skew'] == 'strong_ask' and
-                          ob['imbalance_ratio'] <= 0.5 and
-                          ob['weighted_pressure'] < -0.002)
+        pnl_color = Fore.GREEN if net > 0 else Fore.RED
+        pct_color = Fore.GREEN if pnl_pct > 0 else Fore.RED
 
-            if (rsi <= RSI_OVERSOLD and trend == 'bullish' and
-                ob['best_bid'] <= low * 1.01 and strong_buy):
-                coin = sym.replace('USDT', '')
-                watch_items.append(f"{coin}({rsi:.0f})")
+        print(f"{Fore.CYAN}{sym:<8}{Style.RESET_ALL} "
+              f"{qty:>10.6f} {entry:>12.4f} {cur:>12.4f} "
+              f"{Fore.YELLOW}{rsi_str}{Style.RESET_ALL} "
+              f"{pct_color}{pnl_pct:>7.2f}%{Style.RESET_ALL} "
+              f"{pnl_color}{net:>9.2f}{Style.RESET_ALL} "
+              f"{Style.DIM}{status}{Style.RESET_ALL}")
 
-        signal_str = " | ".join(watch_items[:10]) if watch_items else "No strong buy signals"
-        if len(signal_str) > 80:
-            signal_str = signal_str[:77] + "..."
+    for _ in range(len(positions_list), 15):
+        print(" " * 120)
 
-        print(f"\n{Fore.BOLD}Smart Buy Signals:{Style.RESET_ALL} {Fore.GREEN}{signal_str}{Style.RESET_ALL}")
+    return total_pnl
+
+
+def _print_market_overview_and_signals(self) -> None:
+    valid_cnt = len(self.valid_symbols)
+    avg_vol = 1000000.0  # Replace with real data if available
+
+    print(f"Valid USDT Pairs: {Fore.CYAN}{valid_cnt}{Style.RESET_ALL}")
+    print(f"Avg 24h Volume: ${Fore.YELLOW}{avg_vol:,.0f}{Style.RESET_ALL}")
+    print(f"Price Range: ${Fore.LIGHTBLACK_EX}{MIN_PRICE}{Style.RESET_ALL} → ${Fore.LIGHTBLACK_EX}{MAX_PRICE}{Style.RESET_ALL}")
+
+    # Buy Signals
+    watch_items = []
+    for sym in list(self.valid_symbols)[:20]:
+        ob = self.get_order_book_analysis(sym)
+        rsi, trend, _ = self.get_rsi_and_trend(sym)
+        if not rsi:
+            continue
+        low, _, _ = self.get_24h_price_stats(sym)
+        if not low:
+            continue
+        strong_buy = (ob['depth_skew'] == 'strong_ask' and
+                      ob['imbalance_ratio'] <= 0.5 and
+                      ob['weighted_pressure'] < -0.002)
+
+        if (rsi <= RSI_OVERSOLD and trend == 'bullish' and
+            ob['best_bid'] <= low * 1.01 and strong_buy):
+            coin = sym.replace('USDT', '')
+            watch_items.append(f"{coin}({rsi:.0f})")
+
+    signal_str = " | ".join(watch_items[:10]) if watch_items else "No strong buy signals"
+    if len(signal_str) > 80:
+        signal_str = signal_str[:77] + "..."
+
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}Smart Buy Signals:{Style.RESET_ALL} {Fore.GREEN}{signal_str}{Style.RESET_ALL}")
 
     def place_market_sell(self, symbol: str, quantity: float) -> Optional[str]:
         """Place market sell."""
