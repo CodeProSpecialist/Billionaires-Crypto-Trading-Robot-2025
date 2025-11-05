@@ -781,5 +781,78 @@ class SmartTradingBot:
                 time.sleep(5)
 
 
+    # ==============================================================
+    # === ORDER MANAGEMENT ==========================================
+    # ==============================================================
 
+    def round_price(self, price: float, symbol: str) -> float:
+        info = self.valid_symbols_dict.get(symbol, {})
+        tick_size = info.get('tick_size', 1e-8)
+        if tick_size == 0:
+            return round(price, 8)
+        precision = int(round(-math.log10(tick_size)))
+        return round(price, precision)
+
+    def round_qty(self, qty: float, symbol: str) -> float:
+        info = self.valid_symbols_dict.get(symbol, {})
+        step_size = info.get('step_size', 1e-8)
+        if step_size == 0:
+            return round(qty, 8)
+        precision = int(round(-math.log10(step_size)))
+        return round(qty, precision)
+
+    def place_market_buy(self, symbol: str, amount_usdt: float) -> Optional[str]:
+        try:
+            ticker = self.client.get_symbol_ticker(symbol=symbol)
+            price = float(ticker['price'])
+            quantity = amount_usdt / price
+            quantity = self.round_qty(quantity, symbol)
+
+            min_notional = self.valid_symbols_dict.get(symbol, {}).get('min_notional', 10.0)
+            if quantity * price < min_notional:
+                logger.warning(f"Order too small: {quantity * price:.2f} < {min_notional}")
+                return None
+
+            order = self.client.order_market_buy(symbol=symbol, quantity=quantity)
+            order_id = str(order['orderId'])
+            logger.info(f"BUY {symbol}: {quantity:.6f} @ ${price:.4f}")
+
+            with DBManager() as sess:
+                sess.add(Position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    avg_entry_price=price,
+                    side='long'
+                ))
+            return order_id
+        except Exception as e:
+            logger.error(f"Buy failed: {e}")
+            return None
+
+    def place_limit_buy(self, symbol: str, quantity: float, price: float) -> Optional[str]:
+        try:
+            price = self.round_price(price, symbol)
+            quantity = self.round_qty(quantity, symbol)
+            order = self.client.order_limit_buy(symbol=symbol, quantity=quantity, price=price)
+            order_id = str(order['orderId'])
+            logger.info(f"Limit BUY {symbol}: {quantity:.6f} @ ${price:.4f}")
+            return order_id
+        except Exception as e:
+            logger.error(f"Limit buy failed: {e}")
+            return None
+
+    def place_market_sell(self, symbol: str, quantity: float) -> Optional[str]:
+        try:
+            quantity = self.round_qty(quantity, symbol)
+            order = self.client.order_market_sell(symbol=symbol, quantity=quantity)
+            order_id = str(order['orderId'])
+            logger.info(f"SELL {symbol}: {quantity:.6f}")
+            with DBManager() as sess:
+                pos = sess.query(Position).filter_by(symbol=symbol, status='open').first()
+                if pos:
+                    pos.status = 'closed'
+            return order_id
+        except Exception as e:
+            logger.error(f"Sell failed: {e}")
+            return None
 
