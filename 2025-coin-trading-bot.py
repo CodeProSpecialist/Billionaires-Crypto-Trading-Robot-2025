@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-    DYNAMIC GRID BOT – OPTIMIZED ALLOCATION
-    • Every owned position: 2–8 buy + 2–8 sell grid lines
-    • Smart USDT allocation: prioritizes high-P&L potential
-    • Uses volatility, volume, and unrealized PnL to weight grids
-    • 45-second price check cycle
-    • Full order book ladder: first run only
-    • Rate-limit safe
+    INFINITY GRID BOT – TRUE 24/7 PRICE FOLLOWING
+    • Follows price UP and DOWN forever
+    • Every owned coin: 2–8 buy + 2–8 sell lines
+    • Smart rebalancing every 45 seconds
+    • Cancels and replaces stale grid lines
+    • Uses volatility + PnL to optimize allocation
+    • Full order book on first run only
 """
 import os
 import sys
@@ -40,17 +40,18 @@ if not API_KEY or not API_SECRET:
 
 # Grid Config
 GRID_SIZE_USDT = Decimal('5.0')
-GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5%
+GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5% spacing
 MIN_BUFFER_USDT = Decimal('8.0')
 MAX_GRIDS_PER_SIDE = 8
 MIN_GRIDS_PER_SIDE = 2
 MIN_GRIDS_FALLBACK = 1
+REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75% price move triggers regrid
 
 # General
 MAX_PRICE = 1000.00
 MIN_PRICE = 0.15
 MIN_24H_VOLUME_USDT = 60000
-LOG_FILE = "crypto_trading_bot.log"
+LOG_FILE = "infinity_grid_bot.log"
 POLL_INTERVAL = 45.0  # 45 seconds
 
 # === CONSTANTS ==============================================================
@@ -73,8 +74,7 @@ CST_TZ = pytz.timezone('America/Chicago')
 # === GLOBAL STATE ===========================================================
 valid_symbols_dict: Dict[str, dict] = {}
 order_book_cache: Dict[str, dict] = {}
-positions: Dict[str, dict] = {}
-active_grid_symbols: Dict[str, dict] = {}
+active_grid_symbols: Dict[str, dict] = {}  # {symbol: {center, qty, buy_orders, sell_orders, last_price}}
 first_dashboard_run = True
 last_ob_fetch: Dict[str, float] = {}
 
@@ -96,6 +96,29 @@ def buy_notional_ok(price: Decimal, qty: Decimal) -> bool:
 
 def sell_notional_ok(price: Decimal, qty: Decimal) -> bool:
     return price * qty >= Decimal('3.25')
+
+# === RETRY DECORATOR ========================================================
+def retry_custom(func):
+    def wrapper(*args, **kwargs):
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except BinanceAPIException as e:
+                if e.status_code in (429, 418):
+                    retry_after = int(e.response.headers.get('Retry-After', 60))
+                    logger.warning(f"Rate limit {e.status_code}: sleeping {retry_after}s")
+                    time.sleep(retry_after)
+                else:
+                    delay = 2 ** i
+                    logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e}")
+                    time.sleep(delay)
+            except Exception as e:
+                if i == max_retries - 1:
+                    raise
+                time.sleep(2 ** i)
+        return None
+    return wrapper
 
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
@@ -141,7 +164,6 @@ class DBManager:
 class RateManager:
     def __init__(self, client):
         self.client = client
-        self.current = {'request_weight': 0, 'orders_10s': 0}
     def wait_if_needed(self, typ='REQUEST_WEIGHT'):
         hdr = getattr(self.client, 'response', {}).get('headers', {})
         if typ == 'REQUEST_WEIGHT' and 'x-mbx-used-weight-1m' in hdr:
@@ -170,12 +192,10 @@ class BinanceTradingBot:
                 for b in acct['balances']:
                     asset = b['asset']
                     qty = to_decimal(b['free'])
-                    if qty <= 0 or asset in {'USDT', 'USDC'}:
-                        continue
+                    if qty <= 0 or asset in {'USDT', 'USDC'}: continue
                     sym = f"{asset}USDT"
                     price = self.get_price_usdt(asset)
-                    if price <= ZERO:
-                        continue
+                    if price <= ZERO: continue
                     maker, _ = self.get_trade_fees(sym)
                     sess.add(Position(symbol=sym, quantity=qty, avg_entry_price=price, buy_fee_rate=to_decimal(maker)))
                 sess.commit()
@@ -286,6 +306,14 @@ class BinanceTradingBot:
             logger.error(f"Sell failed: {e}")
             return None
 
+    def cancel_order_safe(self, symbol, order_id):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait_if_needed('ORDERS')
+                self.client.cancel_order(symbol=symbol, orderId=order_id)
+        except:
+            pass
+
     def check_and_process_filled_orders(self):
         with DBManager() as sess:
             for po in sess.query(PendingOrder).all():
@@ -299,24 +327,20 @@ class BinanceTradingBot:
                 except:
                     pass
 
-# === OPTIMIZED GRID ALLOCATION ==============================================
+# === INFINITY GRID CORE =====================================================
 def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
     usdt_free = bot.get_balance() - MIN_BUFFER_USDT
-    if usdt_free <= 0:
-        return {}
+    if usdt_free <= 0: return {}
     with DBManager() as sess:
         owned = sess.query(Position).all()
-    if not owned:
-        return {}
+    if not owned: return {}
 
-    # Score each position
     scores = []
     for pos in owned:
         sym = pos.symbol
         ob = bot.get_order_book_analysis(sym)
         cur_price = (ob['best_bid'] + ob['best_ask']) / 2
-        if cur_price <= 0:
-            continue
+        if cur_price <= 0: continue
         entry = Decimal(str(pos.avg_entry_price))
         qty = Decimal(str(pos.quantity))
         unrealized_pnl = (cur_price - entry) * qty
@@ -324,18 +348,14 @@ def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
         volatility_score = atr / float(cur_price) if atr > 0 else 0
         volume = valid_symbols_dict.get(sym, {}).get('volume', 0)
         volume_score = min(volume / 1e6, 5.0)
-        pnl_score = max(float(unrealized_pnl) / 10.0, -2.0)  # cap negative
+        pnl_score = max(float(unrealized_pnl) / 10.0, -2.0)
         total_score = volatility_score * 2.0 + volume_score + max(pnl_score, 0)
         scores.append((sym, total_score, float(qty), float(cur_price)))
 
-    if not scores:
-        return {}
-
-    # Normalize scores
+    if not scores: return {}
     total_score = sum(s[1] for s in scores) or 1
     allocations = {s[0]: (s[1] / total_score) * float(usdt_free) for s in scores}
 
-    # Determine grid levels
     result = {}
     for sym, alloc in allocations.items():
         max_possible = int(alloc // float(GRID_SIZE_USDT))
@@ -344,58 +364,64 @@ def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
         result[sym] = (levels, levels)
     return result
 
-def place_optimized_grid(bot, symbol):
-    if symbol in active_grid_symbols:
-        return
+def rebalance_infinity_grid(bot, symbol):
     ob = bot.get_order_book_analysis(symbol, force_refresh=True)
-    mid = (ob['best_bid'] + ob['best_ask']) / 2
-    if mid <= 0:
-        return
-    buy_levels, sell_levels = calculate_optimal_grids(bot).get(symbol, (0, 0))
-    if buy_levels == 0:
-        return
+    current_price = (ob['best_bid'] + ob['best_ask']) / 2
+    if current_price <= 0: return
 
-    info = bot.client.get_symbol_info(symbol)
-    lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-    step = Decimal(lot['stepSize'])
-    qty_per_grid = (GRID_SIZE_USDT / mid) // step * step
-    if qty_per_grid <= 0:
-        return
+    grid = active_grid_symbols.get(symbol, {})
+    old_center = Decimal(str(grid.get('center', current_price)))
+    price_move = abs(current_price - old_center) / old_center
 
-    grid_state = {'center': mid, 'qty': float(qty_per_grid), 'buy_orders': [], 'sell_orders': [], 'placed_at': time.time()}
-    tick = bot.get_tick_size(symbol)
+    # Regrid if price moved > threshold OR no grid
+    if symbol not in active_grid_symbols or price_move >= REBALANCE_THRESHOLD_PCT:
+        # Cancel old orders
+        for oid in grid.get('buy_orders', []) + grid.get('sell_orders', []):
+            bot.cancel_order_safe(symbol, oid)
+        active_grid_symbols.pop(symbol, None)
 
-    for i in range(1, buy_levels + 1):
-        price = (mid * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
-        if buy_notional_ok(price, qty_per_grid):
-            order = bot.place_limit_buy_with_tracking(symbol, str(price), float(qty_per_grid))
-            if order:
-                grid_state['buy_orders'].append(str(order['orderId']))
+        # Place new grid
+        buy_levels, sell_levels = calculate_optimal_grids(bot).get(symbol, (0, 0))
+        if buy_levels == 0: return
 
-    base_asset = symbol.replace('USDT', '')
-    free = bot.get_asset_balance(base_asset)
-    for i in range(1, sell_levels + 1):
-        price = (mid * (1 + GRID_INTERVAL_PCT * i) // tick) * tick
-        if free >= qty_per_grid and sell_notional_ok(price, qty_per_grid):
-            order = bot.place_limit_sell_with_tracking(symbol, str(price), float(qty_per_grid))
-            if order:
-                grid_state['sell_orders'].append(str(order['orderId']))
-            free -= qty_per_grid
+        info = bot.client.get_symbol_info(symbol)
+        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        step = Decimal(lot['stepSize'])
+        qty_per_grid = (GRID_SIZE_USDT / current_price) // step * step
+        if qty_per_grid <= 0: return
 
-    if grid_state['buy_orders'] or grid_state['sell_orders']:
-        active_grid_symbols[symbol] = grid_state
-        logger.info(f"OPTIMIZED GRID: {symbol} | {buy_levels}B/{sell_levels}S")
+        new_grid = {
+            'center': current_price,
+            'qty': float(qty_per_grid),
+            'buy_orders': [],
+            'sell_orders': [],
+            'last_price': float(current_price),
+            'placed_at': time.time()
+        }
+        tick = bot.get_tick_size(symbol)
 
-# === RETRY DECORATOR ========================================================
-def retry_custom(func):
-    def wrapper(*args, **kwargs):
-        for i in range(5):
-            try:
-                return func(*args, **kwargs)
-            except:
-                time.sleep(2 ** i)
-        raise
-    return wrapper
+        # Buy side
+        for i in range(1, buy_levels + 1):
+            price = (current_price * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
+            if buy_notional_ok(price, qty_per_grid):
+                order = bot.place_limit_buy_with_tracking(symbol, str(price), float(qty_per_grid))
+                if order:
+                    new_grid['buy_orders'].append(str(order['orderId']))
+
+        # Sell side
+        base_asset = symbol.replace('USDT', '')
+        free = bot.get_asset_balance(base_asset)
+        for i in range(1, sell_levels + 1):
+            price = (current_price * (1 + GRID_INTERVAL_PCT * i) // tick) * tick
+            if free >= qty_per_grid and sell_notional_ok(price, qty_per_grid):
+                order = bot.place_limit_sell_with_tracking(symbol, str(price), float(qty_per_grid))
+                if order:
+                    new_grid['sell_orders'].append(str(order['orderId']))
+                free -= qty_per_grid
+
+        if new_grid['buy_orders'] or new_grid['sell_orders']:
+            active_grid_symbols[symbol] = new_grid
+            logger.info(f"INFINITY REGRID: {symbol} | Center: ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
 
 # === HELPERS ================================================================
 def send_whatsapp_alert(msg: str):
@@ -409,15 +435,9 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def cancel_all_grids(bot):
-    with bot.state_lock:
-        for sym, state in list(active_grid_symbols.items()):
-            for oid in state['buy_orders'] + state['sell_orders']:
-                try:
-                    with bot.api_lock:
-                        bot.rate_manager.wait_if_needed('ORDERS')
-                        bot.client.cancel_order(symbol=sym, orderId=oid)
-                except:
-                    pass
+    for sym, state in list(active_grid_symbols.items()):
+        for oid in state.get('buy_orders', []) + state.get('sell_orders', []):
+            bot.cancel_order_safe(sym, oid)
     active_grid_symbols.clear()
 
 # === DASHBOARD ==============================================================
@@ -425,13 +445,13 @@ def print_dashboard(bot):
     global first_dashboard_run
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 120)
-    print(f"{'OPTIMIZED GRID BOT':^120}")
+    print(f"{'INFINITY GRID BOT – 24/7 PRICE FOLLOWING':^120}")
     print("=" * 120)
     print(f"Time: {now_cst()} | USDT: ${float(bot.get_balance()):,.2f}")
     with DBManager() as sess:
         print(f"Positions: {sess.query(Position).count()} | Active Grids: {len(active_grid_symbols)}")
 
-    print("\nTOP 3 VOLATILE + HIGH PnL POTENTIAL")
+    print("\nTOP 3 VOLATILE + PnL POTENTIAL")
     scores = []
     for sym in valid_symbols_dict:
         ob = bot.get_order_book_analysis(sym)
@@ -460,22 +480,27 @@ def print_dashboard(bot):
         print("\nFull ladder shown once.")
         first_dashboard_run = False
 
-    print("\nGRID STATUS")
+    print("\nGRID STATUS (Center Price | B/S Count)")
     with DBManager() as sess:
         for pos in sess.query(Position).all():
             sym = pos.symbol
             grid = active_grid_symbols.get(sym, {})
+            center = grid.get('center', 0)
             b = len(grid.get('buy_orders', []))
             s = len(grid.get('sell_orders', []))
-            print(f"{sym:<10} | Qty: {float(pos.quantity):>8.4f} | Grid: {b}B/{s}S")
+            print(f"{sym:<10} | Center: ${float(center):>10.6f} | Grid: {b}B/{s}S")
     print("=" * 120)
 
 # === MAIN ===================================================================
 def main():
     bot = BinanceTradingBot()
-    bot.fetch_and_validate_usdt_pairs = lambda: None  # mock for valid_symbols_dict
     global valid_symbols_dict
-    valid_symbols_dict = {p.symbol: {'volume': 1e6} for p in bot.client.get_exchange_info()['symbols'] if p['quoteAsset'] == 'USDT'}
+    try:
+        info = bot.client.get_exchange_info()
+        for s in info['symbols']:
+            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING':
+                valid_symbols_dict[s['symbol']] = {'volume': 1e6}
+    except: pass
 
     last_update = 0
     last_dashboard = 0
@@ -489,7 +514,7 @@ def main():
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
                         if pos.symbol in valid_symbols_dict:
-                            place_optimized_grid(bot, pos.symbol)
+                            rebalance_infinity_grid(bot, pos.symbol)
                 last_update = now
 
             if now - last_dashboard >= 60:
@@ -499,9 +524,10 @@ def main():
             time.sleep(1)
         except KeyboardInterrupt:
             cancel_all_grids(bot)
+            print("\nInfinity grid stopped.")
             break
         except Exception as e:
-            logger.critical(f"Error: {e}")
+            logger.critical(f"Critical error: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
