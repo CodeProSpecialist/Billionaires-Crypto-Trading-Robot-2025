@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID BOT – TRUE 24/7 PRICE FOLLOWING
+    INFINITY GRID BOT – TRUE 24/7 PRICE FOLLOWING (FIXED: response.headers)
     • Follows price UP and DOWN forever
-    • Every owned coin: 2–8 buy + 2–8 sell lines
-    • Smart rebalancing every 45 seconds
-    • Cancels and replaces stale grid lines
-    • Uses volatility + PnL to optimize allocation
-    • Full order book on first run only
+    • Regrids every 45s on 0.75% move
+    • Cancels stale orders, places new grid
+    • Smart allocation: volatility + PnL weighted
+    • Full ladder: first run only
+    • Fixed: response.get('headers') → response.headers
 """
 import os
 import sys
@@ -45,7 +45,7 @@ MIN_BUFFER_USDT = Decimal('8.0')
 MAX_GRIDS_PER_SIDE = 8
 MIN_GRIDS_PER_SIDE = 2
 MIN_GRIDS_FALLBACK = 1
-REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75% price move triggers regrid
+REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75% move
 
 # General
 MAX_PRICE = 1000.00
@@ -74,7 +74,7 @@ CST_TZ = pytz.timezone('America/Chicago')
 # === GLOBAL STATE ===========================================================
 valid_symbols_dict: Dict[str, dict] = {}
 order_book_cache: Dict[str, dict] = {}
-active_grid_symbols: Dict[str, dict] = {}  # {symbol: {center, qty, buy_orders, sell_orders, last_price}}
+active_grid_symbols: Dict[str, dict] = {}
 first_dashboard_run = True
 last_ob_fetch: Dict[str, float] = {}
 
@@ -105,18 +105,20 @@ def retry_custom(func):
             try:
                 return func(*args, **kwargs)
             except BinanceAPIException as e:
-                if e.status_code in (429, 418):
-                    retry_after = int(e.response.headers.get('Retry-After', 60))
-                    logger.warning(f"Rate limit {e.status_code}: sleeping {retry_after}s")
-                    time.sleep(retry_after)
+                if hasattr(e, 'response') and e.response is not None:
+                    hdr = e.response.headers
+                    if e.status_code in (429, 418):
+                        retry_after = int(hdr.get('Retry-After', 60))
+                        logger.warning(f"Rate limit {e.status_code}: sleeping {retry_after}s")
+                        time.sleep(retry_after)
+                    else:
+                        delay = 2 ** i
+                        logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e}")
+                        time.sleep(delay)
                 else:
-                    delay = 2 ** i
-                    logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e}")
-                    time.sleep(delay)
-            except Exception as e:
-                if i == max_retries - 1:
-                    raise
-                time.sleep(2 ** i)
+                    if i == max_retries - 1:
+                        raise
+                    time.sleep(2 ** i)
         return None
     return wrapper
 
@@ -165,7 +167,9 @@ class RateManager:
     def __init__(self, client):
         self.client = client
     def wait_if_needed(self, typ='REQUEST_WEIGHT'):
-        hdr = getattr(self.client, 'response', {}).get('headers', {})
+        if not hasattr(self.client, 'response') or self.client.response is None:
+            return
+        hdr = self.client.response.headers
         if typ == 'REQUEST_WEIGHT' and 'x-mbx-used-weight-1m' in hdr:
             if int(hdr['x-mbx-used-weight-1m']) > 5700:
                 time.sleep(1.1)
@@ -371,16 +375,13 @@ def rebalance_infinity_grid(bot, symbol):
 
     grid = active_grid_symbols.get(symbol, {})
     old_center = Decimal(str(grid.get('center', current_price)))
-    price_move = abs(current_price - old_center) / old_center
+    price_move = abs(current_price - old_center) / old_center if old_center > 0 else 1
 
-    # Regrid if price moved > threshold OR no grid
     if symbol not in active_grid_symbols or price_move >= REBALANCE_THRESHOLD_PCT:
-        # Cancel old orders
         for oid in grid.get('buy_orders', []) + grid.get('sell_orders', []):
             bot.cancel_order_safe(symbol, oid)
         active_grid_symbols.pop(symbol, None)
 
-        # Place new grid
         buy_levels, sell_levels = calculate_optimal_grids(bot).get(symbol, (0, 0))
         if buy_levels == 0: return
 
@@ -400,7 +401,6 @@ def rebalance_infinity_grid(bot, symbol):
         }
         tick = bot.get_tick_size(symbol)
 
-        # Buy side
         for i in range(1, buy_levels + 1):
             price = (current_price * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
             if buy_notional_ok(price, qty_per_grid):
@@ -408,7 +408,6 @@ def rebalance_infinity_grid(bot, symbol):
                 if order:
                     new_grid['buy_orders'].append(str(order['orderId']))
 
-        # Sell side
         base_asset = symbol.replace('USDT', '')
         free = bot.get_asset_balance(base_asset)
         for i in range(1, sell_levels + 1):
