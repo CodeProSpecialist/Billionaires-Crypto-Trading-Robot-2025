@@ -1,4 +1,5 @@
-# 🚀 SMART COIN TRADING BOT for Binance.US Edition 🚀
+# 🚀 INFINITY GRID BOT 
+      for Binance.US Edition 🚀
 **Skyrocketing Wealth Creation with Precision Automation**  
 
 *****
