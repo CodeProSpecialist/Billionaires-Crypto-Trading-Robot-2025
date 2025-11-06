@@ -245,9 +245,6 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
                 pass
             time.sleep(HEARTBEAT_INTERVAL)
 
-    # ------------------------------------------------------------------
-    # Reconnect with exponential back-off – **no ping_interval here**
-    # ------------------------------------------------------------------
     def run_forever(self, **kwargs):
         while True:
             try:
@@ -356,7 +353,6 @@ def start_market_websocket():
             on_open=lambda ws: ws.on_open(ws)
         )
         ws_instances.append(ws)
-        # *** NOTE: NO ping_interval in the kwargs here ***
         t = threading.Thread(target=ws.run_forever, kwargs={}, daemon=True)
         t.start()
         ws_threads.append(t)
@@ -738,7 +734,7 @@ def print_dashboard(bot):
         price = float(asks[0][0])
         if not (MIN_PRICE <= price <= MAX_PRICE): continue
         bid_vol = sum(float(q) for _, q in bids)
-        ask_vol = sum(float(q) for _, q \{ in asks)
+        ask_vol = sum(float(q) for _, q in asks)   # <-- FIXED: removed stray "\{"
         imbalance = bid_vol / (ask_vol or 1)
         if imbalance >= 1.3:
             candidates.append((sym.replace('USDT',''), imbalance, price))
