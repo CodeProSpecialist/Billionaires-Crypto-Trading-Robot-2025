@@ -1,11 +1,14 @@
-#!/usr/first/env python3
+#!/usr/bin/env python3
 """
-    INFINITY GRID BOT – FULLY AUTOMATED
-    • First run: Scans order book ladder → buys top 3 high-pressure coins
-    • Then: Places infinity grid (sell above, buy below) on all owned coins
-    • Uses price range + volume filters
-    • Smart allocation, 24/7 price following
-    • Full ladder: first run only
+    INFINITY GRID BOT – FULL WS + EXECUTION + LIVE + REALIZED PnL
+    • WebSocket: ticker + depth5 + user stream (binance.us)
+    • HEARTBEAT: 25s ping/pong
+    • TRADE EXECUTION: Real-time fill detection
+    • LIVE PnL: Per-position + total
+    • REALIZED PnL: Per-trade + cumulative
+    • First run: Live order book → buys top 3
+    • Infinity grid: regrids every 45s
+    • ZERO REST polling → IP safe
 """
 import os
 import sys
@@ -14,11 +17,13 @@ import logging
 import numpy as np
 import talib
 import requests
+import json
+import threading
+import websocket
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
 from collections import deque
-import threading
 import pytz
 from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
@@ -50,13 +55,19 @@ REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75%
 MAX_PRICE = 1000.00
 MIN_PRICE = 0.15
 MIN_24H_VOLUME_USDT = 60000
-ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')  # Buy 0.1% below best ask
+ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')
 ENTRY_MIN_USDT = Decimal('15.0')
+
+# WebSocket
+WS_BASE = "wss://stream.binance.us:443/stream?streams="
+USER_STREAM_BASE = "wss://stream.binance.us:443/ws/"
+MAX_STREAMS_PER_CONNECTION = 100
+DEPTH_LEVELS = 5
+HEARTBEAT_INTERVAL = 25
 
 # General
 LOG_FILE = "infinity_grid_bot.log"
-POLL_INTERVAL = 45.0
-FIRST_RUN_DONE = False
+first_run_executed = False
 
 # === CONSTANTS ==============================================================
 ZERO = Decimal('0')
@@ -77,11 +88,29 @@ CST_TZ = pytz.timezone('America/Chicago')
 
 # === GLOBAL STATE ===========================================================
 valid_symbols_dict: Dict[str, dict] = {}
-order_book_cache: Dict[str, dict] = {}
 active_grid_symbols: Dict[str, dict] = {}
 first_dashboard_run = True
-last_ob_fetch: Dict[str, float] = {}
+live_prices: Dict[str, Decimal] = {}
+live_bids: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
+live_asks: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
+price_lock = threading.Lock()
+book_lock = threading.Lock()
+ws_threads = []
+ws_instances = []
+user_ws = None
+listen_key = None
+listen_key_lock = threading.Lock()
 first_run_executed = False
+
+# PnL Tracking
+position_pnl: Dict[str, Dict[str, Decimal]] = {}
+total_pnl = ZERO
+pnl_lock = threading.Lock()
+
+# Realized PnL
+realized_pnl_per_symbol: Dict[str, Decimal] = {}
+total_realized_pnl = ZERO
+realized_lock = threading.Lock()
 
 # === MATH & HELPERS =========================================================
 def safe_float(value, default=0.0) -> float:
@@ -150,6 +179,16 @@ class PendingOrder(Base):
     price = Column(Numeric(20, 8), nullable=False)
     quantity = Column(Numeric(20, 8), nullable=False)
 
+class TradeRecord(Base):
+    __tablename__ = "trades"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(4), nullable=False)
+    price = Column(Numeric(20, 8), nullable=False)
+    quantity = Column(Numeric(20, 8), nullable=False)
+    fee = Column(Numeric(20, 8), nullable=False, default=0)
+    timestamp = Column(DateTime, default=func.now())
+
 if not os.path.exists("binance_trades.db"):
     Base.metadata.create_all(engine)
 
@@ -167,26 +206,10 @@ class DBManager:
                 self.session.rollback()
         self.session.close()
 
-# === RATE MANAGER ===========================================================
-class RateManager:
-    def __init__(self, client):
-        self.client = client
-    def wait_if_needed(self, typ='REQUEST_WEIGHT'):
-        if not hasattr(self.client, 'response') or self.client.response is None:
-            return
-        hdr = self.client.response.headers
-        if typ == 'REQUEST_WEIGHT' and 'x-mbx-used-weight-1m' in hdr:
-            if int(hdr['x-mbx-used-weight-1m']) > 5700:
-                time.sleep(1.1)
-        if typ == 'ORDERS' and 'x-mbx-order-count-10s' in hdr:
-            if int(hdr['x-mbx-order-count-10s']) > 45:
-                time.sleep(1.0)
-
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
-        self.rate_manager = RateManager(self.client)
         self.api_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.sync_positions_from_binance()
@@ -194,7 +217,6 @@ class BinanceTradingBot:
     def sync_positions_from_binance(self):
         try:
             with self.api_lock:
-                self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
                 acct = self.client.get_account()
             with DBManager() as sess:
                 sess.query(Position).delete()
@@ -203,7 +225,8 @@ class BinanceTradingBot:
                     qty = to_decimal(b['free'])
                     if qty <= 0 or asset in {'USDT', 'USDC'}: continue
                     sym = f"{asset}USDT"
-                    price = self.get_price_usdt(asset)
+                    with price_lock:
+                        price = live_prices.get(sym, self.get_price_usdt(asset))
                     if price <= ZERO: continue
                     maker, _ = self.get_trade_fees(sym)
                     sess.add(Position(symbol=sym, quantity=qty, avg_entry_price=price, buy_fee_rate=to_decimal(maker)))
@@ -216,44 +239,18 @@ class BinanceTradingBot:
         if asset == 'USDT': return Decimal('1')
         sym = asset + 'USDT'
         with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             ticker = self.client.get_symbol_ticker(symbol=sym)
         return to_decimal(ticker['price'])
 
     @retry_custom
     def get_trade_fees(self, symbol):
         with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             fee = self.client.get_trade_fee(symbol=symbol)
         return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
 
     @retry_custom
-    def get_order_book_analysis(self, symbol: str, force_refresh=False) -> dict:
-        now = time.time()
-        with self.state_lock:
-            if not force_refresh and symbol in order_book_cache and now - order_book_cache[symbol].get('ts', 0) < 900:
-                return order_book_cache[symbol]
-        with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
-            depth = self.client.get_order_book(symbol=symbol, limit=50)
-        bids = depth.get('bids', [])[:50]
-        asks = depth.get('asks', [])[:50]
-        result = {
-            'best_bid': Decimal(bids[0][0]) if bids else ZERO,
-            'best_ask': Decimal(asks[0][0]) if asks else ZERO,
-            'raw_bids': [(Decimal(p), Decimal(q)) for p, q in bids],
-            'raw_asks': [(Decimal(p), Decimal(q)) for p, q in asks],
-            'ts': now
-        }
-        with self.state_lock:
-            order_book_cache[symbol] = result
-            last_ob_fetch[symbol] = now
-        return result
-
-    @retry_custom
     def get_tick_size(self, symbol):
         with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             info = self.client.get_symbol_info(symbol)
         for f in info['filters']:
             if f['filterType'] == 'PRICE_FILTER':
@@ -263,7 +260,6 @@ class BinanceTradingBot:
     @retry_custom
     def get_atr(self, symbol) -> float:
         with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             klines = self.client.get_klines(symbol=symbol, interval='1m', limit=15)
         highs = np.array([safe_float(k[2]) for k in klines])
         lows = np.array([safe_float(k[3]) for k in klines])
@@ -273,7 +269,6 @@ class BinanceTradingBot:
 
     def get_balance(self) -> Decimal:
         with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             acct = self.client.get_account()
         for b in acct['balances']:
             if b['asset'] == 'USDT':
@@ -282,7 +277,6 @@ class BinanceTradingBot:
 
     def get_asset_balance(self, asset: str) -> Decimal:
         with self.api_lock:
-            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             acct = self.client.get_account()
         for b in acct['balances']:
             if b['asset'] == asset:
@@ -292,7 +286,6 @@ class BinanceTradingBot:
     def place_limit_buy_with_tracking(self, symbol, price: str, qty: float):
         try:
             with self.api_lock:
-                self.rate_manager.wait_if_needed('ORDERS')
                 order = self.client.order_limit_buy(symbol=symbol, quantity=qty, price=price)
             with DBManager() as sess:
                 sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='buy',
@@ -305,7 +298,6 @@ class BinanceTradingBot:
     def place_limit_sell_with_tracking(self, symbol, price: str, qty: float):
         try:
             with self.api_lock:
-                self.rate_manager.wait_if_needed('ORDERS')
                 order = self.client.order_limit_sell(symbol=symbol, quantity=qty, price=price)
             with DBManager() as sess:
                 sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='sell',
@@ -318,32 +310,213 @@ class BinanceTradingBot:
     def cancel_order_safe(self, symbol, order_id):
         try:
             with self.api_lock:
-                self.rate_manager.wait_if_needed('ORDERS')
                 self.client.cancel_order(symbol=symbol, orderId=order_id)
         except:
             pass
 
-    def check_and_process_filled_orders(self):
-        with DBManager() as sess:
-            for po in sess.query(PendingOrder).all():
-                try:
-                    with self.api_lock:
-                        self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
-                        o = self.client.get_order(symbol=po.symbol, orderId=int(po.binance_order_id))
-                    if o['status'] == 'FILLED':
-                        sess.delete(po)
-                        send_whatsapp_alert(f"{po.side.upper()} {po.symbol} @ {o['price']}")
-                except:
-                    pass
+# === WEBSOCKET: MARKET + USER STREAM + HEARTBEAT ============================
+class HeartbeatWebSocket(websocket.WebSocketApp):
+    def __init__(self, url, **kwargs):
+        super().__init__(url, **kwargs)
+        self.last_pong = time.time()
+        self.heartbeat_thread = None
 
-# === FIRST RUN: BUY FROM ORDER BOOK LADDER ==================================
+    def on_open(self, *args):
+        logger.info(f"WS Connected: {self.url.split('?')[0]}")
+        self.last_pong = time.time()
+        if self.heartbeat_thread is None:
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self.heartbeat_thread.start()
+
+    def on_pong(self, *args):
+        self.last_pong = time.time()
+
+    def on_error(self, ws, error):
+        logger.warning(f"WS Error: {error}")
+
+    def on_close(self, ws, *args):
+        logger.info("WS Closed. Reconnecting in 5s...")
+        time.sleep(5)
+        self.run_forever(ping_interval=None, ping_timeout=None)
+
+    def _heartbeat(self):
+        while self.sock and self.sock.connected:
+            now = time.time()
+            if now - self.last_pong > HEARTBEAT_INTERVAL + 5:
+                logger.warning("No pong. Reconnecting...")
+                self.close()
+                break
+            try:
+                self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
+            except:
+                pass
+            time.sleep(HEARTBEAT_INTERVAL)
+
+def on_market_message(ws, message):
+    try:
+        data = json.loads(message)
+        stream = data.get('stream', '')
+        payload = data.get('data', {})
+        if not payload: return
+
+        symbol = stream.split('@')[0].upper()
+
+        if stream.endswith('@ticker'):
+            price = to_decimal(payload.get('c', '0'))
+            if price > 0:
+                with price_lock:
+                    live_prices[symbol] = price
+                update_pnl_for_symbol(symbol)
+
+        elif stream.endswith('@depth5'):
+            bids = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('bids', [])]
+            asks = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('asks', [])]
+            with book_lock:
+                live_bids[symbol] = bids
+                live_asks[symbol] = asks
+
+    except Exception as e:
+        logger.debug(f"Market WS error: {e}")
+
+def on_user_message(ws, message):
+    try:
+        data = json.loads(message)
+        if data.get('e') == 'executionReport':
+            event = data
+            order_id = str(event['i'])
+            symbol = event['s']
+            side = event['S']
+            status = event['X']
+            price = to_decimal(event['p'])
+            qty = to_decimal(event['q'])
+            filled = to_decimal(event['z'])
+            fee = to_decimal(event.get('n', '0')) or ZERO
+            fee_asset = event.get('N', 'USDT')
+
+            if status == 'FILLED':
+                with DBManager() as sess:
+                    po = sess.query(PendingOrder).filter_by(binance_order_id=order_id).first()
+                    if po:
+                        sess.delete(po)
+
+                # Record trade
+                with DBManager() as sess:
+                    sess.add(TradeRecord(
+                        symbol=symbol,
+                        side=side,
+                        price=price,
+                        quantity=qty,
+                        fee=fee if fee_asset == 'USDT' else ZERO
+                    ))
+
+                # Calculate realized PnL for sell
+                if side == 'SELL':
+                    with DBManager() as sess:
+                        pos = sess.query(Position).filter_by(symbol=symbol).first()
+                        if pos:
+                            entry = Decimal(str(pos.avg_entry_price))
+                            pnl = (price - entry) * qty - fee
+                            with realized_lock:
+                                realized_pnl_per_symbol[symbol] = realized_pnl_per_symbol.get(symbol, ZERO) + pnl
+                                global total_realized_pnl
+                                total_realized_pnl += pnl
+
+                send_whatsapp_alert(f"{side} {symbol} FILLED @ {price} | Qty: {filled} | Fee: {fee}")
+                logger.info(f"FILL: {side} {symbol} @ {price} | {filled} | Fee: {fee}")
+                update_pnl_for_symbol(symbol)
+    except Exception as e:
+        logger.debug(f"User WS error: {e}")
+
+def start_market_websocket():
+    global ws_instances, ws_threads
+    symbols = [s.lower() for s in valid_symbols_dict.keys() if 'USDT' in s]
+    ticker_streams = [f"{s}@ticker" for s in symbols]
+    depth_streams = [f"{s}@depth{DEPTH_LEVELS}" for s in symbols]
+    all_streams = ticker_streams + depth_streams
+    chunks = [all_streams[i:i + MAX_STREAMS_PER_CONNECTION] for i in range(0, len(all_streams), MAX_STREAMS_PER_CONNECTION)]
+    
+    for chunk in chunks:
+        url = WS_BASE + '/'.join(chunk)
+        ws = HeartbeatWebSocket(
+            url,
+            on_message=on_market_message,
+            on_error=lambda ws, err: ws.on_error(ws, err),
+            on_close=lambda ws, *args: ws.on_close(ws, *args),
+            on_open=lambda ws: ws.on_open()
+        )
+        ws_instances.append(ws)
+        t = threading.Thread(target=ws.run_forever, kwargs={'ping_interval': None}, daemon=True)
+        t.start()
+        ws_threads.append(t)
+        time.sleep(0.5)
+
+def start_user_stream():
+    global user_ws, listen_key
+    try:
+        with threading.Lock():
+            client = Client(API_KEY, API_SECRET, tld='us')
+            listen_key = client.stream_get_listen_key()
+        url = f"{USER_STREAM_BASE}{listen_key}"
+        user_ws = HeartbeatWebSocket(
+            url,
+            on_message=on_user_message,
+            on_error=lambda ws, err: ws.on_error(ws, err),
+            on_close=lambda ws, *args: ws.on_close(ws, *args),
+            on_open=lambda ws: ws.on_open()
+        )
+        t = threading.Thread(target=user_ws.run_forever, kwargs={'ping_interval': None}, daemon=True)
+        t.start()
+        ws_threads.append(t)
+        logger.info("User stream started")
+    except Exception as e:
+        logger.error(f"User stream failed: {e}")
+
+def keepalive_user_stream():
+    while True:
+        time.sleep(1800)
+        try:
+            with listen_key_lock:
+                if listen_key:
+                    Client(API_KEY, API_SECRET, tld='us').stream_keepalive(listen_key)
+        except:
+            pass
+
+# === PnL TRACKING ===========================================================
+def update_pnl_for_symbol(symbol: str):
+    with DBManager() as sess:
+        pos = sess.query(Position).filter_by(symbol=symbol).first()
+        if not pos: return
+        qty = Decimal(str(pos.quantity))
+        entry = Decimal(str(pos.avg_entry_price))
+        with price_lock:
+            current = live_prices.get(symbol, ZERO)
+        if current <= 0: return
+        unrealized = (current - entry) * qty
+        with pnl_lock:
+            position_pnl[symbol] = {
+                'unrealized': unrealized,
+                'pct': ((current - entry) / entry * HUNDRED) if entry > 0 else ZERO
+            }
+        update_total_pnl()
+
+def update_total_pnl():
+    with pnl_lock:
+        global total_pnl
+        total_pnl = sum(info['unrealized'] for info in position_pnl.values())
+
+def refresh_all_pnl():
+    with DBManager() as sess:
+        for pos in sess.query(Position).all():
+            update_pnl_for_symbol(pos.symbol)
+
+# === FIRST RUN: BUY FROM LIVE ORDER BOOK ====================================
 def first_run_entry_from_ladder(bot):
     global first_run_executed
     if first_run_executed:
         return
     usdt_free = bot.get_balance()
     if usdt_free < ENTRY_MIN_USDT:
-        logger.info("Insufficient USDT for entry. Skipping.")
+        logger.info("Insufficient USDT for entry.")
         first_run_executed = True
         return
 
@@ -352,22 +525,24 @@ def first_run_entry_from_ladder(bot):
         owned = {p.symbol for p in sess.query(Position).all()}
 
     for sym in valid_symbols_dict:
-        if sym in owned:
+        if sym in owned or valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
             continue
-        ob = bot.get_order_book_analysis(sym, force_refresh=True)
-        price = float(ob['best_ask'])
+        with book_lock:
+            bids = live_bids.get(sym, [])
+            asks = live_asks.get(sym, [])
+        if not bids or not asks:
+            continue
+        price = float(asks[0][0])
         if not (MIN_PRICE <= price <= MAX_PRICE):
             continue
-        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
-            continue
-        bid_vol = sum(float(q) for _, q in ob['raw_bids'][:5])
-        ask_vol = sum(float(q) for _, q in ob['raw_asks'][:5])
+        bid_vol = sum(float(q) for _, q in bids)
+        ask_vol = sum(float(q) for _, q in asks)
         imbalance = bid_vol / (ask_vol or 1)
         if imbalance >= 1.5:
             candidates.append((sym, imbalance, price))
 
     if not candidates:
-        logger.info("No strong entry signals. Skipping first run buys.")
+        logger.info("No entry signals.")
         first_run_executed = True
         return
 
@@ -376,8 +551,7 @@ def first_run_entry_from_ladder(bot):
     per_coin = (usdt_free - MIN_BUFFER_USDT) / len(to_buy)
 
     for sym, imb, price in to_buy:
-        if per_coin < ENTRY_MIN_USDT:
-            break
+        if per_coin < ENTRY_MIN_USDT: break
         qty = (per_coin * (1 - ENTRY_BUY_PCT_BELOW_ASK)) / price
         info = bot.client.get_symbol_info(sym)
         lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
@@ -390,7 +564,7 @@ def first_run_entry_from_ladder(bot):
         if buy_notional_ok(buy_price, qty):
             order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
             if order:
-                logger.info(f"ENTRY BUY: {sym} | ${float(buy_price):.6f} | Qty: {float(qty):.6f}")
+                logger.info(f"ENTRY: {sym} @ ${float(buy_price):.6f}")
                 send_whatsapp_alert(f"ENTRY {sym} @ {buy_price:.6f}")
 
     first_run_executed = True
@@ -406,9 +580,9 @@ def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
     scores = []
     for pos in owned:
         sym = pos.symbol
-        ob = bot.get_order_book_analysis(sym)
-        cur_price = (ob['best_bid'] + ob['best_ask']) / 2
-        if cur_price <= 0: continue
+        with price_lock:
+            cur_price = live_prices.get(sym)
+        if not cur_price: continue
         entry = Decimal(str(pos.avg_entry_price))
         qty = Decimal(str(pos.quantity))
         unrealized_pnl = (cur_price - entry) * qty
@@ -433,9 +607,9 @@ def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
     return result
 
 def rebalance_infinity_grid(bot, symbol):
-    ob = bot.get_order_book_analysis(symbol, force_refresh=True)
-    current_price = (ob['best_bid'] + ob['best_ask']) / 2
-    if current_price <= 0: return
+    with price_lock:
+        current_price = live_prices.get(symbol)
+    if not current_price or current_price <= 0: return
 
     grid = active_grid_symbols.get(symbol, {})
     old_center = Decimal(str(grid.get('center', current_price)))
@@ -460,12 +634,10 @@ def rebalance_infinity_grid(bot, symbol):
             'qty': float(qty_per_grid),
             'buy_orders': [],
             'sell_orders': [],
-            'last_price': float(current_price),
             'placed_at': time.time()
         }
         tick = bot.get_tick_size(symbol)
 
-        # Buy below
         for i in range(1, buy_levels + 1):
             price = (current_price * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
             if buy_notional_ok(price, qty_per_grid):
@@ -473,7 +645,6 @@ def rebalance_infinity_grid(bot, symbol):
                 if order:
                     new_grid['buy_orders'].append(str(order['orderId']))
 
-        # Sell above
         base_asset = symbol.replace('USDT', '')
         free = bot.get_asset_balance(base_asset)
         for i in range(1, sell_levels + 1):
@@ -486,7 +657,7 @@ def rebalance_infinity_grid(bot, symbol):
 
         if new_grid['buy_orders'] or new_grid['sell_orders']:
             active_grid_symbols[symbol] = new_grid
-            logger.info(f"GRID: {symbol} | Center: ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
+            logger.info(f"GRID: {symbol} | ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
 
 # === HELPERS ================================================================
 def send_whatsapp_alert(msg: str):
@@ -510,36 +681,60 @@ def print_dashboard(bot):
     global first_dashboard_run
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 120)
-    print(f"{'INFINITY GRID BOT – AUTO ENTRY + 24/7 GRID':^120}")
+    print(f"{'INFINITY GRID BOT – LIVE + REALIZED PnL':^120}")
     print("=" * 120)
     print(f"Time: {now_cst()} | USDT: ${float(bot.get_balance()):,.2f}")
+    print(f"Total Unrealized: ${float(total_pnl):+.2f} | Total Realized: ${float(total_realized_pnl):+.2f}")
     with DBManager() as sess:
-        print(f"Positions: {sess.query(Position).count()} | Active Grids: {len(active_grid_symbols)}")
+        print(f"Positions: {sess.query(Position).count()} | Active Grids: {len(active_grid_symbols)} | WS: {len(ws_instances)}")
 
-    print("\nTOP 3 BUY PRESSURE (FOR ENTRY)")
+    print("\nPOSITIONS + LIVE PnL")
+    with DBManager() as sess:
+        for pos in sess.query(Position).all():
+            sym = pos.symbol
+            qty = float(pos.quantity)
+            entry = float(pos.avg_entry_price)
+            with price_lock:
+                current = float(live_prices.get(sym, 0))
+            with pnl_lock:
+                pnl_info = position_pnl.get(sym, {'unrealized': 0, 'pct': 0})
+            unrealized = float(pnl_info['unrealized'])
+            pct = float(pnl_info['pct'])
+            with realized_lock:
+                realized = float(realized_pnl_per_symbol.get(sym, ZERO))
+            color = "\033[92m" if unrealized >= 0 else "\033[91m"
+            reset = "\033[0m"
+            print(f"{sym:<10} | Qty: {qty:>8.4f} | Entry: ${entry:>8.6f} | Now: ${current:>8.6f} | Live: {color}${unrealized:+8.2f} ({pct:+.2f}%){reset} | Realized: ${realized:+.2f}")
+
+    print("\nTOP 3 BUY PRESSURE (LIVE)")
     candidates = []
     for sym in valid_symbols_dict:
-        ob = bot.get_order_book_analysis(sym)
-        if float(ob['best_ask']) < MIN_PRICE or float(ob['best_ask']) > MAX_PRICE:
-            continue
-        bid_vol = sum(float(q) for _, q in ob['raw_bids'][:5])
-        ask_vol = sum(float(q) for _, q in ob['raw_asks'][:5])
+        with book_lock:
+            bids = live_bids.get(sym, [])
+            asks = live_asks.get(sym, [])
+        if not bids or not asks: continue
+        price = float(asks[0][0])
+        if not (MIN_PRICE <= price <= MAX_PRICE): continue
+        bid_vol = sum(float(q) for _, q in bids)
+        ask_vol = sum(float(q) for _, q in asks)
         imbalance = bid_vol / (ask_vol or 1)
         if imbalance >= 1.3:
-            candidates.append((sym.replace('USDT',''), imbalance, float(ob['best_ask'])))
+            candidates.append((sym.replace('USDT',''), imbalance, price))
     for coin, imb, price in sorted(candidates, key=lambda x: x[1], reverse=True)[:3]:
         print(f" {coin:>8} | {imb:>4.1f}x | Ask: ${price:,.6f}")
         if first_dashboard_run:
-            ob = bot.get_order_book_analysis(f"{coin}USDT", force_refresh=True)
+            with book_lock:
+                ob_bids = live_bids.get(f"{coin}USDT", [])
+                ob_asks = live_asks.get(f"{coin}USDT", [])
             print("  BIDS           | ASKS")
-            for i in range(5):
-                bp = float(ob['raw_bids'][i][0]) if i < len(ob['raw_bids']) else 0
-                bq = float(ob['raw_bids'][i][1]) if i < len(ob['raw_bids']) else 0
-                ap = float(ob['raw_asks'][i][0]) if i < len(ob['raw_asks']) else 0
-                aq = float(ob['raw_asks'][i][1]) if i < len(ob['raw_asks']) else 0
+            for i in range(DEPTH_LEVELS):
+                bp = float(ob_bids[i][0]) if i < len(ob_bids) else 0
+                bq = float(ob_bids[i][1]) if i < len(ob_bids) else 0
+                ap = float(ob_asks[i][0]) if i < len(ob_asks) else 0
+                aq = float(ob_asks[i][1]) if i < len(ob_asks) else 0
                 print(f"  {bp:>10.6f}x{bq:>6.1f} | {ap:<10.6f}x{aq:<6.1f}")
     if first_dashboard_run:
-        print("\nFull ladder shown once.")
+        print("\nLive ladder shown once.")
         first_dashboard_run = False
 
     print("\nGRID STATUS")
@@ -564,25 +759,40 @@ def main():
                 valid_symbols_dict[s['symbol']] = {'volume': 1e6}
     except: pass
 
-    last_update = 0
+    # Start streams
+    start_market_websocket()
+    start_user_stream()
+    threading.Thread(target=keepalive_user_stream, daemon=True).start()
+
+    # Wait for sync
+    logger.info("Waiting 15s for WebSocket sync...")
+    time.sleep(15)
+
     last_dashboard = 0
+    last_rebalance_check = 0
+    last_pnl_refresh = 0
 
     while True:
         try:
-            bot.check_and_process_filled_orders()
             now = time.time()
 
-            # First run: buy from ladder
+            # First run
             with DBManager() as sess:
                 if sess.query(Position).count() == 0 and not first_run_executed:
                     first_run_entry_from_ladder(bot)
 
-            if now - last_update >= POLL_INTERVAL:
+            # Rebalance
+            if now - last_rebalance_check >= 45:
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
                         if pos.symbol in valid_symbols_dict:
                             rebalance_infinity_grid(bot, pos.symbol)
-                last_update = now
+                last_rebalance_check = now
+
+            # Refresh PnL every 2s
+            if now - last_pnl_refresh >= 2:
+                refresh_all_pnl()
+                last_pnl_refresh = now
 
             if now - last_dashboard >= 60:
                 print_dashboard(bot)
@@ -591,6 +801,10 @@ def main():
             time.sleep(1)
         except KeyboardInterrupt:
             cancel_all_grids(bot)
+            for ws in ws_instances:
+                ws.close()
+            if user_ws:
+                user_ws.close()
             print("\nBot stopped.")
             break
         except Exception as e:
