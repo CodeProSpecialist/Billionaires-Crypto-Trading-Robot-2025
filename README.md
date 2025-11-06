@@ -124,7 +124,7 @@ pip install python-binance sqlalchemy talib tenacity requests numpy
 ### **Summary: How It Works (Step-by-Step)**
 
 1. **Start** → Load API keys, init DB, fetch valid USDT pairs  
-2. **Spawn 1 thread per coin** → each runs forever  
+2. **Spawn 1 thread for buy orders and 1 thread for sell orders. ** → each runs forever  
 3. **Every 1 second**:  
    - Pull klines → compute RSI, MACD, BB, trend  
    - Pull order book → compute bid/ask pressure  
