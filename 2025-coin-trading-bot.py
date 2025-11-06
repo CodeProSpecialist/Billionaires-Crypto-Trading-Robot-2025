@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID + TRAILING HYBRID BOT – Binance Spot
-    MODIFIED: Only 1 BUY thread + 1 SELL thread (all symbols processed in parallel within each)
+    INFINITY GRID + TRAILING HYBRID BOT – Binance.US Spot
+    MODIFIED: Top 3 buy-pressure coins only | Order book ladder on first run only
     • Full script with all functions expanded (no external calls to undefined helpers)
-    • All logic preserved: grid, trailing, dashboard, DB, alerts, rate-limit safe
-    • Real-time balance checks before every order
-    • Configurable $5 per grid, 4–16 grids, infinity mode (12h no cancel)
-    • Fallback to trailing momentum if < $40
+    • Order book fetched every 15 mins or before orders
+    • Rate-limit safe: no REST spam
+    • Professional dashboard with top 3 buy-pressure focus
 """
 import os
 import sys
@@ -108,6 +107,8 @@ trailing_sell_active: Dict[str, dict] = {}
 buy_cooldown: Dict[str, float] = {}
 price_history: Dict[str, deque] = {}
 active_grid_symbols: Dict[str, dict] = {}
+first_dashboard_run = True
+last_ob_fetch: Dict[str, float] = {}
 
 # === SAFE MATH ==============================================================
 def safe_float(value, default=0.0) -> float:
@@ -374,16 +375,21 @@ class BinanceTradingBot:
         return valid
 
     @retry_custom
-    def get_order_book_analysis(self, symbol: str) -> dict:
+    def get_order_book_analysis(self, symbol: str, force_refresh=False) -> dict:
         now = time.time()
         with self.state_lock:
             cached = order_book_cache.get(symbol)
-            if cached and now - cached.get('ts', 0) < 1.0:
+            last_fetch = last_ob_fetch.get(symbol, 0)
+            if not force_refresh and cached and now - cached.get('ts', 0) < 1.0:
                 return cached
+            if not force_refresh and now - last_fetch < 900:  # 15 minutes
+                return cached or {'best_bid': ZERO, 'best_ask': ZERO, 'ts': now, 'pct_bid': 50.0, 'pct_ask': 50.0, 'imbalance_ratio': 1.0}
+
         with self.api_lock:
             self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
             depth = self.client.get_order_book(symbol=symbol, limit=ORDER_BOOK_LEVELS)
             self.rate_manager.update_current()
+
         bids = depth.get('bids', [])[:ORDER_BOOK_LEVELS]
         asks = depth.get('asks', [])[:ORDER_BOOK_LEVELS]
         top5_bids = bids[:5]
@@ -434,6 +440,7 @@ class BinanceTradingBot:
         }
         with self.state_lock:
             order_book_cache[symbol] = result
+            last_ob_fetch[symbol] = now
         return result
 
     @retry_custom
@@ -788,7 +795,7 @@ class BinanceTradingBot:
         with self.state_lock:
             if symbol in trailing_buy_active:
                 return
-            ob = self.get_order_book_analysis(symbol)
+            ob = self.get_order_book_analysis(symbol, force_refresh=True)
             ask = ob['best_ask']
             trailing_buy_active[symbol] = {
                 'lowest_price': ask,
@@ -804,7 +811,7 @@ class BinanceTradingBot:
                 return
             state = trailing_buy_active[symbol]
         try:
-            ob = self.get_order_book_analysis(symbol)
+            ob = self.get_order_book_analysis(symbol, force_refresh=True)
             ask = ob['best_ask']
             if ask <= ZERO:
                 return
@@ -865,7 +872,7 @@ class BinanceTradingBot:
             alloc = min(Decimal(str(bal - MIN_BALANCE)) * Decimal(str(RISK_PER_TRADE)),
                         Decimal(str(bal - MIN_BALANCE)))
             if force_market or price is None:
-                ob = self.get_order_book_analysis(symbol)
+                ob = self.get_order_book_analysis(symbol, force_refresh=True)
                 ask = Decimal(str(ob['best_ask'])) if ob['best_ask'] else ZERO
                 if ask <= ZERO:
                     return
@@ -924,7 +931,7 @@ class BinanceTradingBot:
                 return
             state = trailing_sell_active[symbol]
         try:
-            ob = self.get_order_book_analysis(symbol)
+            ob = self.get_order_book_analysis(symbol, force_refresh=True)
             bid = ob['best_bid']
             if bid <= ZERO:
                 return
@@ -986,7 +993,7 @@ class BinanceTradingBot:
                 except:
                     pass
             if force_market or price is None:
-                ob = self.get_order_book_analysis(symbol)
+                ob = self.get_order_book_analysis(symbol, force_refresh=True)
                 bid = Decimal(str(ob['best_bid'])) if ob['best_bid'] else ZERO
                 if not sell_notional_ok(symbol, bid, Decimal(str(qty))):
                     logger.info(f"MARKET SELL SKIPPED {symbol}: notional {bid*Decimal(str(qty)):.2f} USDT < $5")
@@ -1143,8 +1150,18 @@ def cancel_all_unfilled(bot):
         active_grid_symbols.clear()
     logger.info("All unfilled orders cancelled.")
 
+def get_top_buy_pressure_coins(bot, limit=3):
+    candidates = []
+    for sym in valid_symbols_dict:
+        ob = bot.get_order_book_analysis(sym)
+        imbalance = ob['imbalance_ratio']
+        if imbalance >= 1.2 and ob['pct_bid'] >= 60:
+            candidates.append((sym, imbalance, ob['pct_bid'], ob['best_bid'], ob['best_ask']))
+    return sorted(candidates, key=lambda x: x[1], reverse=True)[:limit]
+
 # === DASHBOARD ==============================================================
 def print_professional_dashboard(bot):
+    global first_dashboard_run
     try:
         GREEN = "\033[32m"
         RED = "\033[31m"
@@ -1171,6 +1188,7 @@ def print_professional_dashboard(bot):
         print(f"Total Portfolio Value: ${total_port:,.6f}")
         print(f"Active Trailing Orders: {tbuy_cnt} buys, {tsel_cnt} sells")
         print(f"Active Grid Orders: {grid_count} ($5 each)")
+
         balance = float(usdt_free)
         mode = "TRAILING MOMENTUM"
         grid_levels = 0
@@ -1185,52 +1203,34 @@ def print_professional_dashboard(bot):
             mode = "INFINITY GRID (4 levels)"
         mode_color = GREEN if grid_count > 0 else YELLOW if tbuy_cnt + tsel_cnt > 0 else RED
         print(f"{BOLD}Strategy Mode:{RESET} {mode_color}{mode}{RESET}")
-        print(f"\n{BOLD}DEPTH IMBALANCE BARS (Top 10 by Volume){RESET}")
-        sorted_symbols = sorted(
-            valid_symbols_dict.items(),
-            key=lambda x: x[1]['volume'],
-            reverse=True
-        )[:10]
-        BAR_WIDTH = 50
-        for sym, info in sorted_symbols:
-            ob = bot.get_order_book_analysis(sym)
-            pct_bid = ob['pct_bid']
-            pct_ask = 100 - pct_bid
-            bid_blocks = max(0, min(BAR_WIDTH, int(pct_bid / 2)))
-            ask_blocks = max(0, min(BAR_WIDTH, int(pct_ask / 2)))
-            bid_bar = GREEN + "█" * bid_blocks + RESET
-            ask_bar = RED + "█" * ask_blocks + RESET
-            neutral = "░" * (BAR_WIDTH - bid_blocks - ask_blocks)
-            bar = bid_bar + neutral + ask_bar
-            bar = (bar + "░" * BAR_WIDTH)[:BAR_WIDTH]
-            bias = ("strong bid wall" if pct_bid > 60 else
-                    "strong ask pressure" if pct_bid < 40 else
-                    "balanced")
-            coin = sym.replace("USDT", "")
-            print(f"{coin:<9} |{bar}| {pct_bid:>3.0f}% bid / {pct_ask:>3.0f}% ask")
-            print(f"{'':<9} {bias:<20}")
-            print()
-        print(DIVIDER)
-        print(f"{BOLD}ORDER BOOK LADDER (Top 3 Active Coins){RESET}")
-        ladder_symbols = list(active_grid_symbols.keys())[:3]
-        if not ladder_symbols:
-            ladder_symbols = [s for s, _ in sorted_symbols[:3]]
-        for sym in ladder_symbols:
-            ob = bot.get_order_book_analysis(sym)
-            bids = ob.get('raw_bids', [])[:5]
-            asks = ob.get('raw_asks', [])[:5]
-            mid = ob['mid_price']
-            coin = sym.replace("USDT", "")
-            print(f" {MAGENTA}{coin:>8}{RESET} | Mid: ${mid:,.6f}")
-            print(" BIDS | ASKS")
-            print(" --------------------------- | ---------------------------")
-            for i in range(5):
-                bid_price = float(bids[i][0]) if i < len(bids) else 0.0
-                bid_qty = float(bids[i][1]) if i < len(bids) else 0.0
-                ask_price = float(asks[i][0]) if i < len(asks) else 0.0
-                ask_qty = float(asks[i][1]) if i < len(asks) else 0.0
-                print(f" {bid_price:>10.6f} x {bid_qty:>8.2f} | {ask_price:<10.6f} x {ask_qty:<8.2f}")
-            print()
+
+        print(f"\n{BOLD}TOP 3 BUY PRESSURE COINS (Strong Bid Walls){RESET}")
+        top_coins = get_top_buy_pressure_coins(bot, 3)
+        if not top_coins:
+            print(f"{' ':<9} No strong buy pressure detected.")
+        else:
+            for sym, imbalance, pct_bid, bid, ask in top_coins:
+                coin = sym.replace("USDT", "")
+                mid = (float(bid) + float(ask)) / 2
+                print(f" {YELLOW}{coin:>8}{RESET} | Imbalance: {imbalance:>5.2f}x | Bid: {pct_bid:>5.1f}% | Mid: ${mid:,.6f}")
+                if first_dashboard_run:
+                    print("  BIDS                   | ASKS")
+                    print("  --------------------- | ---------------------")
+                    ob = bot.get_order_book_analysis(sym, force_refresh=True)
+                    bids = ob['raw_bids'][:5]
+                    asks = ob['raw_asks'][:5]
+                    for i in range(5):
+                        bp = float(bids[i][0]) if i < len(bids) else 0
+                        bq = float(bids[i][1]) if i < len(bids) else 0
+                        ap = float(asks[i][0]) if i < len(asks) else 0
+                        aq = float(asks[i][1]) if i < len(asks) else 0
+                        print(f"  {bp:>10.6f} x {bq:>8.2f} | {ap:<10.6f} x {aq:<8.2f}")
+                print()
+
+        if first_dashboard_run:
+            print(f"{DIM}Full order book ladder shown once. Subsequent runs show top stats only.{RESET}\n")
+            first_dashboard_run = False
+
         print(DIVIDER)
         print(f"{BOLD}{'CURRENT POSITIONS & P&L':^120}{RESET}")
         print(f"{'SYMBOL':<10} {'QUANTITY':>12} {'ENTRY PRICE':>12} {'CURRENT PRICE':>12} {'RSI':>6} {'P&L %':>8} {'PROFIT':>10} {'STATUS':<30}")
@@ -1364,7 +1364,6 @@ def main():
         bot.sync_positions_from_binance()
         bot.symbols_initialised = True
 
-    # Start exactly 1 buy thread and 1 sell thread
     threading.Thread(target=buy_thread, args=(bot,), daemon=True).start()
     threading.Thread(target=sell_thread, args=(bot,), daemon=True).start()
 
@@ -1400,7 +1399,7 @@ def main():
                         send_whatsapp_alert(f"GRID OFF: {sym} (<$40)")
                 last_grid_check = now
 
-            if now - last_dashboard >= 30:
+            if now - last_dashboard >= 60:
                 print_professional_dashboard(bot)
                 last_dashboard = now
 
