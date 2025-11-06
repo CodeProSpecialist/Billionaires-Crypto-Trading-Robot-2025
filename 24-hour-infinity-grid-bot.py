@@ -29,8 +29,8 @@ from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
-from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, ForeignKey, func
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
+from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
 # === CONFIGURATION ===========================================================
@@ -59,8 +59,8 @@ ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')
 ENTRY_MIN_USDT = Decimal('15.0')
 
 # WebSocket
-WS_BASE = "wss://stream.binance.us:443/stream?streams="
-USER_STREAM_BASE = "wss://stream.binance.us:443/ws/"
+WS_BASE = "wss://stream.binance.us:9443/stream?streams="
+USER_STREAM_BASE = "wss://stream.binance.us:9443/ws/"
 MAX_STREAMS_PER_CONNECTION = 100
 DEPTH_LEVELS = 5
 HEARTBEAT_INTERVAL = 25
@@ -206,6 +206,191 @@ class DBManager:
                 self.session.rollback()
         self.session.close()
 
+# === WEBSOCKET CALLBACKS (FIXED) ============================================
+def on_ws_error(ws, err):
+    logger.warning(f"WebSocket error ({ws.url.split('?')[0]}): {err}")
+
+def on_ws_close(ws, close_status_code, close_msg):
+    logger.info(f"WebSocket closed ({ws.url.split('?')[0]}) – {close_status_code}: {close_msg}")
+
+# === WEBSOCKET: HEARTBEAT + RECONNECT =======================================
+class HeartbeatWebSocket(websocket.WebSocketApp):
+    def __init__(self, url, **kwargs):
+        super().__init__(url, **kwargs)
+        self.last_pong = time.time()
+        self.heartbeat_thread = None
+        self.reconnect_attempts = 0
+
+    def on_open(self, ws):
+        logger.info(f"WS Connected: {ws.url.split('?')[0]}")
+        self.last_pong = time.time()
+        self.reconnect_attempts = 0
+        if self.heartbeat_thread is None:
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self.heartbeat_thread.start()
+
+    def on_pong(self, *args):
+        self.last_pong = time.time()
+
+    def _heartbeat(self):
+        while self.sock and self.sock.connected:
+            now = time.time()
+            if now - self.last_pong > HEARTBEAT_INTERVAL + 5:
+                logger.warning("No pong received – closing connection")
+                self.close()
+                break
+            try:
+                self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
+            except Exception:
+                pass
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    def run_forever(self, **kwargs):
+        while True:
+            try:
+                super().run_forever(ping_interval=None, ping_timeout=None, **kwargs)
+            except Exception as e:
+                logger.error(f"run_forever crashed: {e}")
+
+            self.reconnect_attempts += 1
+            delay = min(300, (2 ** self.reconnect_attempts) + (time.time() % 1))
+            logger.info(f"Reconnecting in {delay:.1f}s (attempt {self.reconnect_attempts}) …")
+            time.sleep(delay)
+
+# === WEBSOCKET: MARKET MESSAGE HANDLER ======================================
+def on_market_message(ws, message):
+    try:
+        data = json.loads(message)
+        stream = data.get('stream', '')
+        payload = data.get('data', {})
+        if not payload: return
+
+        symbol = stream.split('@')[0].upper()
+
+        if stream.endswith('@ticker'):
+            price = to_decimal(payload.get('c', '0'))
+            if price > 0:
+                with price_lock:
+                    live_prices[symbol] = price
+                update_pnl_for_symbol(symbol)
+
+        elif stream.endswith('@depth5'):
+            bids = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('bids', [])]
+            asks = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('asks', [])]
+            with book_lock:
+                live_bids[symbol] = bids
+                live_asks[symbol] = asks
+
+    except Exception as e:
+        logger.debug(f"Market WS error: {e}")
+
+# === WEBSOCKET: USER MESSAGE HANDLER ========================================
+def on_user_message(ws, message):
+    try:
+        data = json.loads(message)
+        if data.get('e') == 'executionReport':
+            event = data
+            order_id = str(event['i'])
+            symbol = event['s']
+            side = event['S']
+            status = event['X']
+            price = to_decimal(event['p'])
+            qty = to_decimal(event['q'])
+            filled = to_decimal(event['z'])
+            fee = to_decimal(event.get('n', '0')) or ZERO
+            fee_asset = event.get('N', 'USDT')
+
+            if status == 'FILLED':
+                with DBManager() as sess:
+                    po = sess.query(PendingOrder).filter_by(binance_order_id=order_id).first()
+                    if po:
+                        sess.delete(po)
+
+                # Record trade
+                with DBManager() as sess:
+                    sess.add(TradeRecord(
+                        symbol=symbol,
+                        side=side,
+                        price=price,
+                        quantity=qty,
+                        fee=fee if fee_asset == 'USDT' else ZERO
+                    ))
+
+                # Calculate realized PnL for sell
+                if side == 'SELL':
+                    with DBManager() as sess:
+                        pos = sess.query(Position).filter_by(symbol=symbol).first()
+                        if pos:
+                            entry = Decimal(str(pos.avg_entry_price))
+                            pnl = (price - entry) * qty - fee
+                            with realized_lock:
+                                realized_pnl_per_symbol[symbol] = realized_pnl_per_symbol.get(symbol, ZERO) + pnl
+                                global total_realized_pnl
+                                total_realized_pnl += pnl
+
+                send_whatsapp_alert(f"{side} {symbol} FILLED @ {price} | Qty: {filled} | Fee: {fee}")
+                logger.info(f"FILL: {side} {symbol} @ {price} | {filled} | Fee: {fee}")
+                update_pnl_for_symbol(symbol)
+    except Exception as e:
+        logger.debug(f"User WS error: {e}")
+
+# === WEBSOCKET: START MARKET STREAMS ========================================
+def start_market_websocket():
+    global ws_instances, ws_threads
+    symbols = [s.lower() for s in valid_symbols_dict.keys() if 'USDT' in s]
+    ticker_streams = [f"{s}@ticker" for s in symbols]
+    depth_streams = [f"{s}@depth{DEPTH_LEVELS}" for s in symbols]
+    all_streams = ticker_streams + depth_streams
+    chunks = [all_streams[i:i + MAX_STREAMS_PER_CONNECTION] for i in range(0, len(all_streams), MAX_STREAMS_PER_CONNECTION)]
+    
+    for chunk in chunks:
+        url = WS_BASE + '/'.join(chunk)
+        ws = HeartbeatWebSocket(
+            url,
+            on_message=on_market_message,
+            on_error=on_ws_error,
+            on_close=on_ws_close,
+            on_open=lambda ws: ws.on_open(ws)
+        )
+        ws_instances.append(ws)
+        t = threading.Thread(target=ws.run_forever, kwargs={'ping_interval': None}, daemon=True)
+        t.start()
+        ws_threads.append(t)
+        time.sleep(0.5)
+
+# === WEBSOCKET: START USER STREAM ===========================================
+def start_user_stream():
+    global user_ws, listen_key
+    try:
+        with threading.Lock():
+            client = Client(API_KEY, API_SECRET, tld='us')
+            listen_key = client.stream_get_listen_key()
+        url = f"{USER_STREAM_BASE}{listen_key}"
+        user_ws = HeartbeatWebSocket(
+            url,
+            on_message=on_user_message,
+            on_error=on_ws_error,
+            on_close=on_ws_close,
+            on_open=lambda ws: ws.on_open(ws)
+        )
+        t = threading.Thread(target=user_ws.run_forever, kwargs={'ping_interval': None}, daemon=True)
+        t.start()
+        ws_threads.append(t)
+        logger.info("User stream started")
+    except Exception as e:
+        logger.error(f"User stream failed: {e}")
+
+# === WEBSOCKET: KEEPALIVE USER STREAM =======================================
+def keepalive_user_stream():
+    while True:
+        time.sleep(1800)
+        try:
+            with listen_key_lock:
+                if listen_key:
+                    Client(API_KEY, API_SECRET, tld='us').stream_keepalive(listen_key)
+        except:
+            pass
+
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
@@ -311,173 +496,6 @@ class BinanceTradingBot:
         try:
             with self.api_lock:
                 self.client.cancel_order(symbol=symbol, orderId=order_id)
-        except:
-            pass
-
-# === WEBSOCKET: MARKET + USER STREAM + HEARTBEAT ============================
-class HeartbeatWebSocket(websocket.WebSocketApp):
-    def __init__(self, url, **kwargs):
-        super().__init__(url, **kwargs)
-        self.last_pong = time.time()
-        self.heartbeat_thread = None
-
-    def on_open(self, *args):
-        logger.info(f"WS Connected: {self.url.split('?')[0]}")
-        self.last_pong = time.time()
-        if self.heartbeat_thread is None:
-            self.heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
-            self.heartbeat_thread.start()
-
-    def on_pong(self, *args):
-        self.last_pong = time.time()
-
-    def on_error(self, ws, error):
-        logger.warning(f"WS Error: {error}")
-
-    def on_close(self, ws, *args):
-        logger.info("WS Closed. Reconnecting in 5s...")
-        time.sleep(5)
-        self.run_forever(ping_interval=None, ping_timeout=None)
-
-    def _heartbeat(self):
-        while self.sock and self.sock.connected:
-            now = time.time()
-            if now - self.last_pong > HEARTBEAT_INTERVAL + 5:
-                logger.warning("No pong. Reconnecting...")
-                self.close()
-                break
-            try:
-                self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
-            except:
-                pass
-            time.sleep(HEARTBEAT_INTERVAL)
-
-def on_market_message(ws, message):
-    try:
-        data = json.loads(message)
-        stream = data.get('stream', '')
-        payload = data.get('data', {})
-        if not payload: return
-
-        symbol = stream.split('@')[0].upper()
-
-        if stream.endswith('@ticker'):
-            price = to_decimal(payload.get('c', '0'))
-            if price > 0:
-                with price_lock:
-                    live_prices[symbol] = price
-                update_pnl_for_symbol(symbol)
-
-        elif stream.endswith('@depth5'):
-            bids = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('bids', [])]
-            asks = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('asks', [])]
-            with book_lock:
-                live_bids[symbol] = bids
-                live_asks[symbol] = asks
-
-    except Exception as e:
-        logger.debug(f"Market WS error: {e}")
-
-def on_user_message(ws, message):
-    try:
-        data = json.loads(message)
-        if data.get('e') == 'executionReport':
-            event = data
-            order_id = str(event['i'])
-            symbol = event['s']
-            side = event['S']
-            status = event['X']
-            price = to_decimal(event['p'])
-            qty = to_decimal(event['q'])
-            filled = to_decimal(event['z'])
-            fee = to_decimal(event.get('n', '0')) or ZERO
-            fee_asset = event.get('N', 'USDT')
-
-            if status == 'FILLED':
-                with DBManager() as sess:
-                    po = sess.query(PendingOrder).filter_by(binance_order_id=order_id).first()
-                    if po:
-                        sess.delete(po)
-
-                # Record trade
-                with DBManager() as sess:
-                    sess.add(TradeRecord(
-                        symbol=symbol,
-                        side=side,
-                        price=price,
-                        quantity=qty,
-                        fee=fee if fee_asset == 'USDT' else ZERO
-                    ))
-
-                # Calculate realized PnL for sell
-                if side == 'SELL':
-                    with DBManager() as sess:
-                        pos = sess.query(Position).filter_by(symbol=symbol).first()
-                        if pos:
-                            entry = Decimal(str(pos.avg_entry_price))
-                            pnl = (price - entry) * qty - fee
-                            with realized_lock:
-                                realized_pnl_per_symbol[symbol] = realized_pnl_per_symbol.get(symbol, ZERO) + pnl
-                                global total_realized_pnl
-                                total_realized_pnl += pnl
-
-                send_whatsapp_alert(f"{side} {symbol} FILLED @ {price} | Qty: {filled} | Fee: {fee}")
-                logger.info(f"FILL: {side} {symbol} @ {price} | {filled} | Fee: {fee}")
-                update_pnl_for_symbol(symbol)
-    except Exception as e:
-        logger.debug(f"User WS error: {e}")
-
-def start_market_websocket():
-    global ws_instances, ws_threads
-    symbols = [s.lower() for s in valid_symbols_dict.keys() if 'USDT' in s]
-    ticker_streams = [f"{s}@ticker" for s in symbols]
-    depth_streams = [f"{s}@depth{DEPTH_LEVELS}" for s in symbols]
-    all_streams = ticker_streams + depth_streams
-    chunks = [all_streams[i:i + MAX_STREAMS_PER_CONNECTION] for i in range(0, len(all_streams), MAX_STREAMS_PER_CONNECTION)]
-    
-    for chunk in chunks:
-        url = WS_BASE + '/'.join(chunk)
-        ws = HeartbeatWebSocket(
-            url,
-            on_message=on_market_message,
-            on_error=lambda ws, err: ws.on_error(ws, err),
-            on_close=lambda ws, *args: ws.on_close(ws, *args),
-            on_open=lambda ws: ws.on_open()
-        )
-        ws_instances.append(ws)
-        t = threading.Thread(target=ws.run_forever, kwargs={'ping_interval': None}, daemon=True)
-        t.start()
-        ws_threads.append(t)
-        time.sleep(0.5)
-
-def start_user_stream():
-    global user_ws, listen_key
-    try:
-        with threading.Lock():
-            client = Client(API_KEY, API_SECRET, tld='us')
-            listen_key = client.stream_get_listen_key()
-        url = f"{USER_STREAM_BASE}{listen_key}"
-        user_ws = HeartbeatWebSocket(
-            url,
-            on_message=on_user_message,
-            on_error=lambda ws, err: ws.on_error(ws, err),
-            on_close=lambda ws, *args: ws.on_close(ws, *args),
-            on_open=lambda ws: ws.on_open()
-        )
-        t = threading.Thread(target=user_ws.run_forever, kwargs={'ping_interval': None}, daemon=True)
-        t.start()
-        ws_threads.append(t)
-        logger.info("User stream started")
-    except Exception as e:
-        logger.error(f"User stream failed: {e}")
-
-def keepalive_user_stream():
-    while True:
-        time.sleep(1800)
-        try:
-            with listen_key_lock:
-                if listen_key:
-                    Client(API_KEY, API_SECRET, tld='us').stream_keepalive(listen_key)
         except:
             pass
 
