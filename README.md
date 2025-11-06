@@ -303,7 +303,7 @@ Run Program:
 
 ```bash
 conda activate 
-python3 2025-coin-trading-bot.py
+python3 24-hour-infinity-grid-bot.py
 ```
 
 **Note**: Ensure the bot script is saved as `2025-coin-trading-bot.py`. Monitor logs in `crypto_trading_bot.log` for issues and the console dashboard for status. This setup is for educational use; live trading carries significant risks, including the potential to **lose all or part of your investment**, as outlined in the disclaimers. 
