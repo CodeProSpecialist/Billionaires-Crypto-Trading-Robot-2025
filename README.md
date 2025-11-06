@@ -6,7 +6,7 @@ Update to the newest version
 for the best working 
 trading robot python code. 
 Newest Python code 
-updates were on 11-5-2025. 
+updates were on 11-6-2025. 
 
 *****
 
@@ -24,7 +24,7 @@ This also fixes any program startup errors. )
 
 | Feature | Description |
 |--------|-------------|
-| **4 Dedicated Threads** | 1 for buy scanning, 1 for sell scanning, 1 for trailing buys, 1 for trailing sells |
+| **2 Dedicated Threads** | 1 for buy scanning, 1 for sell scanning |
 | **20-Level Order Book Depth** | Full VWAP, imbalance, skew, and pressure analysis |
 | **Candlestick Pattern Detection** | Integrated TA-Lib patterns (Hammer, Engulfing, Doji, etc.) |
 | **Custom 24h Price Tracking** | Accurate high/low/avg with 1-minute granularity |
