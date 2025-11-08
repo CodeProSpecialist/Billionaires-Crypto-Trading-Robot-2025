@@ -1,4 +1,4 @@
-# 🚀 INFINITY GRID BOT 
+# 🚀 24 HOUR INFINITY GRID BOT 
       for Binance.US Edition 🚀
 **Skyrocketing Wealth Creation with Precision Automation**  
 
@@ -7,7 +7,7 @@ Update to the newest version
 for the best working 
 trading robot python code. 
 Newest Python code 
-updates were on 11-6-2025. 
+updates were on 11-7-2025. 
 
 *****
 
@@ -15,7 +15,7 @@ updates were on 11-6-2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-# Dynamic Trailing Bot for Binance.US  – **MULTI-THREADED, RATE-LIMIT & DEPTH AWARE**
+# Dynamic Trailing Bot for Binance.US 
 
 > **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book Intelligence, and Institutional-Grade Risk Controls**
 
@@ -25,11 +25,7 @@ This also fixes any program startup errors. )
 
 | Feature | Description |
 |--------|-------------|
-| **2 Dedicated Threads** | 1 for buy scanning, 1 for sell scanning |
-| **20-Level Order Book Depth** | Full VWAP, imbalance, skew, and pressure analysis |
-| **Candlestick Pattern Detection** | Integrated TA-Lib patterns (Hammer, Engulfing, Doji, etc.) |
-| **Custom 24h Price Tracking** | Accurate high/low/avg with 1-minute granularity |
-| **Thread-Safe & Rate-Limit Aware** | Smart retry logic, header-based throttling, 429/418 handling |
+
 | **Professional Dashboard** | Real-time P&L, positions, market overview, and buy signals |
 | **SQLite Trade & Position DB** | Full audit trail, auto-import of existing holdings |
 | **WhatsApp Alerts** | Instant execution & event notifications via CallMeBot |
@@ -46,24 +42,7 @@ Most bots trade blindly. This one *watches the market like a hawk*.
 	•	15-Minute Stall Protection → Prevents capital lockup
 	•	0.8% Net Profit Target → Disciplined exits after fees
 	•	RSI + Bollinger + MACD + Patterns → Multi-layer confirmation
-	•	Risk Per Trade: 10% → Configurable, balanced exposure
 
-
-How It Works
-Buy Logic
-	1	Scans all valid USDT pairs (> $100k 24h volume)
-	2	Detects sell pressure spike + RSI ≤ 35 + bullish trend
-	3	Starts dynamic trailing buy:
-	◦	Tracks lowest price
-	◦	Buys on 3% bounce or pressure drop
-	◦	Market buy on 1% flash crash
-Sell Logic
-	1	Monitors open positions
-	2	Waits for 0.8% net profit + RSI ≥ 65 + bearish trend
-	3	Starts dynamic trailing sell:
-	◦	Tracks peak price
-	◦	Sells on 0.5% pullback or buy pressure collapse
-	◦	Market sell on stall > 15 min
 
 
 Safety & Compliance
