@@ -44,21 +44,21 @@ if not API_KEY or not API_SECRET:
 
 # ---- Grid & Entry ----------------------------------------------------------
 GRID_SIZE_USDT = Decimal('5.0')
-GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5%
+GRID_INTERVAL_PCT = Decimal('0.015')          # 1.5 %
 MIN_BUFFER_USDT = Decimal('8.0')
 MIN_SELL_VALUE_USDT = Decimal('5.0')
 MIN_SELL_QTY = Decimal('0.00001')
 MAX_GRIDS_PER_SIDE = 8
 MIN_GRIDS_PER_SIDE = 2
 MIN_GRIDS_FALLBACK = 1
-REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75%
+REBALANCE_THRESHOLD_PCT = Decimal('0.0075')   # 0.75 %
 
 # ---- Entry Filters ---------------------------------------------------------
 MIN_24H_VOLUME_USDT = 100000
 MIN_PRICE = Decimal('1.00')
 MAX_PRICE = Decimal('1000')
 ENTRY_MIN_USDT = Decimal('5.0')
-ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')  # 0.1%
+ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')    # 0.1 %
 
 # ---- WebSocket -------------------------------------------------------------
 WS_BASE = "wss://stream.binance.us:9443/stream?streams="
@@ -543,12 +543,12 @@ def update_pnl_for_symbol(symbol: str):
         entry = Decimal(str(pos.avg_entry_price))
         with price_lock:
             current = live_prices.get(symbol, ZERO)
-        if current <= 0: return
+        if current <= ZERO: return
         unrealized = (current - entry) * qty
         with pnl_lock:
             position_pnl[symbol] = {
                 'unrealized': unrealized,
-                'pct': ((current - entry) / entry * HUNDRED) if entry > 0 else ZERO
+                'pct': ((current - entry) / entry * HUNDRED) if entry > ZERO else ZERO
             }
         update_total_pnl()
 
@@ -567,7 +567,7 @@ def refresh_all_pnl():
 # --------------------------------------------------------------------------- #
 def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
     usdt_free = bot.get_balance() - MIN_BUFFER_USDT
-    if usdt_free <= 0: return {}
+    if usdt_free <= ZERO: return {}
     with DBManager() as sess:
         owned = sess.query(Position).all()
     if not owned: return {}
@@ -604,11 +604,11 @@ def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
 def rebalance_infinity_grid(bot, symbol):
     with price_lock:
         current_price = live_prices.get(symbol)
-    if not current_price or current_price <= 0: return
+    if not current_price or current_price <= ZERO: return
 
     grid = active_grid_symbols.get(symbol, {})
     old_center = Decimal(str(grid.get('center', current_price)))
-    price_move = abs(current_price - old_center) / old_center if old_center > 0 else 1
+    price_move = abs(current_price - old_center) / old_center if old_center > ZERO else ONE
 
     if symbol not in active_grid_symbols or price_move >= REBALANCE_THRESHOLD_PCT:
         for oid in grid.get('buy_orders', []) + grid.get('sell_orders', []):
@@ -620,7 +620,7 @@ def rebalance_infinity_grid(bot, symbol):
 
         step = bot.get_lot_step(symbol)
         qty_per_grid = (GRID_SIZE_USDT / current_price) // step * step
-        if qty_per_grid <= 0: return
+        if qty_per_grid <= ZERO: return
 
         new_grid = {
             'center': current_price,
@@ -743,24 +743,26 @@ def first_run_entry_from_ladder(bot):
     pressure.sort(key=lambda x: x[1], reverse=True)
     top3 = pressure[:3]
 
-    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)  # Decimal
+    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)   # Decimal
 
     for sym, imbalance, ask_price in top3:
         if per_coin < ENTRY_MIN_USDT:
             break
 
-        # FIXED: Full Decimal arithmetic
-        discount = ONE - ENTRY_BUY_PCT_BELOW_ASK
-        adjusted_usdt = per_coin * discount
-        raw_qty = adjusted_usdt / ask_price
+        # --------------------------------------------------------------- #
+        #  FIXED: pure Decimal arithmetic – no float mixing
+        # --------------------------------------------------------------- #
+        discount = ONE - ENTRY_BUY_PCT_BELOW_ASK                     # Decimal
+        adjusted_usdt = per_coin * discount                         # Decimal * Decimal
+        raw_qty = adjusted_usdt / ask_price                         # Decimal / Decimal
 
-        step = bot.get_lot_step(sym)
+        step = bot.get_lot_step(sym)                                # Decimal
         qty = (raw_qty // step) * step
         if qty <= ZERO:
             continue
 
-        buy_price = ask_price * discount
-        tick = bot.get_tick_size(sym)
+        buy_price = ask_price * discount                            # Decimal * Decimal
+        tick = bot.get_tick_size(sym)                               # Decimal
         buy_price = (buy_price // tick) * tick
 
         if not buy_notional_ok(buy_price, qty):
@@ -803,7 +805,8 @@ def print_dashboard(bot):
                 realized = float(realized_pnl_per_symbol.get(sym, ZERO))
             color = "\033[92m" if unrealized >= 0 else "\033[91m"
             reset = "\033[0m"
-            print(f"{sym:<10} | Qty: {qty:>8.4f} | Entry: ${entry:>8.6f} | Now: ${current:>8.6f} | Live: {color}${unrealized:+8.2f} ({pct:+.2f}%){reset} | Realized: ${realized:+.2f}")
+            print(f"{sym:<10} | Qty: {qty:>8.4f} | Entry: ${entry:>8.6f} | Now: ${current:>8.6f} | "
+                  f"Live: {color}${unrealized:+8.2f} ({pct:+.2f}%){reset} | Realized: ${realized:+.2f}")
 
     print("\nTOP 3 BUY PRESSURE (LIVE)")
     candidates = []
