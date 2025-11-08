@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
     INFINITY GRID BOT – LEGACY CORE + PRO FILTERS + DASHBOARD
-    • Uses 24-hour-infinity-grid-bot.py: order processing, grid rebalancing, PnL
-    • Entry: TOP 10 buy pressure + $60k 24h vol + $0.15–$1,000
+    • Entry: TOP 3 buy pressure + $60k 24h vol + $0.15–$1,000
     • Dynamic grids via ATR + Volume + PnL (fallback: 4x4)
     • $8 USDT buffer | No sell < $5 or qty < 0.00001
     • DB sync on startup | All grid orders on dashboard
     • 100% WebSocket | No REST after startup
+    • ENFORCED: ONLY BUY TOP-3 BUY PRESSURE COINS (NO EXCEPTIONS)
 """
 
 import os
@@ -59,7 +59,6 @@ MIN_PRICE = Decimal('1.00')
 MAX_PRICE = Decimal('1000')
 ENTRY_MIN_USDT = Decimal('5.0')
 ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')
-TOP_N_ENTRY = 10
 
 # ---- WebSocket -------------------------------------------------------------
 WS_BASE = "wss://stream.binance.us:9443/stream?streams="
@@ -154,45 +153,6 @@ def send_whatsapp_alert(msg: str):
 
 def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-# --------------------------------------------------------------------------- #
-# =============================== ENTRY GUARD ================================ #
-# --------------------------------------------------------------------------- #
-def allow_new_position_buy(symbol: str) -> bool:
-    """Only allow new position if symbol is in top-3 buy pressure."""
-    with book_lock:
-        bids = live_bids.get(symbol, [])
-        asks = live_asks.get(symbol, [])
-    if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
-        return False
-
-    bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
-    ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
-    if ask_vol == ZERO:
-        return False
-    imbalance = bid_vol / ask_vol
-
-    # Rebuild top-3 list on-the-fly
-    top3 = []
-    for sym in valid_symbols_dict:
-        if sym == symbol:
-            continue
-        with book_lock:
-            b = live_bids.get(sym, [])
-            a = live_asks.get(sym, [])
-        if len(b) < DEPTH_LEVELS or len(a) < DEPTH_LEVELS:
-            continue
-        bv = sum(q for _, q in b[:DEPTH_LEVELS])
-        av = sum(q for _, q in a[:DEPTH_LEVELS])
-        if av == ZERO:
-            continue
-        top3.append((sym, bv / av))
-
-    top3.sort(key=lambda x: x[1], reverse=True)
-    top3_symbols = {s for s, _ in top3[:3]}
-
-    return symbol in top3_symbols
-
 
 # --------------------------------------------------------------------------- #
 # =============================== RETRY ===================================== #
@@ -693,6 +653,44 @@ def rebalance_infinity_grid(bot, symbol):
             logger.info(f"GRID: {symbol} | ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
 
 # --------------------------------------------------------------------------- #
+# =========================== TOP-3 ENTRY GUARD ============================= #
+# --------------------------------------------------------------------------- #
+def is_top3_buy_pressure(symbol: str) -> bool:
+    """Check if symbol is in top-3 buy pressure (depth-5)."""
+    with book_lock:
+        bids = live_bids.get(symbol, [])
+        asks = live_asks.get(symbol, [])
+    if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+        return False
+
+    bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
+    ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
+    if ask_vol == ZERO:
+        return False
+    my_imbalance = bid_vol / ask_vol
+
+    # Build top-3 from all valid symbols
+    competitors = []
+    for sym in valid_symbols_dict:
+        if sym == symbol:
+            continue
+        with book_lock:
+            b = live_bids.get(sym, [])
+            a = live_asks.get(sym, [])
+        if len(b) < DEPTH_LEVELS or len(a) < DEPTH_LEVELS:
+            continue
+        bv = sum(q for _, q in b[:DEPTH_LEVELS])
+        av = sum(q for _, q in a[:DEPTH_LEVELS])
+        if av == ZERO:
+            continue
+        competitors.append((sym, bv / av))
+
+    competitors.sort(key=lambda x: x[1], reverse=True)
+    top3_symbols = {s for s, _ in competitors[:3]}
+
+    return symbol in top3_symbols
+
+# --------------------------------------------------------------------------- #
 # =========================== FIRST RUN ENTRY =============================== #
 # --------------------------------------------------------------------------- #
 def first_run_entry_from_ladder(bot):
@@ -771,7 +769,7 @@ def first_run_entry_from_ladder(bot):
         order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
         if order:
             logger.info(f"TOP-3 ENTRY: {sym} @ {buy_price} | Pressure: {imbalance:.2f}x")
-            send_whatsapp_alert(f"TOP-3 {sym} @ {buy_price:.6f}")
+            send_whatsapp_alert(f"TOP-3 {sym} @ {buy_price:.6f} (Pressure {imbalance:.2f}x)")
 
     first_run_executed = True
 
@@ -782,7 +780,7 @@ def print_dashboard(bot):
     global first_dashboard_run
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 120)
-    print(f"{'INFINITY GRID BOT – LEGACY CORE + PRO FILTERS':^120}")
+    print(f"{'INFINITY GRID BOT – TOP-3 ENTRY ONLY':^120}")
     print("=" * 120)
     print(f"Time: {now_cst()} | USDT: ${float(bot.get_balance()):,.2f}")
     print(f"Total Unrealized: ${float(total_pnl):+.2f} | Total Realized: ${float(total_realized_pnl):+.2f}")
@@ -807,25 +805,23 @@ def print_dashboard(bot):
             reset = "\033[0m"
             print(f"{sym:<10} | Qty: {qty:>8.4f} | Entry: ${entry:>8.6f} | Now: ${current:>8.6f} | Live: {color}${unrealized:+8.2f} ({pct:+.2f}%){reset} | Realized: ${realized:+.2f}")
 
-    print(f"\nTOP {TOP_N_ENTRY} BUY PRESSURE (ENTRY CANDIDATES)")
+    print("\nTOP 3 BUY PRESSURE (LIVE)")
     candidates = []
     for sym in valid_symbols_dict:
-        vol = valid_symbols_dict[sym]['volume']
-        with price_lock:
-            price = live_prices.get(sym, ZERO)
-        if price <= ZERO or price < MIN_PRICE or price > MAX_PRICE or vol < MIN_24H_VOLUME_USDT:
-            continue
         with book_lock:
             bids = live_bids.get(sym, [])
             asks = live_asks.get(sym, [])
-        if not bids or not asks: continue
-        bid_vol = sum(float(q) for _, q in bids)
-        ask_vol = sum(float(q) for _, q in asks)
-        imbalance = bid_vol / (ask_vol or 1)
-        if imbalance >= 1.3:
-            candidates.append((sym.replace('USDT',''), imbalance, float(price)))
-    for coin, imb, price in sorted(candidates, key=lambda x: x[1], reverse=True)[:TOP_N_ENTRY]:
-        print(f" {coin:>8} | {imb:>4.1f}x | ${price:>8.6f}")
+        if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+            continue
+        bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
+        ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
+        if ask_vol == ZERO:
+            continue
+        imbalance = bid_vol / ask_vol
+        if imbalance >= 1.0:
+            candidates.append((sym.replace('USDT',''), imbalance, float(asks[0][0])))
+    for coin, imb, price in sorted(candidates, key=lambda x: x[1], reverse=True)[:3]:
+        print(f" {coin:>8} | {imb:>4.1f}x | Ask: ${price:,.6f}")
 
     print("\nGRID LIMIT ORDERS (BUY & SELL)")
     with DBManager() as sess:
@@ -878,10 +874,23 @@ def main():
         try:
             now = time.time()
 
+            # === FIRST-RUN ENTRY (TOP-3 ONLY) ===
             with DBManager() as sess:
                 if sess.query(Position).count() == 0 and not first_run_executed:
                     first_run_entry_from_ladder(bot)
 
+            # === RE-ENTRY: ONLY IF TOP-3 SIGNAL APPEARS ===
+            with DBManager() as sess:
+                if sess.query(Position).count() == 0 and first_run_executed:
+                    # Scan for any top-3 signal
+                    for sym in valid_symbols_dict:
+                        if is_top3_buy_pressure(sym):
+                            logger.info(f"RE-ENTRY SIGNAL: {sym} in top-3 buy pressure. Re-triggering entry...")
+                            first_run_executed = False
+                            first_run_entry_from_ladder(bot)
+                            break
+
+            # === GRID REBALANCE ===
             if now - last_rebalance_check >= 45:
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
@@ -889,10 +898,12 @@ def main():
                             rebalance_infinity_grid(bot, pos.symbol)
                 last_rebalance_check = now
 
+            # === PnL REFRESH ===
             if now - last_pnl_refresh >= 2:
                 refresh_all_pnl()
                 last_pnl_refresh = now
 
+            # === DASHBOARD ===
             if now - last_dashboard >= 60:
                 print_dashboard(bot)
                 last_dashboard = now
