@@ -837,7 +837,7 @@ def print_dashboard(bot):
 # === MAIN ===================================================================
 def main():
     bot = BinanceTradingBot()
-    global valid_symbols_dict
+    global valid_symbols_dict, first_run_executed
     try:
         info = bot.client.get_exchange_info()
         for s in info['symbols']:
