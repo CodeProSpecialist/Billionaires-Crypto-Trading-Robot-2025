@@ -656,11 +656,8 @@ def rebalance_infinity_grid(bot, symbol):
 # --------------------------------------------------------------------------- #
 # =========================== FIRST RUN ENTRY =============================== #
 # --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# =========================== FIRST RUN ENTRY =============================== #
-# --------------------------------------------------------------------------- #
 def first_run_entry_from_ladder(bot):
-    """Buy ONLY the three symbols with the highest bid/ask volume imbalance."""
+    """ONLY buy the top-3 coins with highest bid/ask volume imbalance in depth-5."""
     global first_run_executed
     if first_run_executed:
         return
@@ -671,20 +668,15 @@ def first_run_entry_from_ladder(bot):
         first_run_executed = True
         return
 
-    # --------------------------------------------------------------------
-    # 1. Scan every USDT pair – depth-5 only
-    # --------------------------------------------------------------------
-    pressure: List[Tuple[str, Decimal, Decimal]] = []   # (symbol, imbalance, ask_price)
+    # --- 1. Scan depth-5 for buy pressure ---
+    pressure = []  # (symbol, imbalance, best_ask)
     with DBManager() as sess:
         owned = {p.symbol for p in sess.query(Position).all()}
 
     for sym in valid_symbols_dict:
         if sym in owned:
             continue
-
-        # 24-h volume & price filters
-        vol = valid_symbols_dict[sym]['volume']
-        if vol < MIN_24H_VOLUME_USDT:
+        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
             continue
 
         with price_lock:
@@ -698,45 +690,38 @@ def first_run_entry_from_ladder(bot):
         if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
             continue
 
-        # sum first 5 levels only
         bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
         ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
-        if ask_vol == 0:
+        if ask_vol == ZERO:
             continue
 
-        imbalance = bid_vol / ask_vol                     # >1 → buying pressure
-        ask_price = asks[0][0]                            # best ask
+        imbalance = bid_vol / ask_vol
+        best_ask = asks[0][0]
 
-        pressure.append((sym, imbalance, ask_price))
+        pressure.append((sym, imbalance, best_ask))
 
     if not pressure:
-        logger.info("No symbols with sufficient buy pressure.")
+        logger.info("No top-3 buy pressure signals.")
         first_run_executed = True
         return
 
-    # --------------------------------------------------------------------
-    # 2. Pick the **top-3** by imbalance
-    # --------------------------------------------------------------------
+    # --- 2. Select TOP-3 only ---
     pressure.sort(key=lambda x: x[1], reverse=True)
-    top3 = pressure[:3]                                   # (sym, imb, ask_price)
+    top3 = pressure[:3]
 
-    # --------------------------------------------------------------------
-    # 3. Allocate equally (minus buffer) and place limit buys a hair below the ask
-    # --------------------------------------------------------------------
+    # --- 3. Allocate & buy ---
     per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)
 
-    for sym, imb, ask_price in top3:
+    for sym, imbalance, ask_price in top3:
         if per_coin < ENTRY_MIN_USDT:
             break
 
-        # ---- quantity ---------------------------------------------------
         raw_qty = (per_coin * (1 - float(ENTRY_BUY_PCT_BELOW_ASK))) / float(ask_price)
         step = bot.get_lot_step(sym)
         qty = (to_decimal(raw_qty) // step) * step
-        if qty <= 0:
+        if qty <= ZERO:
             continue
 
-        # ---- price ------------------------------------------------------
         buy_price = to_decimal(float(ask_price) * (1 - ENTRY_BUY_PCT_BELOW_ASK))
         tick = bot.get_tick_size(sym)
         buy_price = (buy_price // tick) * tick
@@ -744,14 +729,10 @@ def first_run_entry_from_ladder(bot):
         if not buy_notional_ok(buy_price, qty):
             continue
 
-        order = bot.place_limit_buy_with_tracking(
-            symbol=sym,
-            price=str(buy_price),
-            qty=float(qty)
-        )
+        order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
         if order:
-            logger.info(f"FIRST-RUN BUY {sym} @ {buy_price} (imbalance {imb:.2f}x)")
-            send_whatsapp_alert(f"FIRST-RUN {sym} @ {buy_price:.6f}")
+            logger.info(f"TOP-3 ENTRY: {sym} @ {buy_price} | Pressure: {imbalance:.2f}x")
+            send_whatsapp_alert(f"TOP-3 {sym} @ {buy_price:.6f}")
 
     first_run_executed = True
 
