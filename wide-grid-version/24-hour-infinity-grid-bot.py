@@ -54,10 +54,10 @@ MIN_GRIDS_FALLBACK = 1
 REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75%
 
 # ---- Entry Filters ---------------------------------------------------------
-MIN_24H_VOLUME_USDT = 60000
-MIN_PRICE = Decimal('0.15')
+MIN_24H_VOLUME_USDT = 100000
+MIN_PRICE = Decimal('1.00')
 MAX_PRICE = Decimal('1000')
-ENTRY_MIN_USDT = Decimal('15.0')
+ENTRY_MIN_USDT = Decimal('5.0')
 ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')
 TOP_N_ENTRY = 10
 
