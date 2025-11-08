@@ -15,7 +15,6 @@ updates were on 11-7-2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
-# Dynamic Trailing Bot for Binance.US 
 
 > **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book Intelligence, and Institutional-Grade Risk Controls**
 
