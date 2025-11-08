@@ -156,6 +156,45 @@ def now_cst():
     return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 # --------------------------------------------------------------------------- #
+# =============================== ENTRY GUARD ================================ #
+# --------------------------------------------------------------------------- #
+def allow_new_position_buy(symbol: str) -> bool:
+    """Only allow new position if symbol is in top-3 buy pressure."""
+    with book_lock:
+        bids = live_bids.get(symbol, [])
+        asks = live_asks.get(symbol, [])
+    if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+        return False
+
+    bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
+    ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
+    if ask_vol == ZERO:
+        return False
+    imbalance = bid_vol / ask_vol
+
+    # Rebuild top-3 list on-the-fly
+    top3 = []
+    for sym in valid_symbols_dict:
+        if sym == symbol:
+            continue
+        with book_lock:
+            b = live_bids.get(sym, [])
+            a = live_asks.get(sym, [])
+        if len(b) < DEPTH_LEVELS or len(a) < DEPTH_LEVELS:
+            continue
+        bv = sum(q for _, q in b[:DEPTH_LEVELS])
+        av = sum(q for _, q in a[:DEPTH_LEVELS])
+        if av == ZERO:
+            continue
+        top3.append((sym, bv / av))
+
+    top3.sort(key=lambda x: x[1], reverse=True)
+    top3_symbols = {s for s, _ in top3[:3]}
+
+    return symbol in top3_symbols
+
+
+# --------------------------------------------------------------------------- #
 # =============================== RETRY ===================================== #
 # --------------------------------------------------------------------------- #
 def retry_custom(func):
