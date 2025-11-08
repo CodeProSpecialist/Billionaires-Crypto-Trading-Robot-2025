@@ -9,6 +9,7 @@
     • First run: Live order book → buys top 3
     • Infinity grid: regrids every 45s
     • ZERO REST polling → IP safe
+    • ENFORCED: ONLY BUY TOP-3 BUY PRESSURE COINS (NO EXCEPTIONS)
 """
 import os
 import sys
@@ -100,7 +101,6 @@ ws_instances = []
 user_ws = None
 listen_key = None
 listen_key_lock = threading.Lock()
-first_run_executed = False
 
 # PnL Tracking
 position_pnl: Dict[str, Dict[str, Decimal]] = {}
@@ -269,12 +269,14 @@ def on_market_message(ws, message):
 
         if stream.endswith('@ticker'):
             price = to_decimal(payload.get('c', '0'))
-            if price > 0:
+            volume = to_decimal(payload.get('v', '0')) * price
+            if price > ZERO:
                 with price_lock:
                     live_prices[symbol] = price
+                valid_symbols_dict[symbol]['volume'] = float(volume)
                 update_pnl_for_symbol(symbol)
 
-        elif stream.endswith('@depth5'):
+        elif stream.endswith(f'@depth{DEPTH_LEVELS}'):
             bids = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('bids', [])]
             asks = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('asks', [])]
             with book_lock:
@@ -411,11 +413,18 @@ class BinanceTradingBot:
                     if qty <= 0 or asset in {'USDT', 'USDC'}: continue
                     sym = f"{asset}USDT"
                     with price_lock:
-                        price = live_prices.get(sym, self.get_price_usdt(asset))
+                        price = live_prices.get(sym, ZERO)
+                    if price <= ZERO:
+                        try:
+                            ticker = self.client.get_symbol_ticker(symbol=sym)
+                            price = to_decimal(ticker['price'])
+                        except:
+                            continue
                     if price <= ZERO: continue
                     maker, _ = self.get_trade_fees(sym)
                     sess.add(Position(symbol=sym, quantity=qty, avg_entry_price=price, buy_fee_rate=to_decimal(maker)))
                 sess.commit()
+            logger.info("DB synced with Binance positions on startup")
         except Exception as e:
             logger.error(f"Sync failed: {e}")
 
@@ -527,8 +536,42 @@ def refresh_all_pnl():
         for pos in sess.query(Position).all():
             update_pnl_for_symbol(pos.symbol)
 
-# === FIRST RUN: BUY FROM LIVE ORDER BOOK ====================================
-# === FIRST RUN: BUY ONLY TOP-3 BUY-PRESSURE COINS ========================
+# === TOP-3 BUY PRESSURE GUARD ===============================================
+def is_top3_buy_pressure(symbol: str) -> bool:
+    """Return True only if symbol is in top-3 buy pressure (depth-5)."""
+    with book_lock:
+        bids = live_bids.get(symbol, [])
+        asks = live_asks.get(symbol, [])
+    if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+        return False
+
+    bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
+    ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
+    if ask_vol == ZERO:
+        return False
+    my_imbalance = bid_vol / ask_vol
+
+    # Build top-3 list
+    competitors = []
+    for sym in valid_symbols_dict:
+        if sym == symbol:
+            continue
+        with book_lock:
+            b = live_bids.get(sym, [])
+            a = live_asks.get(sym, [])
+        if len(b) < DEPTH_LEVELS or len(a) < DEPTH_LEVELS:
+            continue
+        bv = sum(q for _, q in b[:DEPTH_LEVELS])
+        av = sum(q for _, q in a[:DEPTH_LEVELS])
+        if av == ZERO:
+            continue
+        competitors.append((sym, bv / av))
+
+    competitors.sort(key=lambda x: x[1], reverse=True)
+    top3_symbols = {s for s, _ in competitors[:3]}
+    return symbol in top3_symbols
+
+# === FIRST RUN: BUY ONLY TOP-3 BUY-PRESSURE COINS ===========================
 def first_run_entry_from_ladder(bot):
     """Buy the three symbols with the highest bid/ask volume imbalance."""
     global first_run_executed
@@ -541,13 +584,16 @@ def first_run_entry_from_ladder(bot):
         first_run_executed = True
         return
 
-    # --------------------------------------------------------------------
-    # 1. Scan the live depth-5 book for every USDT pair
-    # --------------------------------------------------------------------
-    pressure: List[Tuple[str, Decimal, Decimal]] = []   # (symbol, imbalance, ask_price)
+    # --- 1. Scan depth-5 ---
+    pressure: List[Tuple[str, Decimal, Decimal]] = []
+    with DBManager() as sess:
+        owned = {p.symbol for p in sess.query(Position).all()}
+
     for sym in valid_symbols_dict:
-        if sym in {p.symbol for p in bot.client.get_account()['balances'] if float(p['free']) > 0}:
-            continue                                 # skip already-owned assets
+        if sym in owned:
+            continue
+        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
+            continue
 
         with book_lock:
             bids = live_bids.get(sym, [])
@@ -555,66 +601,53 @@ def first_run_entry_from_ladder(bot):
         if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
             continue
 
-        # total volume on the first 5 levels
         bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
         ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
-        if ask_vol == 0:
+        if ask_vol == ZERO:
             continue
-        imbalance = bid_vol / ask_vol                     # >1  → buying pressure
+        imbalance = bid_vol / ask_vol
+        ask_price = asks[0][0]
 
-        ask_price = asks[0][0]                           # best ask
         if not (MIN_PRICE <= float(ask_price) <= MAX_PRICE):
-            continue
-        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
             continue
 
         pressure.append((sym, imbalance, ask_price))
 
     if not pressure:
-        logger.info("No symbols with sufficient buy pressure.")
+        logger.info("No top-3 buy pressure signals.")
         first_run_executed = True
         return
 
-    # --------------------------------------------------------------------
-    # 2. Pick the top-3 by imbalance
-    # --------------------------------------------------------------------
+    # --- 2. Pick top-3 ---
     pressure.sort(key=lambda x: x[1], reverse=True)
-    top3 = pressure[:3]                                 # (sym, imb, ask_price)
+    top3 = pressure[:3]
 
-    # --------------------------------------------------------------------
-    # 3. Allocate equally (minus buffer) and place limit buys a hair below the ask
-    # --------------------------------------------------------------------
+    # --- 3. Allocate & buy ---
     per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)
 
     for sym, imb, ask_price in top3:
         if per_coin < ENTRY_MIN_USDT:
             break
 
-        # ---- quantity ---------------------------------------------------
-        raw_qty = (per_coin * (1 - ENTRY_BUY_PCT_BELOW_ASK)) / float(ask_price)
+        raw_qty = (per_coin * (1 - float(ENTRY_BUY_PCT_BELOW_ASK))) / float(ask_price)
         info = bot.client.get_symbol_info(sym)
         lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         step = Decimal(lot['stepSize'])
         qty = (to_decimal(raw_qty) // step) * step
-        if qty <= 0:
+        if qty <= ZERO:
             continue
 
-        # ---- price ------------------------------------------------------
-        buy_price = to_decimal(float(ask_price) * (1 - ENTRY_BUY_PCT_BELOW_ASK))
+        buy_price = to_decimal(float(ask_price) * (1 - float(ENTRY_BUY_PCT_BELOW_ASK)))
         tick = bot.get_tick_size(sym)
         buy_price = (buy_price // tick) * tick
 
         if not buy_notional_ok(buy_price, qty):
             continue
 
-        order = bot.place_limit_buy_with_tracking(
-            symbol=sym,
-            price=str(buy_price),
-            qty=float(qty)
-        )
+        order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
         if order:
-            logger.info(f"FIRST-RUN BUY {sym} @ {buy_price} (imbalance {imb:.2f}x)")
-            send_whatsapp_alert(f"FIRST-RUN {sym} @ {buy_price:.6f}")
+            logger.info(f"TOP-3 ENTRY: {sym} @ {buy_price} | Pressure: {imb:.2f}x")
+            send_whatsapp_alert(f"TOP-3 {sym} @ {buy_price:.6f} (Pressure {imb:.2f}x)")
 
     first_run_executed = True
 
@@ -730,7 +763,7 @@ def print_dashboard(bot):
     global first_dashboard_run
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 120)
-    print(f"{'INFINITY GRID BOT – LIVE + REALIZED PnL':^120}")
+    print(f"{'INFINITY GRID BOT – TOP-3 ENTRY ONLY':^120}")
     print("=" * 120)
     print(f"Time: {now_cst()} | USDT: ${float(bot.get_balance()):,.2f}")
     print(f"Total Unrealized: ${float(total_pnl):+.2f} | Total Realized: ${float(total_realized_pnl):+.2f}")
@@ -761,13 +794,17 @@ def print_dashboard(bot):
         with book_lock:
             bids = live_bids.get(sym, [])
             asks = live_asks.get(sym, [])
-        if not bids or not asks: continue
+        if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+            continue
         price = float(asks[0][0])
-        if not (MIN_PRICE <= price <= MAX_PRICE): continue
-        bid_vol = sum(float(q) for _, q in bids)
-        ask_vol = sum(float(q) for _, q in asks)   # <-- FIXED: removed stray "\{"
-        imbalance = bid_vol / (ask_vol or 1)
-        if imbalance >= 1.3:
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            continue
+        bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
+        ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
+        if ask_vol == ZERO:
+            continue
+        imbalance = bid_vol / ask_vol
+        if imbalance >= 1.0:
             candidates.append((sym.replace('USDT',''), imbalance, price))
     for coin, imb, price in sorted(candidates, key=lambda x: x[1], reverse=True)[:3]:
         print(f" {coin:>8} | {imb:>4.1f}x | Ask: ${price:,.6f}")
@@ -825,12 +862,22 @@ def main():
         try:
             now = time.time()
 
-            # First run
+            # === FIRST-RUN ENTRY (TOP-3 ONLY) ===
             with DBManager() as sess:
                 if sess.query(Position).count() == 0 and not first_run_executed:
                     first_run_entry_from_ladder(bot)
 
-            # Rebalance
+            # === RE-ENTRY: ONLY IF TOP-3 SIGNAL APPEARS ===
+            with DBManager() as sess:
+                if sess.query(Position).count() == 0 and first_run_executed:
+                    for sym in valid_symbols_dict:
+                        if is_top3_buy_pressure(sym):
+                            logger.info(f"RE-ENTRY SIGNAL: {sym} in top-3. Re-triggering entry...")
+                            first_run_executed = False
+                            first_run_entry_from_ladder(bot)
+                            break
+
+            # === GRID REBALANCE ===
             if now - last_rebalance_check >= 45:
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
@@ -838,11 +885,12 @@ def main():
                             rebalance_infinity_grid(bot, pos.symbol)
                 last_rebalance_check = now
 
-            # Refresh PnL every 2s
+            # === PnL REFRESH ===
             if now - last_pnl_refresh >= 2:
                 refresh_all_pnl()
                 last_pnl_refresh = now
 
+            # === DASHBOARD ===
             if now - last_dashboard >= 60:
                 print_dashboard(bot)
                 last_dashboard = now
