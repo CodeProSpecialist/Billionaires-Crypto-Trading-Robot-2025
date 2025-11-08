@@ -26,7 +26,7 @@ This also fixes any program startup errors. )
 |--------|-------------|
 
 | **Professional Dashboard** | Real-time P&L, positions, market overview, and buy signals |
-| **SQLite Trade & Position DB** | Full audit trail, auto-import of existing holdings |
+| **SQLite Trade & Position DB** | auto-import of existing holdings |
 | **WhatsApp Alerts** | Instant execution & event notifications via CallMeBot |
 | **Dynamic Trailing Logic** | Buy on dips, sell on peaks — with stall detection & flash move triggers |
 
@@ -38,10 +38,8 @@ This also fixes any program startup errors. )
 Most bots trade blindly. This one *watches the market like a hawk*.
 	•	Order Book Pressure Spikes → Detects panic selling or FOMO buying
 	•	Rapid Price Moves (1.5% in <5s) → Instant market entry/exit
-	•	15-Minute Stall Protection → Prevents capital lockup
+	
 	•	0.8% Net Profit Target → Disciplined exits after fees
-	•	RSI + Bollinger + MACD + Patterns → Multi-layer confirmation
-
 
 
 Safety & Compliance
