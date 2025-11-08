@@ -656,60 +656,102 @@ def rebalance_infinity_grid(bot, symbol):
 # --------------------------------------------------------------------------- #
 # =========================== FIRST RUN ENTRY =============================== #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# =========================== FIRST RUN ENTRY =============================== #
+# --------------------------------------------------------------------------- #
 def first_run_entry_from_ladder(bot):
+    """Buy ONLY the three symbols with the highest bid/ask volume imbalance."""
     global first_run_executed
     if first_run_executed:
         return
+
     usdt_free = bot.get_balance()
     if usdt_free < ENTRY_MIN_USDT:
-        logger.info("Insufficient USDT for entry.")
+        logger.info("Insufficient USDT for first-run entry.")
         first_run_executed = True
         return
 
-    candidates = []
+    # --------------------------------------------------------------------
+    # 1. Scan every USDT pair – depth-5 only
+    # --------------------------------------------------------------------
+    pressure: List[Tuple[str, Decimal, Decimal]] = []   # (symbol, imbalance, ask_price)
     with DBManager() as sess:
         owned = {p.symbol for p in sess.query(Position).all()}
 
     for sym in valid_symbols_dict:
-        if sym in owned: continue
+        if sym in owned:
+            continue
+
+        # 24-h volume & price filters
         vol = valid_symbols_dict[sym]['volume']
+        if vol < MIN_24H_VOLUME_USDT:
+            continue
+
         with price_lock:
             price = live_prices.get(sym, ZERO)
-        if price <= ZERO or price < MIN_PRICE or price > MAX_PRICE or vol < MIN_24H_VOLUME_USDT:
+        if price <= ZERO or price < MIN_PRICE or price > MAX_PRICE:
             continue
+
         with book_lock:
             bids = live_bids.get(sym, [])
             asks = live_asks.get(sym, [])
-        if not bids or not asks: continue
-        bid_vol = sum(float(q) for _, q in bids)
-        ask_vol = sum(float(q) for _, q in asks)
-        imbalance = bid_vol / (ask_vol or 1)
-        if imbalance >= 1.3:
-            candidates.append((sym, imbalance, float(price)))
+        if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+            continue
 
-    if not candidates:
-        logger.info("No entry signals.")
+        # sum first 5 levels only
+        bid_vol = sum(q for _, q in bids[:DEPTH_LEVELS])
+        ask_vol = sum(q for _, q in asks[:DEPTH_LEVELS])
+        if ask_vol == 0:
+            continue
+
+        imbalance = bid_vol / ask_vol                     # >1 → buying pressure
+        ask_price = asks[0][0]                            # best ask
+
+        pressure.append((sym, imbalance, ask_price))
+
+    if not pressure:
+        logger.info("No symbols with sufficient buy pressure.")
         first_run_executed = True
         return
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    top_10 = candidates[:TOP_N_ENTRY]
-    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top_10)
+    # --------------------------------------------------------------------
+    # 2. Pick the **top-3** by imbalance
+    # --------------------------------------------------------------------
+    pressure.sort(key=lambda x: x[1], reverse=True)
+    top3 = pressure[:3]                                   # (sym, imb, ask_price)
 
-    for sym, imb, price in top_10:
-        if per_coin < ENTRY_MIN_USDT: break
-        qty = (per_coin * (1 - float(ENTRY_BUY_PCT_BELOW_ASK))) / price
+    # --------------------------------------------------------------------
+    # 3. Allocate equally (minus buffer) and place limit buys a hair below the ask
+    # --------------------------------------------------------------------
+    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)
+
+    for sym, imb, ask_price in top3:
+        if per_coin < ENTRY_MIN_USDT:
+            break
+
+        # ---- quantity ---------------------------------------------------
+        raw_qty = (per_coin * (1 - float(ENTRY_BUY_PCT_BELOW_ASK))) / float(ask_price)
         step = bot.get_lot_step(sym)
-        qty = (to_decimal(qty) // step) * step
-        if qty <= 0: continue
-        buy_price = to_decimal(price * (1 - ENTRY_BUY_PCT_BELOW_ASK))
+        qty = (to_decimal(raw_qty) // step) * step
+        if qty <= 0:
+            continue
+
+        # ---- price ------------------------------------------------------
+        buy_price = to_decimal(float(ask_price) * (1 - ENTRY_BUY_PCT_BELOW_ASK))
         tick = bot.get_tick_size(sym)
         buy_price = (buy_price // tick) * tick
-        if buy_notional_ok(buy_price, qty):
-            order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
-            if order:
-                logger.info(f"ENTRY: {sym} @ ${float(buy_price):.6f}")
-                send_whatsapp_alert(f"ENTRY {sym} @ {buy_price:.6f}")
+
+        if not buy_notional_ok(buy_price, qty):
+            continue
+
+        order = bot.place_limit_buy_with_tracking(
+            symbol=sym,
+            price=str(buy_price),
+            qty=float(qty)
+        )
+        if order:
+            logger.info(f"FIRST-RUN BUY {sym} @ {buy_price} (imbalance {imb:.2f}x)")
+            send_whatsapp_alert(f"FIRST-RUN {sym} @ {buy_price:.6f}")
 
     first_run_executed = True
 
