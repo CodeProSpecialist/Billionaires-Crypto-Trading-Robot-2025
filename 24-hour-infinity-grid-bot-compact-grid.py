@@ -575,6 +575,7 @@ def is_top3_buy_pressure(symbol: str) -> bool:
 def first_run_entry_from_ladder(bot):
     """Buy the three symbols with the highest bid/ask volume imbalance."""
     global first_run_executed
+    
     if first_run_executed:
         return
 
