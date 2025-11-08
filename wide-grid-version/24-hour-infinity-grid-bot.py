@@ -58,7 +58,7 @@ MIN_24H_VOLUME_USDT = 100000
 MIN_PRICE = Decimal('1.00')
 MAX_PRICE = Decimal('1000')
 ENTRY_MIN_USDT = Decimal('5.0')
-ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')
+ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')  # 0.1%
 
 # ---- WebSocket -------------------------------------------------------------
 WS_BASE = "wss://stream.binance.us:9443/stream?streams="
@@ -632,7 +632,7 @@ def rebalance_infinity_grid(bot, symbol):
         tick = bot.get_tick_size(symbol)
 
         for i in range(1, buy_levels + 1):
-            price = (current_price * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
+            price = (current_price * (ONE - GRID_INTERVAL_PCT * i) // tick) * tick
             if buy_notional_ok(price, qty_per_grid):
                 order = bot.place_limit_buy_with_tracking(symbol, str(price), float(qty_per_grid))
                 if order:
@@ -641,7 +641,7 @@ def rebalance_infinity_grid(bot, symbol):
         base_asset = symbol.replace('USDT', '')
         free = bot.get_asset_balance(base_asset)
         for i in range(1, sell_levels + 1):
-            price = (current_price * (1 + GRID_INTERVAL_PCT * i) // tick) * tick
+            price = (current_price * (ONE + GRID_INTERVAL_PCT * i) // tick) * tick
             if free >= qty_per_grid and sell_notional_ok(price, qty_per_grid):
                 order = bot.place_limit_sell_with_tracking(symbol, str(price), float(qty_per_grid))
                 if order:
@@ -669,7 +669,6 @@ def is_top3_buy_pressure(symbol: str) -> bool:
         return False
     my_imbalance = bid_vol / ask_vol
 
-    # Build top-3 from all valid symbols
     competitors = []
     for sym in valid_symbols_dict:
         if sym == symbol:
@@ -705,7 +704,6 @@ def first_run_entry_from_ladder(bot):
         first_run_executed = True
         return
 
-    # --- 1. Scan depth-5 for buy pressure ---
     pressure = []  # (symbol, imbalance, best_ask)
     with DBManager() as sess:
         owned = {p.symbol for p in sess.query(Position).all()}
@@ -742,24 +740,26 @@ def first_run_entry_from_ladder(bot):
         first_run_executed = True
         return
 
-    # --- 2. Select TOP-3 only ---
     pressure.sort(key=lambda x: x[1], reverse=True)
     top3 = pressure[:3]
 
-    # --- 3. Allocate & buy ---
-    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)
+    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(top3)  # Decimal
 
     for sym, imbalance, ask_price in top3:
         if per_coin < ENTRY_MIN_USDT:
             break
 
-        raw_qty = (per_coin * (1 - float(ENTRY_BUY_PCT_BELOW_ASK))) / float(ask_price)
+        # FIXED: Full Decimal arithmetic
+        discount = ONE - ENTRY_BUY_PCT_BELOW_ASK
+        adjusted_usdt = per_coin * discount
+        raw_qty = adjusted_usdt / ask_price
+
         step = bot.get_lot_step(sym)
-        qty = (to_decimal(raw_qty) // step) * step
+        qty = (raw_qty // step) * step
         if qty <= ZERO:
             continue
 
-        buy_price = to_decimal(float(ask_price) * (1 - ENTRY_BUY_PCT_BELOW_ASK))
+        buy_price = ask_price * discount
         tick = bot.get_tick_size(sym)
         buy_price = (buy_price // tick) * tick
 
@@ -882,7 +882,6 @@ def main():
             # === RE-ENTRY: ONLY IF TOP-3 SIGNAL APPEARS ===
             with DBManager() as sess:
                 if sess.query(Position).count() == 0 and first_run_executed:
-                    # Scan for any top-3 signal
                     for sym in valid_symbols_dict:
                         if is_top3_buy_pressure(sym):
                             logger.info(f"RE-ENTRY SIGNAL: {sym} in top-3 buy pressure. Re-triggering entry...")
