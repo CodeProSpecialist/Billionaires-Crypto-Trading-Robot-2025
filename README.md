@@ -15,6 +15,12 @@ updates were on 11-8-2025.
 binance_trades.db when restarting the program if there might be any configuration changes. 
 This also fixes any program startup errors. )
 
+Instructions for the Compact Infinity Grid Bot:
+1. Manually place a few buy orders for $25 ( or any amount that is only 1/5 of your total account balance ) 
+  Buy the top 3 coins that are showing strong buying pressure in the order book: looking at the Infinity Grid Bot's top 3 order book coins.
+
+3. Start the compact infinity grid bot and relax while the infinity grid bot handles the buying and selling during any future price changes. 
+
 
 > **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book Intelligence, and Institutional-Grade Risk Controls**
 
