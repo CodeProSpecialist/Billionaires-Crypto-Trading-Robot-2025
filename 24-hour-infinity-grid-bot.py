@@ -17,7 +17,6 @@ import websocket
 import signal
 import re
 from decimal import Decimal, ROUND_DOWN, getcontext 
-getcontext().prec = 28
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
 import pytz
@@ -27,6 +26,9 @@ from binance.exceptions import BinanceAPIException
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import OperationalError, IntegrityError
+
+# for decimal import
+getcontext().prec = 28
 
 # === CONFIGURATION ===========================================================
 API_KEY = os.getenv('BINANCE_API_KEY')
