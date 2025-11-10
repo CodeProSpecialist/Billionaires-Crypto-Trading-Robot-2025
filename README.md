@@ -74,7 +74,7 @@ export CALLMEBOT_API_KEY="123456"
 export CALLMEBOT_PHONE="15551234567"
 
 # 3. Run
-python3 2025-coin-trading-bot.py
+python3 24-hour-infinity-grid-bot.py
 ```
  
 **NO SUBSCRIPTION • NO CLOUD • FULL CONTROL**
