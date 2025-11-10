@@ -974,7 +974,7 @@ def print_dashboard(bot):
         # === FIXED: Use global + safe Decimal math ===
         with realized_lock:
             current_time = time.time()
-            pnl_history Trunk.append((current_time, total_realized_pnl))
+            pnl_history.append((current_time, total_realized_pnl))
             cutoff = current_time - SHARPE_WINDOW * 60
             pnl_history[:] = [x for x in pnl_history if x[0] > cutoff]
 
