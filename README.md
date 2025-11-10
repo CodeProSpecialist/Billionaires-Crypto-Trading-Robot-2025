@@ -17,8 +17,8 @@ binance_trades.db when restarting the program if there might be any configuratio
 This also fixes any program startup errors. )
 
 Instructions for the Compact Infinity Grid Bot:
-1. Download and run my other python bot called Digital-Coin-Portfolio-Rebalancer Bot. 
-
+1. Download and run my other python bot called Digital-Coin-Portfolio-Rebalancer Bot for a professionally balanced coin portfolio or just simply place some buy orders manually. 
+2. After your portfolio is rebalanced and ready proceed to next step. 
 3. Start the compact infinity grid bot and relax while the infinity grid bot handles the buying and selling during any future price changes. 
 
 
