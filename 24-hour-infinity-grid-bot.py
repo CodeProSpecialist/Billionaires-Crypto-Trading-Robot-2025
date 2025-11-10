@@ -2,7 +2,7 @@
 """
     INFINITY GRID BOT v7.2 – STRATEGY MODE + DASHBOARD DISPLAY
     • Auto-grids ANY /USDT coin in portfolio
-    • PME AI: Trend / Mean-Reversion / Volume-Anchored
+    • PME Profit Management Engine: Trend / Mean-Reversion / Volume-Anchored
     • Dashboard shows CURRENT STRATEGY per symbol
     • Bundled WhatsApp ≤5 min
     • $8 cash guard | $5 min sell
