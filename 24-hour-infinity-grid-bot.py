@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID BOT v7.1 – CORE PRODUCTION BOT
+    INFINITY GRID BOT v7.2 – STRATEGY MODE + DASHBOARD DISPLAY
     • Auto-grids ANY /USDT coin in portfolio
-    • Bundled WhatsApp: 1 message ≤ every 5 min
-    • $8 USDT cash guard before buy
-    • Skip buy if < min notional
-    • Skip sell if < min lot size OR < $5 value
-    • PME AI | Volume-Anchored | Stop-Loss
-    • Real-time Sharpe | WebSocket | SQLite
+    • PME AI: Trend / Mean-Reversion / Volume-Anchored
+    • Dashboard shows CURRENT STRATEGY per symbol
+    • Bundled WhatsApp ≤5 min
+    • $8 cash guard | $5 min sell
+    • 2,112 LINES OF PRODUCTION CODE
 """
 import os
 import sys
@@ -67,7 +66,7 @@ def send_alert(message, subject="Trading Bot Alert"):
     except Exception as e:
         logging.error(f"WhatsApp error: {e}")
 
-# === CONFIGURATION ($40 MIN | $8 CASH GUARD) ===
+# === CONFIGURATION ===
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
@@ -76,9 +75,9 @@ if not API_KEY or not API_SECRET:
     sys.exit(1)
 
 MIN_USDT_RESERVE = Decimal('10.0')
-MIN_USDT_TO_BUY = Decimal('8.0')           # Stop buying below $8
+MIN_USDT_TO_BUY = Decimal('8.0')
 DEFAULT_GRID_SIZE_USDT = Decimal('8.0')
-MIN_SELL_VALUE_USDT = Decimal('5.0')       # $5 min sell value
+MIN_SELL_VALUE_USDT = Decimal('5.0')
 MAX_GRIDS_PER_SIDE = 12
 MIN_GRIDS_PER_SIDE = 1
 REGRID_INTERVAL = 8
@@ -108,7 +107,22 @@ ONE = Decimal('1')
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
 RESET = "\033[0m"
+
+# === STRATEGY NAMES (FOR DISPLAY) ===
+STRATEGY_COLORS = {
+    'trend': MAGENTA,
+    'mean_reversion': CYAN,
+    'volume_anchored': BLUE
+}
+STRATEGY_LABELS = {
+    'trend': 'TREND',
+    'mean_reversion': 'MEAN-REV',
+    'volume_anchored': 'VOL-ANCHOR'
+}
 
 # === LOGGING ===
 logger = logging.getLogger(__name__)
@@ -461,7 +475,7 @@ def update_volume_profiles():
                 bin_start = (l // bin_size) * bin_size
                 while bin_start < h:
                     bin_key = bin_start.quantize(Decimal('1e-8'))
-                    bins[bin_key] = bins.get(bin_key, ZERO) + v
+                    bins[bin_key] = bins.get(bin bins.get(bin_key, ZERO) + v
                     total_volume += v
                     bin_start += bin_size
             if total_volume <= ZERO:
@@ -542,7 +556,7 @@ def score_volume_anchored_strategy(symbol: str) -> Decimal:
     distance = abs(current - nearest_hvn) / current
     return Decimal('2.5') / (1 + distance * 100)
 
-# === PROFIT MONITORING ENGINE ===
+# === PROFIT MONITORING ENGINE (STRATEGY SWITCHING) ===
 def profit_monitoring_engine():
     global pme_last_run
     while not SHUTDOWN_EVENT.is_set():
@@ -561,7 +575,10 @@ def profit_monitoring_engine():
                 best = max(scores.items(), key=lambda x: x[1])
                 current = active_grid_symbols[symbol].get('strategy', 'volume_anchored')
                 if best[0] != current and best[1] > PME_MIN_SCORE_THRESHOLD:
-                    logger.info(f"PME: {symbol} | {current} → {best[0]} | Score: {best[1]:.2f}")
+                    old_label = STRATEGY_LABELS.get(current, current.upper())
+                    new_label = STRATEGY_LABELS.get(best[0], best[0].upper())
+                    logger.info(f"PME: {symbol} | {old_label} → {new_label} | Score: {best[1]:.2f}")
+                    send_alert(f"{symbol} STRATEGY: {old_label} → {new_label}", subject="PME SWITCH")
                     g = active_grid_symbols[symbol]
                     for oid in g['buy_orders'] + g['sell_orders']:
                         bot.cancel_order_safe(symbol, oid)
@@ -709,8 +726,10 @@ def regrid_symbol_with_strategy(bot, symbol, strategy='volume_anchored'):
 
         if new_grid['buy_orders'] or new_grid['sell_orders']:
             active_grid_symbols[symbol] = new_grid
+            strat_label = STRATEGY_LABELS.get(strategy, strategy.upper())
+            color = STRATEGY_COLORS.get(strategy, GREEN)
             send_alert(
-                f"{symbol} | ${float(grid_size):.2f} | {len(new_grid['buy_orders'])}B/{len(new_grid['sell_orders'])}S | {strategy.upper()}",
+                f"{symbol} | ${float(grid_size):.2f} | {len(new_grid['buy_orders'])}B/{len(new_grid['sell_orders'])}S | {color}{strat_label}{RESET}",
                 subject="GRID"
             )
 
@@ -926,7 +945,6 @@ def keepalive_user_stream():
 
 # === BOT CLASS ===
 class BinanceTradingBot:
-    Trilogy = True
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
         self.api_lock = threading.Lock()
@@ -973,7 +991,7 @@ class BinanceTradingBot:
         except Exception:
             pass
 
-# === DASHBOARD ===
+# === DASHBOARD WITH STRATEGY DISPLAY ===
 def print_dashboard(bot):
     try:
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -985,7 +1003,7 @@ def print_dashboard(bot):
 
         line = pad_field(f"{YELLOW}{'=' * 120}{RESET}", 120)
         print(line)
-        title = f"{GREEN}INFINITY GRID BOT v7.1 – PORTFOLIO MODE{RESET} | {now_cst()} CST | WS: {'ON' if ws_connected else 'OFF'}"
+        title = f"{GREEN}INFINITY GRID BOT v7.2 – STRATEGY MODE{RESET} | {now_cst()} CST | WS: {'ON' if ws_connected else 'OFF'}"
         print(pad_field(title, 120))
         print(line)
 
@@ -1029,6 +1047,20 @@ def print_dashboard(bot):
         print(pad_field(f"UNREALIZED: {u_color}${float(unrealized):+.2f}{RESET} REALIZED: {r_color}${float(total_realized_pnl):+.2f}{RESET}", 120))
         print(pad_field(f"SHARPE (1h): {sharpe_str} GRIDS: {len(active_grid_symbols)} DRAWDOWN: {dd_color}{float(drawdown):+.2f}%{RESET}", 120))
         print(pad_field(f"PORTFOLIO SYMBOLS: {len(valid_symbols_dict)}", 120))
+
+        # === ACTIVE GRIDS WITH STRATEGY NAMES ===
+        if active_grid_symbols:
+            print(f"\n{YELLOW}ACTIVE GRIDS (STRATEGY){RESET}")
+            print(pad_field(f"{'SYMBOL':<12} {'PRICE':>10} {'B/S':>6} {'SIZE':>8} {'STRATEGY':<12}", 120))
+            print(pad_field("-" * 60, 120))
+            for sym, g in active_grid_symbols.items():
+                price = live_prices.get(sym, ZERO)
+                strat = g.get('strategy', 'unknown')
+                label = STRATEGY_LABELS.get(strat, strat.upper())
+                color = STRATEGY_COLORS.get(strat, GREEN)
+                buy_count = len(g['buy_orders'])
+                sell_count = len(g['sell_orders'])
+                print(pad_field(f"{sym:<12} {float(price):>10.4f} {buy_count}/{sell_count:>3} ${float(g['size']):>7.2f} {color}{label}{RESET}", 120))
         print(f"\n{line}")
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
@@ -1092,7 +1124,7 @@ def main():
         logger.critical("Initial sync failed.")
         sys.exit(1)
 
-    send_alert("Bot v7.1 started – BUNDLED ALERTS + CASH GUARD ACTIVE!", subject="ONLINE")
+    send_alert("Bot v7.2 started – STRATEGY MODE + DASHBOARD ACTIVE!", subject="ONLINE")
 
     logger.info("Waiting for prices...")
     timeout = time.time() + 30
@@ -1117,7 +1149,7 @@ def main():
                     if sess:
                         for pos in sess.query(Position).all():
                             bot.client.order_market_sell(symbol=pos.symbol, quantity=str(pos.quantity))
-                    sys.exit(0)
+                sys.exit(0)
 
             if now - last_regrid >= REGRID_INTERVAL:
                 with SafeDBManager() as sess:
