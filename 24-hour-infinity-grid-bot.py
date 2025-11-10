@@ -285,7 +285,6 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
             time.sleep(delay)
             self.reconnect_delay = min(self.max_delay, self.reconnect_delay * 2)
 
-صیل
 
 # === WEBSOCKET CALLBACKS ====================================================
 def on_market_message(ws, message):
