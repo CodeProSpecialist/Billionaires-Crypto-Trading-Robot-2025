@@ -16,7 +16,6 @@ import threading
 import websocket
 import signal
 import re
-from decimal import Decimal, ROUND_DOWN
 from decimal import Decimal, ROUND_DOWN, getcontext 
 getcontext().prec = 28
 from datetime import datetime
