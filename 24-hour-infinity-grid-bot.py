@@ -6,7 +6,7 @@
     • Dashboard shows CURRENT STRATEGY per symbol
     • Bundled WhatsApp ≤5 min
     • $8 cash guard | $5 min sell
-    • 2,112 LINES OF PRODUCTION CODE
+    • 1,180 LINES OF PRODUCTION CODE
 """
 import os
 import sys
