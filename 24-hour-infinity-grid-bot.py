@@ -475,7 +475,7 @@ def update_volume_profiles():
                 bin_start = (l // bin_size) * bin_size
                 while bin_start < h:
                     bin_key = bin_start.quantize(Decimal('1e-8'))
-                    bins[bin_key] = bins.get(bin bins.get(bin_key, ZERO) + v
+                    bins[bin_key] = bins.get(bin_key, ZERO) + v
                     total_volume += v
                     bin_start += bin_size
             if total_volume <= ZERO:
