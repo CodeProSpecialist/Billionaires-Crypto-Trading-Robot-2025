@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-    ULTIMATE INFINITY GRID BOT v3.0 – SELF-OPTIMIZING AI
+    ULTIMATE INFINITY GRID BOT v3.0 – SELF-OPTIMIZING PME 
     • Profit Monitoring Engine (PME) – Live Strategy Switching
     • Trend, Mean-Reversion, Volume-Anchored Strategies
     • Real-Time Sharpe Scoring | Adaptive Grids | Zero Lag
