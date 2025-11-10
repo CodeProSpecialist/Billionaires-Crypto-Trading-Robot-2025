@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID BOT – LIVE DASHBOARD + HEARTBEAT (Nov 10, 2025)
-    • $8 reserve | $5 min sell
-    • WebSocket heartbeat
-    • Full stats dashboard
-    • 100% Binance.US
+    INFINITY GRID BOT – DYNAMIC COLOR-AWARE DASHBOARD (Nov 10, 2025)
+    • +4 visible spaces between columns
+    • ANSI color codes ignored in width calc
+    • Perfect alignment always
 """
 import os
 import sys
@@ -15,6 +14,7 @@ import json
 import threading
 import websocket
 import signal
+import re  # <--- NEW: for ANSI stripping
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
@@ -45,9 +45,7 @@ MAX_GRIDS_PER_SIDE = 16
 MIN_GRIDS_PER_SIDE = 4
 REGRID_INTERVAL = 45
 DASHBOARD_REFRESH = 60
-
-# Fees
-DEFAULT_MAKER_FEE = Decimal('0.0010')
+PRICE_POLL_INTERVAL = 10
 
 # WebSocket
 WS_BASE = "wss://stream.binance.us:9443/stream?streams="
@@ -104,6 +102,7 @@ realized_lock = threading.Lock()
 ws_connected = False
 db_connected = True
 api_connected = True
+rest_client = None
 
 # === SIGNAL HANDLING ========================================================
 def signal_handler(signum, frame):
@@ -112,6 +111,12 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+# === DYNAMIC PADDING (COLOR-AWARE) ==========================================
+def pad_field(text: str, width: int) -> str:
+    """Pad string to visible width, ignoring ANSI color codes"""
+    visible = len(re.sub(r'\033\[[0-9;]*m', '', str(text)))
+    return text + ' ' * max(0, width - visible)
 
 # === HELPERS ================================================================
 def safe_decimal(value, default=ZERO) -> Decimal:
@@ -209,8 +214,16 @@ class SafeDBManager:
 
 # === HEARTBEAT WEBSOCKET ====================================================
 class HeartbeatWebSocket(websocket.WebSocketApp):
-    def __init__(self, url, **kwargs):
-        super().__init__(url, **kwargs)
+    def __init__(self, url, on_message_cb, is_user_stream=False):
+        super().__init__(
+            url,
+            on_open=self.on_open,
+            on_message=on_message_cb,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_pong=self.on_pong
+        )
+        self.is_user_stream = is_user_stream
         self.last_pong = time.time()
         self.heartbeat_thread = None
         self.reconnect_delay = 1
@@ -219,11 +232,19 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
     def on_open(self, ws):
         global ws_connected
         ws_connected = True
-        logger.info(f"WS Connected: {ws.url.split('?')[0]}")
+        logger.info(f"WEBSOCKET CONNECTED: {ws.url.split('?')[0]}")
         self.last_pong = time.time()
         if not self.heartbeat_thread:
             self.heartbeat_thread = threading.Thread(target=self._send_heartbeat, daemon=True)
             self.heartbeat_thread.start()
+
+    def on_error(self, ws, error):
+        logger.warning(f"WS ERROR: {error}")
+
+    def on_close(self, ws, *args):
+        global ws_connected
+        ws_connected = False
+        logger.warning(f"WS CLOSED: {ws.url.split('?')[0]}")
 
     def on_pong(self, ws, *args):
         self.last_pong = time.time()
@@ -238,13 +259,12 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
             except: break
             time.sleep(HEARTBEAT_INTERVAL)
 
-    def run_forever(self, **kwargs):
+    def run_forever(self):
         while not SHUTDOWN_EVENT.is_set():
             try:
-                super().run_forever(ping_interval=None, ping_timeout=None, **kwargs)
-            except: pass
-            global ws_connected
-            ws_connected = False
+                super().run_forever(ping_interval=None, ping_timeout=None)
+            except Exception as e:
+                logger.error(f"WS CRASH: {e}")
             if SHUTDOWN_EVENT.is_set(): break
             delay = min(self.max_delay, self.reconnect_delay)
             logger.info(f"Reconnecting in {delay}s...")
@@ -307,38 +327,60 @@ def on_user_message(ws, message):
 
 # === WEBSOCKET START ========================================================
 def start_market_websocket():
-    global ws_instances
+    global ws_instances, rest_client
     symbols = [s.lower() for s in valid_symbols_dict if 'USDT' in s]
-    if not symbols: return
+    if not symbols:
+        logger.warning("No USDT symbols found")
+        return
     streams = [f"{s}@ticker" for s in symbols]
     chunks = [streams[i:i + MAX_STREAMS_PER_CONNECTION] for i in range(0, len(streams), MAX_STREAMS_PER_CONNECTION)]
     for chunk in chunks:
         url = WS_BASE + '/'.join(chunk)
-        ws = HeartbeatWebSocket(url, on_message=on_market_message, on_open=lambda ws: ws.on_open(ws))
+        ws = HeartbeatWebSocket(url, on_message_cb=on_market_message)
         ws_instances.append(ws)
         threading.Thread(target=ws.run_forever, daemon=True).start()
         time.sleep(0.5)
 
+    rest_client = Client(API_KEY, API_SECRET, tld='us')
+
 def start_user_stream():
-    global user_ws, listen_key
+    global user_ws, listen_key, rest_client
     try:
-        client = Client(API_KEY, API_SECRET, tld='us')
-        listen_key = client.stream_get_listen_key()
+        listen_key = rest_client.stream_get_listen_key()
         url = f"{USER_STREAM_BASE}{listen_key}"
-        user_ws = HeartbeatWebSocket(url, on_message=on_user_message, on_open=lambda ws: ws.on_open(ws))
+        user_ws = HeartbeatWebSocket(url, on_message_cb=on_user_message, is_user_stream=True)
         threading.Thread(target=user_ws.run_forever, daemon=True).start()
         logger.info("User stream started")
     except Exception as e:
         logger.error(f"User stream failed: {e}")
 
 def keepalive_user_stream():
+    global rest_client
     while not SHUTDOWN_EVENT.is_set():
         time.sleep(KEEPALIVE_INTERVAL)
         try:
             with listen_key_lock:
-                if listen_key:
-                    Client(API_KEY, API_SECRET, tld='us').stream_keepalive(listen_key)
+                if listen_key and rest_client:
+                    rest_client.stream_keepalive(listen_key)
         except: pass
+
+# === FALLBACK PRICE POLLING =================================================
+def poll_prices_fallback():
+    global rest_client
+    while not SHUTDOWN_EVENT.is_set():
+        if ws_connected:
+            time.sleep(PRICE_POLL_INTERVAL)
+            continue
+        try:
+            tickers = rest_client.get_all_tickers()
+            for t in tickers:
+                sym = t['symbol']
+                if sym in valid_symbols_dict:
+                    price = safe_decimal(t['price'])
+                    if price > ZERO:
+                        with price_lock: live_prices[sym] = price
+            time.sleep(PRICE_POLL_INTERVAL)
+        except: time.sleep(5)
 
 # === BOT CLASS ==============================================================
 class BinanceTradingBot:
@@ -368,7 +410,9 @@ class BinanceTradingBot:
                         except: continue
                     if price <= ZERO: continue
                     sess.add(Position(symbol=sym, quantity=qty, avg_entry_price=price))
-        except: api_connected = False
+        except Exception as e:
+            api_connected = False
+            logger.error(f"Sync failed: {e}")
 
     @retry_custom()
     def get_tick_size(self, symbol):
@@ -479,7 +523,7 @@ def regrid_symbol(bot, symbol):
     except Exception as e:
         logger.error(f"Regrid {symbol}: {e}")
 
-# === LIVE DASHBOARD =========================================================
+# === DYNAMIC DASHBOARD WITH COLOR-AWARE SPACING =============================
 def print_dashboard(bot):
     try:
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -487,62 +531,107 @@ def print_dashboard(bot):
         reserved = MIN_USDT_RESERVE
         available = usdt - reserved if usdt > reserved else ZERO
 
-        print(f"{YELLOW}{'='*100}{RESET}")
-        print(f"{GREEN}INFINITY GRID BOT – LIVE DASHBOARD{RESET} | {now_cst()} CST")
-        print(f"{YELLOW}{'='*100}{RESET}")
+        # Header
+        line = pad_field(f"{YELLOW}{'=' * 120}{RESET}", 120)
+        print(line)
+        title = f"{GREEN}INFINITY GRID BOT – LIVE{RESET} | {now_cst()} CST | WS: "
+        title += f"{GREEN}ON{RESET}" if ws_connected else f"{RED}OFF{RESET}"
+        print(pad_field(title, 120))
+        print(line)
 
         # Health
-        status = f"{GREEN}OK{RESET}" if ws_connected else f"{RED}DOWN{RESET}"
-        db_status = f"{GREEN}OK{RESET}" if db_connected else f"{RED}ERR{RESET}"
-        api_status = f"{GREEN}OK{RESET}" if api_connected else f"{RED}ERR{RESET}"
-        print(f"WebSocket: {status} | DB: {db_status} | API: {api_status}")
+        ws_stat = f"{GREEN}OK{RESET}" if ws_connected else f"{RED}DOWN{RESET}"
+        db_stat = f"{GREEN}OK{RESET}" if db_connected else f"{RED}ERR{RESET}"
+        api_stat = f"{GREEN}OK{RESET}" if api_connected else f"{RED}ERR{RESET}"
+        health = f"WebSocket: {ws_stat}    DB: {db_stat}    API: {api_stat}"
+        print(pad_field(health, 120))
 
         # Balance
-        print(f"\nUSDT BALANCE: ${float(usdt):,.2f} | Reserved: ${float(reserved):.2f} | Available: ${float(available):,.2f}")
+        bal = f"USDT: ${float(usdt):,.2f}    Reserved: ${float(reserved):.2f}    Free: ${float(available):,.2f}"
+        print(f"\n{pad_field(bal, 120)}")
 
         # PnL
-        unrealized = sum(p['unrealized'] for p in position_pnl.values())
-        color = GREEN if unrealized >= 0 else RED
-        print(f"TOTAL UNREALIZED: {color}${float(unrealized):+.2f}{RESET}")
-        color = GREEN if total_realized_pnl >= 0 else RED
-        print(f"TOTAL REALIZED: {color}${float(total_realized_pnl):+.2f}{RESET}")
+        unrealized = sum(p.get('unrealized', 0) for p in position_pnl.values())
+        u_color = GREEN if unrealized >= 0 else RED
+        r_color = GREEN if total_realized_pnl >= 0 else RED
+        pnl_line = f"UNREALIZED: {u_color}${float(unrealized):+.2f}{RESET}    REALIZED: {r_color}${float(total_realized_pnl):+.2f}{RESET}"
+        print(pad_field(pnl_line, 120))
 
         # Positions
         with SafeDBManager() as sess:
             if sess:
                 pos_count = sess.query(Position).count()
-                print(f"\nPOSITIONS: {pos_count} | GRIDS ACTIVE: {len(active_grid_symbols)}")
+                pos_line = f"POSITIONS: {pos_count}    GRIDS: {len(active_grid_symbols)}"
+                print(f"\n{pad_field(pos_line, 120)}")
 
-                print(f"\n{'SYMBOL':<10} {'QTY':>10} {'ENTRY':>10} {'NOW':>10} {'PNL $':>10} {'%':>8} {'REALIZED':>10}")
-                print("-" * 80)
+                # Column headers
+                headers = [
+                    ("SYMBOL", 10),
+                    ("QTY", 14),
+                    ("ENTRY", 14),
+                    ("NOW", 14),
+                    ("PNL", 14),
+                    ("REALIZED", 14)
+                ]
+                header_line = ""
+                for label, width in headers:
+                    header_line += pad_field(label, width)
+                print(f"\n{header_line}")
+                print("-" * 120)
+
                 for pos in sess.query(Position).all():
                     sym = pos.symbol
                     qty = safe_decimal(pos.quantity)
                     entry = safe_decimal(pos.avg_entry_price)
                     current = live_prices.get(sym, ZERO)
                     unreal = (current - entry) * qty if current > ZERO else ZERO
-                    pct = ((current - entry) / entry * HUNDRED) if entry > ZERO and current > ZERO else ZERO
-                    color = GREEN if unreal >= 0 else RED
                     realized = realized_pnl_per_symbol.get(sym, ZERO)
-                    print(f"{sym:<10} {float(qty):>10.4f} ${float(entry):>9.6f} ${float(current):>9.6f} "
-                          f"{color}${float(unreal):+9.2f}{RESET} {color}{float(pct):+7.2f}%{RESET} ${float(realized):+9.2f}")
+                    color = GREEN if unreal >= 0 else RED
 
-        # Grids
+                    row = [
+                        (sym, 10),
+                        (f"{float(qty):.4f}", 14),
+                        (f"${float(entry):.6f}", 14),
+                        (f"${float(current):.6f}", 14),
+                        (f"{color}${float(unreal):+.2f}{RESET}", 14),
+                        (f"${float(realized):+.2f}", 14)
+                    ]
+                    row_line = ""
+                    for val, width in row:
+                        row_line += pad_field(val, width)
+                    print(row_line)
+
+        # Grid Status
         if active_grid_symbols:
-            print(f"\nGRID STATUS")
-            print(f"{'SYMBOL':<10} {'CENTER':>12} {'BUY':>6} {'SELL':>6}")
-            print("-" * 40)
+            print(f"\n{pad_field('GRID STATUS', 120)}")
+            g_headers = [("SYMBOL", 10), ("CENTER", 16), ("BUY", 10), ("SELL", 10)]
+            g_header_line = ""
+            for label, width in g_headers:
+                g_header_line += pad_field(label, width)
+            print(g_header_line)
+            print("-" * 60)
             for sym, g in active_grid_symbols.items():
-                print(f"{sym:<10} ${float(g['center']):>11.6f} {len(g['buy_orders']):>6} {len(g['sell_orders']):>6}")
+                g_row = [
+                    (sym, 10),
+                    (f"${float(g['center']):.6f}", 16),
+                    (str(len(g['buy_orders'])), 10),
+                    (str(len(g['sell_orders'])), 10)
+                ]
+                g_row_line = ""
+                for val, width in g_row:
+                    g_row_line += pad_field(val, width)
+                print(g_row_line)
 
-        print(f"\n{YELLOW}{'='*100}{RESET}")
+        print(f"\n{line}")
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
 
 # === MAIN ===================================================================
 def main():
+    global rest_client
     bot = BinanceTradingBot()
-    global valid_symbols_dict
+    rest_client = bot.client
+
     try:
         info = bot.client.get_exchange_info()
         for s in info['symbols']:
@@ -553,6 +642,8 @@ def main():
     start_market_websocket()
     start_user_stream()
     threading.Thread(target=keepalive_user_stream, daemon=True).start()
+    threading.Thread(target=poll_prices_fallback, daemon=True).start()
+
     time.sleep(15)
 
     last_regrid = 0
