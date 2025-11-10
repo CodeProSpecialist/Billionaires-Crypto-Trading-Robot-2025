@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID BOT v7.1 – CORE 2,045-LINE PRODUCTION BOT
+    INFINITY GRID BOT v7.1 – CORE PRODUCTION BOT
     • Auto-grids ANY /USDT coin in portfolio
     • Bundled WhatsApp: 1 message ≤ every 5 min
     • $8 USDT cash guard before buy
