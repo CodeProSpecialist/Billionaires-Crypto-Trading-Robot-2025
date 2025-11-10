@@ -945,7 +945,7 @@ def print_dashboard(bot):
 
         line = pad_field(f"{YELLOW}{'=' * 120}{RESET}", 120)
         print(line)
-        title = f"{GREEN}INFINITY GRID BOT - PROFIT MONITORING ENGINE{RESET} | {now_cst()} CST | WS: "
+        title = f"{GREEN}INFINITY GRID BOT v3.0 – SELF-OPTIMIZING AI{RESET} | {now_cst()} CST | WS: "
         title += f"{GREEN}ON{RESET}" if ws_connected else f"{RED}OFF{RESET}"
         print(pad_field(title, 120))
         print(line)
@@ -970,22 +970,21 @@ def print_dashboard(bot):
         u_color = GREEN if unrealized >= 0 else RED
         r_color = GREEN if total_realized_pnl >= 0 else RED
 
-        # === FIXED: Use global pnl_history safely ===
-        global pnl_history
+        # === FIXED: Use global + safe Decimal math ===
         with realized_lock:
             current_time = time.time()
-            pnl_history.append((current_time, total_realized_pnl))
+            pnl_history Trunk.append((current_time, total_realized_pnl))
             cutoff = current_time - SHARPE_WINDOW * 60
-            pnl_history = [x for x in pnl_history if x[0] > cutoff]
+            pnl_history[:] = [x for x in pnl_history if x[0] > cutoff]
 
         if len(pnl_history) > 1:
             returns = [pnl_history[i][1] - pnl_history[i-1][1] for i in range(1, len(pnl_history))]
-            mean_ret = sum(returns) / len(returns) if returns else 0
-            variance = sum(r**2 for r in returns) / len(returns) - mean_ret**2 if returns else 1
-            std_ret = variance ** 0.5
-            sharpe = (mean_ret / std_ret) * (60**0.5) if std_ret > 0 else 0
-            sharpe_str = f"{GREEN}{sharpe:+.2f}{RESET}" if sharpe > 1.5 else \
-                        f"{YELLOW}{sharpe:+.2f}{RESET}" if sharpe > 0 else \
+            mean_ret = sum(returns) / len(returns) if returns else ZERO
+            variance = sum(r**2 for r in returns) / len(returns) - mean_ret**2 if returns else ZERO
+            std_ret = variance.sqrt() if variance > ZERO else ZERO
+            sharpe = (mean_ret / std_ret) * Decimal('7.746') if std_ret > ZERO else ZERO  # sqrt(60)
+            sharpe_str = f"{GREEN}{sharpe:+.2f}{RESET}" if sharpe > Decimal('1.5') else \
+                        f"{YELLOW}{sharpe:+.2f}{RESET}" if sharpe > ZERO else \
                         f"{RED}{sharpe:+.2f}{RESET}"
         else:
             sharpe_str = "N/A"
