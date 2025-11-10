@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-    ULTIMATE INFINITY GRID BOT v3.0 – SELF-OPTIMIZING AI
+    ULTIMATE INFINITY GRID BOT v3.0 – SELF-OPTIMIZING Profit Engine 
     • Profit Monitoring Engine (PME) – Live Strategy Switching
     • Trend, Mean-Reversion, Volume-Anchored Strategies
     • Real-Time Sharpe Scoring | Adaptive Grids | Zero Lag
@@ -943,7 +943,7 @@ def print_dashboard(bot):
 
         line = pad_field(f"{YELLOW}{'=' * 120}{RESET}", 120)
         print(line)
-        title = f"{GREEN}INFINITY GRID BOT v3.0 – SELF-OPTIMIZING AI{RESET} | {now_cst()} CST | WS: "
+        title = f"{GREEN}INFINITY GRID BOT - PROFIT MONITORING ENGINE{RESET} | {now_cst()} CST | WS: "
         title += f"{GREEN}ON{RESET}" if ws_connected else f"{RED}OFF{RESET}"
         print(pad_field(title, 120))
         print(line)
