@@ -1,5 +1,6 @@
 # 🚀 24 HOUR INFINITY GRID BOT 
       for Binance.US Edition 🚀
+
 **Skyrocketing Wealth Creation with Precision Automation**  
 
 *****
