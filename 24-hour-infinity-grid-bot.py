@@ -140,6 +140,57 @@ def safe_decimal(value, default=ZERO) -> Decimal:
     except: 
         return default
 
+# ------------------ DATABASE ------------------
+DB_URL = "sqlite:///binance_trades.db"
+engine = create_engine(DB_URL, echo=False, future=True, pool_pre_ping=True)
+SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
+Base = declarative_base()
+
+class Position(Base):
+    __tablename__ = "positions"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), unique=True, nullable=False, index=True)
+    quantity = Column(Numeric(20,8), nullable=False)
+    avg_entry_price = Column(Numeric(20,8), nullable=False)
+
+class PendingOrder(Base):
+    __tablename__ = "pending_orders"
+    id = Column(Integer, primary_key=True)
+    binance_order_id = Column(String(64), unique=True, nullable=False, index=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(4), nullable=False)
+    price = Column(Numeric(20,8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
+
+class TradeRecord(Base):
+    __tablename__ = "trades"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(4), nullable=False)
+    price = Column(Numeric(20,8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
+    fee = Column(Numeric(20,8), nullable=False, default=0)
+    timestamp = Column(DateTime, default=func.now())
+
+if not os.path.exists("binance_trades.db"):
+    Base.metadata.create_all(engine)
+
+class SafeDBManager:
+    def __enter__(self):
+        try:
+            self.session = SessionFactory()
+            return self.session
+        except Exception:
+            return None
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not hasattr(self,'session'): return
+        if exc_type: self.session.rollback()
+        else:
+            try: 
+                self.session.commit()
+            except IntegrityError: 
+                self.session.rollback()
+        self.session.close()
 
 
 
