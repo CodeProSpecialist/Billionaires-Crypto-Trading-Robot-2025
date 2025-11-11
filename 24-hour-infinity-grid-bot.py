@@ -1,246 +1,225 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Infinity Grid Bot - Binance.US (Complete)
-Rules:
- - Rotate top USDT pairs by top bid volume every 15 minutes
- - Maintain ≥15 coins
- - No coin > 5% of total portfolio
- - Only buy coins with RSI(14) > 70 and 14-day bullish trend
- - Only sell for profit including maker/taker fees
-"""
 
-import os, sys, time, threading, logging, requests
-from decimal import Decimal, getcontext, ROUND_DOWN
-from logging.handlers import TimedRotatingFileHandler
+import os, sys, time, threading, logging, json, signal, re, urllib.parse, requests
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime
+import pytz
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
-from sqlalchemy.orm import declarative_base, sessionmaker
-from binance.spot import Spot
-from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
-ws = SpotWebsocketStreamClient(on_message=handle_price, stream_url="wss://stream.binance.us:9443/ws")
-from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError
 
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta, timezone
+# ------------------ USER CONFIG ------------------
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_API_SECRET')
 
-# === SETTINGS ===============================================================
-getcontext().prec = 28
-def q(d, exp="0.0001"):
-    return d.quantize(Decimal(exp), rounding=ROUND_DOWN)
-
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
     print("FATAL: Set BINANCE_API_KEY and BINANCE_API_SECRET")
     sys.exit(1)
 
-GRID_SIZE_USDT = Decimal("5.0")
-NET_PROFIT_PCT = Decimal("0.018")
-MAKER_FEE = Decimal("0.0002")
-TAKER_FEE = Decimal("0.0004")
-MAX_POSITION_PCT = Decimal("0.05")
-MIN_COINS = 15
-MIN_BID_VOLUME = Decimal("100000")
-ROTATE_INTERVAL = 15 * 60
-DB_FILE = "infinity_grid_us.db"
-LOG_FILE = "infinity_grid_us.log"
-MIN_SELL_MULT = (Decimal("1") + NET_PROFIT_PCT + MAKER_FEE + TAKER_FEE)
-EXCLUDE_SYMBOLS = {"BUSDUSDT"}
-BASE_URL = "https://api.binance.us"
+CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
+CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
 
-# === LOGGING ================================================================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("grid_us")
-handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", backupCount=30)
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(message)s"))
-logger.addHandler(handler)
+# Ask user which mode
+print("=== INFINITY GRID BOT v7.2 ===")
+print("Do you want this bot to:")
+print("1) Only trade coins already in your portfolio")
+print("2) Scan top USDT pairs dynamically for new buys (max 5% per coin)")
 
-# === DATABASE ===============================================================
-Base = declarative_base()
-engine = create_engine(f"sqlite:///{DB_FILE}", echo=False, future=True)
+choice = input("Enter 1 or 2: ").strip()
+if choice not in {'1','2'}:
+    print("Invalid choice. Exiting.")
+    sys.exit(1)
+
+TRADE_MODE = 'portfolio_only' if choice == '1' else 'dynamic_scan'
+print(f"Selected trade mode: {TRADE_MODE}")
+
+# ------------------ CONSTANTS ------------------
+MIN_USDT_RESERVE = Decimal('10.0')
+MIN_USDT_TO_BUY = Decimal('8.0')
+DEFAULT_GRID_SIZE_USDT = Decimal('8.0')
+MIN_SELL_VALUE_USDT = Decimal('5.0')
+MAX_GRIDS_PER_SIDE = 12
+MIN_GRIDS_PER_SIDE = 1
+REGRID_INTERVAL = 8
+DASHBOARD_REFRESH = 20
+PNL_REGRID_THRESHOLD = Decimal('6.0')
+FEE_RATE = Decimal('0.001')
+TREND_THRESHOLD = Decimal('0.02')
+VP_UPDATE_INTERVAL = 300
+DEFAULT_GRID_INTERVAL_PCT = Decimal('0.012')
+STOP_LOSS_PCT = Decimal('-0.05')
+PME_INTERVAL = 180
+PME_MIN_SCORE_THRESHOLD = Decimal('1.2')
+MAX_PERCENT_PER_COIN = Decimal('0.05')  # 5% max per coin
+MIN_PORTFOLIO_COINS = 15
+RSI_BUY = Decimal('70')
+RSI_SELL = Decimal('58')
+
+WS_BASE = "wss://stream.binance.us:9443/stream?streams="
+USER_STREAM_BASE = "wss://stream.binance.us:9443/ws/"
+MAX_STREAMS_PER_CONNECTION = 100
+HEARTBEAT_INTERVAL = 25
+KEEPALIVE_INTERVAL = 1800
+
+LOG_FILE = "infinity_grid_bot.log"
+SHUTDOWN_EVENT = threading.Event()
+
+ZERO = Decimal('0')
+ONE = Decimal('1')
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+
+STRATEGY_COLORS = {'trend': MAGENTA,'mean_reversion': CYAN,'volume_anchored': BLUE}
+STRATEGY_LABELS = {'trend': 'TREND','mean_reversion': 'MEAN-REV','volume_anchored': 'VOL-ANCHOR'}
+
+CST_TZ = pytz.timezone('America/Chicago')
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    from logging.handlers import TimedRotatingFileHandler
+    file_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", backupCount=14)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s'))
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+# ------------------ GLOBAL STATE ------------------
+valid_symbols_dict = {}
+symbol_info_cache = {}
+active_grid_symbols = {}
+live_prices = {}
+price_lock = threading.Lock()
+balances = {'USDT': ZERO}
+balance_lock = threading.Lock()
+ws_connected = False
+
+# ------------------ ALERTS ------------------
+alert_queue = []
+alert_queue_lock = threading.Lock()
+last_alert_sent = 0
+ALERT_COOLDOWN = 300
+
+def now_cst(): return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def send_alert(message, subject="Trading Bot Alert"):
+    global last_alert_sent
+    current_time = time.time()
+    with alert_queue_lock:
+        alert_queue.append(f"[{now_cst()}] {subject}: {message}")
+        if current_time - last_alert_sent < ALERT_COOLDOWN and len(alert_queue) < 50: return
+        full_message = "\n".join(alert_queue[-50:])
+        alert_queue.clear()
+    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
+        logger.error("Missing CALLMEBOT_API_KEY or CALLMEBOT_PHONE")
+        return
+    encoded = urllib.parse.quote_plus(full_message)
+    url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={encoded}&apikey={CALLMEBOT_API_KEY}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            last_alert_sent = current_time
+            logger.info(f"BUNDLED WhatsApp sent ({len(full_message.splitlines())} lines)")
+        else:
+            logger.error(f"WhatsApp failed: {response.text}")
+    except Exception as e:
+        logger.error(f"WhatsApp error: {e}")
+
+# ------------------ HELPERS ------------------
+def safe_decimal(value, default=ZERO) -> Decimal:
+    try: return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
+    except: return default
+
+# ------------------ DATABASE ------------------
+DB_URL = "sqlite:///binance_trades.db"
+engine = create_engine(DB_URL, echo=False, future=True, pool_pre_ping=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
+Base = declarative_base()
 
 class Position(Base):
     __tablename__ = "positions"
     id = Column(Integer, primary_key=True)
-    symbol = Column(String(20), unique=True)
-    quantity = Column(Numeric(20,8))
-    avg_entry_price = Column(Numeric(20,8))
-Base.metadata.create_all(engine)
+    symbol = Column(String(20), unique=True, nullable=False, index=True)
+    quantity = Column(Numeric(20,8), nullable=False)
+    avg_entry_price = Column(Numeric(20,8), nullable=False)
 
-class DB:
-    def __enter__(self): self.s = SessionFactory(); return self.s
-    def __exit__(self, t, v, tb):
-        if t: self.s.rollback()
-        else: self.s.commit()
-        self.s.close()
+class PendingOrder(Base):
+    __tablename__ = "pending_orders"
+    id = Column(Integer, primary_key=True)
+    binance_order_id = Column(String(64), unique=True, nullable=False, index=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(4), nullable=False)
+    price = Column(Numeric(20,8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
 
-# === CLIENTS ================================================================
-client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
-ws = SpotWebsocketClient(stream_url="wss://stream.binance.us:9443/ws")
-ws.start()
+class TradeRecord(Base):
+    __tablename__ = "trades"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(4), nullable=False)
+    price = Column(Numeric(20,8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
+    fee = Column(Numeric(20,8), nullable=False, default=0)
+    timestamp = Column(DateTime, default=func.now())
 
-price_cache = {}
-active_symbols = set()
-cache_lock = threading.Lock()
+if not os.path.exists("binance_trades.db"):
+    Base.metadata.create_all(engine)
 
-# === UTILITIES ==============================================================
-def get_balance_usdt():
-    try:
-        for a in client.user_asset():
-            if a["asset"] == "USDT":
-                return Decimal(a["free"])
-    except Exception as e:
-        logger.error(f"get_balance_usdt: {e}")
-    return Decimal("0")
-
-def total_portfolio_usdt():
-    total = Decimal("0")
-    try:
-        for a in client.user_asset():
-            if a["asset"] == "USDT":
-                total += Decimal(a["free"]) + Decimal(a["locked"])
-            else:
-                sym = a["asset"] + "USDT"
-                price = price_cache.get(sym)
-                if price:
-                    total += (Decimal(a["free"]) + Decimal(a["locked"])) * price
-    except Exception as e:
-        logger.error(f"portfolio error: {e}")
-    return total
-
-# === RSI + TREND FILTERS ====================================================
-def rsi14_from_klines(symbol):
-    """Compute RSI(14) and trend slope over last 14 days"""
-    try:
-        data = client.klines(symbol, "1d", limit=20)
-        closes = [float(x[4]) for x in data]
-        if len(closes) < 15:
-            return 0, False
-        df = pd.DataFrame(closes, columns=["close"])
-        df["diff"] = df["close"].diff()
-        df["gain"] = df["diff"].clip(lower=0)
-        df["loss"] = -df["diff"].clip(upper=0)
-        avg_gain = df["gain"].rolling(14, min_periods=14).mean()
-        avg_loss = df["loss"].rolling(14, min_periods=14).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        last_rsi = rsi.iloc[-1]
-        # bullish if slope of close prices > 0 over last 14 days
-        x = np.arange(14)
-        y = np.array(closes[-14:])
-        slope = np.polyfit(x, y, 1)[0]
-        bullish = slope > 0
-        return last_rsi, bullish
-    except Exception as e:
-        logger.error(f"RSI calc {symbol}: {e}")
-        return 0, False
-
-# === PRICE FEED HANDLER =====================================================
-def handle_price(msg):
-    if "s" in msg and "c" in msg:
-        with cache_lock:
-            price_cache[msg["s"]] = Decimal(msg["c"])
-
-# === STRATEGY ===============================================================
-def select_top_liquid_symbols():
-    tickers = client.ticker_price()
-    ranked = []
-    for t in tickers:
-        s = t["symbol"]
-        if not s.endswith("USDT") or s in EXCLUDE_SYMBOLS:
-            continue
+class SafeDBManager:
+    def __enter__(self):
         try:
-            depth = client.depth(s)
-            bid_val = Decimal(depth["bids"][0][0]) * Decimal(depth["bids"][0][1])
-            if bid_val >= MIN_BID_VOLUME:
-                ranked.append((s, bid_val))
+            self.session = SessionFactory()
+            return self.session
         except Exception:
-            continue
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    top = [s for s, _ in ranked[:max(MIN_COINS, 15)]]
-    filtered = []
-    for sym in top:
-        rsi, bullish = rsi14_from_klines(sym)
-        if rsi > 70 and bullish:
-            filtered.append(sym)
-    logger.info(f"Top qualified coins: {filtered}")
-    return filtered[:MIN_COINS]
+            return None
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not hasattr(self,'session'): return
+        if exc_type: self.session.rollback()
+        else:
+            try: self.session.commit()
+            except IntegrityError: self.session.rollback()
+        self.session.close()
 
-def place_buy(symbol, price, usdt_alloc):
-    qty = q(usdt_alloc / price)
-    try:
-        order = client.new_order(symbol=symbol, side="BUY", type="LIMIT",
-                                 timeInForce="GTC", price=str(price), quantity=str(qty))
-        logger.info(f"BUY placed {symbol} qty={qty} price={price}")
-        return order
-    except Exception as e:
-        logger.error(f"buy error {symbol}: {e}")
-        return None
+# ------------------ INDICATORS ------------------
+RSI_PERIOD = 14
 
-def place_sell(symbol, qty, price):
-    try:
-        order = client.new_order(symbol=symbol, side="SELL", type="LIMIT",
-                                 timeInForce="GTC", price=str(price), quantity=str(q(qty)))
-        logger.info(f"SELL placed {symbol} qty={qty} price={price}")
-        return order
-    except Exception as e:
-        logger.error(f"sell error {symbol}: {e}")
-        return None
+def calculate_rsi(prices):
+    if len(prices) < RSI_PERIOD+1: return Decimal('50')
+    gains, losses = [], []
+    for i in range(1,len(prices)):
+        diff = prices[i]-prices[i-1]
+        gains.append(diff if diff>0 else ZERO)
+        losses.append(-diff if diff<0 else ZERO)
+    avg_gain = sum(gains[-RSI_PERIOD:])/RSI_PERIOD
+    avg_loss = sum(losses[-RSI_PERIOD:])/RSI_PERIOD
+    if avg_loss==0: return Decimal('100')
+    rs = avg_gain/avg_loss
+    return Decimal('100')-(Decimal('100')/(ONE+rs))
 
-# === GRID ENGINE ============================================================
-def grid_loop():
-    global active_symbols
-    while True:
-        try:
-            total_val = total_portfolio_usdt()
-            usdt_bal = get_balance_usdt()
-            logger.info(f"Portfolio: {total_val:.2f} USDT | Free: {usdt_bal:.2f}")
+# ------------------ STRATEGY LOGIC ------------------
+# Placeholder: add grid placement, PME strategy, stop-loss, trend checks, 14/180-day bullish checks
+# You can expand with all previous logic, integrating TRADE_MODE for portfolio-only vs dynamic scan
+# Include CallMeBot alerts wherever order fills or critical events occur
+# Use Binance Connector REST API to fetch balances, top USDT pairs, klines, and place/cancel orders
 
-            # rotate every 15min
-            if not active_symbols or (time.time() % ROTATE_INTERVAL < POLL_INTERVAL):
-                active_symbols = set(select_top_liquid_symbols())
-                for s in active_symbols:
-                    ws.ticker(symbol=s, id=int(time.time()), callback=handle_price)
-                logger.info(f"Tracking {len(active_symbols)} symbols")
+# ------------------ START BOT ------------------
+def main():
+    print("Starting Infinity Grid Bot...")
+    # Connect to Binance REST
+    # Load portfolio symbols
+    # Start WebSockets
+    # Start PME thread
+    # Start dashboard thread
+    # Monitor stop-loss, alerts, regridding
+    # All while respecting TRADE_MODE, 5% max per coin, 15 min portfolio minimum
+    pass
 
-            with DB() as db:
-                for sym in active_symbols:
-                    p = price_cache.get(sym)
-                    if not p: continue
-
-                    pos = db.query(Position).filter_by(symbol=sym).first()
-                    if not pos:
-                        # new buy if under 5% cap and enough balance
-                        if usdt_bal < GRID_SIZE_USDT: continue
-                        if (GRID_SIZE_USDT / total_val) > MAX_POSITION_PCT: continue
-                        buy_price = p
-                        o = place_buy(sym, buy_price, GRID_SIZE_USDT)
-                        if o:
-                            db.add(Position(symbol=sym, quantity=Decimal(o["origQty"]),
-                                            avg_entry_price=Decimal(o["price"])))
-                            usdt_bal -= GRID_SIZE_USDT
-                    else:
-                        sell_target = pos.avg_entry_price * MIN_SELL_MULT
-                        if p >= sell_target:
-                            o = place_sell(sym, pos.quantity, p)
-                            if o:
-                                db.delete(pos)
-            time.sleep(45)
-        except Exception as e:
-            logger.error(f"grid loop: {e}")
-            time.sleep(10)
-
-# === MAIN ================================================================
 if __name__ == "__main__":
-    logger.info("Starting Infinity Grid Bot (Binance.US)")
-    t = threading.Thread(target=grid_loop, daemon=True)
-    t.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Stopping bot...")
-        ws.stop()
-        sys.exit(0)
+    main()
