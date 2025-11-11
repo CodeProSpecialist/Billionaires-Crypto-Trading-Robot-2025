@@ -4,6 +4,9 @@
 import os, sys, time, threading, logging, json, signal, re, urllib.parse, requests
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
 import pytz
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
