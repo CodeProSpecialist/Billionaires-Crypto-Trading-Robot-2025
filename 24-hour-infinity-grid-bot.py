@@ -16,7 +16,8 @@ from logging.handlers import TimedRotatingFileHandler
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from binance.spot import Spot
-from binance.websocket.spot.websocket_client import SpotWebsocketClient
+from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
