@@ -100,3 +100,40 @@ balances = {'USDT': ZERO}
 balance_lock = threading.Lock()
 ws_connected = False
 
+# ------------------ ALERTS ------------------
+alert_queue = []
+alert_queue_lock = threading.Lock()
+last_alert_sent = 0
+ALERT_COOLDOWN = 300  # 5 minutes
+
+def now_cst(): 
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def send_alert(message, subject="Trading Bot Alert"):
+    global last_alert_sent
+    current_time = time.time()
+    with alert_queue_lock:
+        alert_queue.append(f"[{now_cst()}] {subject}: {message}")
+        if current_time - last_alert_sent < ALERT_COOLDOWN and len(alert_queue) < 50: 
+            return
+        full_message = "\n".join(alert_queue[-50:])
+        alert_queue.clear()
+    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
+        logger.error("Missing CALLMEBOT_API_KEY or CALLMEBOT_PHONE")
+        return
+    encoded = urllib.parse.quote_plus(full_message)
+    url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={encoded}&apikey={CALLMEBOT_API_KEY}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            last_alert_sent = current_time
+            logger.info(f"BUNDLED WhatsApp sent ({len(full_message.splitlines())} lines)")
+        else:
+            logger.error(f"WhatsApp failed: {response.text}")
+    except Exception as e:
+        logger.error(f"WhatsApp error: {e}")
+
+
+
+
+
