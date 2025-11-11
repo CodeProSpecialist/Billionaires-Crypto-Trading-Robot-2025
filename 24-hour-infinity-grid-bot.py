@@ -18,6 +18,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from binance.spot import Spot
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 ws = SpotWebsocketStreamClient(on_message=handle_price, stream_url="wss://stream.binance.us:9443/ws")
+from binance.websocket.spot.websocket_api import SpotWebsocketAPIClient
 
 import pandas as pd
 import numpy as np
