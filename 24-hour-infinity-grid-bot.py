@@ -438,6 +438,185 @@ def update_active_symbols(bot: BinanceTradingBot, portfolio_only=False, max_per_
     except Exception as e:
         logger.error(f"Error updating active symbols: {e}")
 
+# ------------------ MAIN LOOP & SCHEDULER ------------------
+
+def fetch_and_update_prices(bot: BinanceTradingBot):
+    """
+    Updates live prices for all active symbols.
+    """
+    try:
+        for symbol in list(valid_symbols_dict.keys()):
+            try:
+                ticker = bot.client.get_symbol_ticker(symbol=symbol)
+                price = safe_decimal(ticker['price'])
+                if price > 0:
+                    with price_lock:
+                        live_prices[symbol] = price
+            except Exception as e:
+                logger.debug(f"Price update failed for {symbol}: {e}")
+            time.sleep(0.05)  # small delay to avoid hitting rate limits
+    except Exception as e:
+        logger.error(f"Error fetching prices: {e}")
+
+
+def main_loop(bot: BinanceTradingBot, portfolio_only=False):
+    """
+    Main loop for running the Infinity Grid Bot.
+    """
+    last_grid_update = 0
+    last_dashboard_update = 0
+    grid_interval = 600  # 10 minutes
+    dashboard_interval = DASHBOARD_REFRESH  # seconds
+
+    # Start PME in a separate thread
+    threading.Thread(target=profit_monitoring_engine, daemon=True).start()
+
+    # Start user stream keepalive
+    threading.Thread(target=keepalive_user_stream, daemon=True).start()
+
+    logger.info("Bot main loop started...")
+
+    while not SHUTDOWN_EVENT.is_set():
+        current_time = time.time()
+
+        # Periodically fetch and update live prices
+        fetch_and_update_prices(bot)
+
+        # Update grids every 10 minutes
+        if current_time - last_grid_update > grid_interval:
+            last_grid_update = current_time
+            update_active_symbols(bot, portfolio_only=portfolio_only)
+        
+        # Refresh dashboard periodically
+        if current_time - last_dashboard_update > dashboard_interval:
+            last_dashboard_update = current_time
+            print_dashboard(bot)
+
+        # Check stop-loss
+        if check_stop_loss():
+            logger.critical("Stop-loss triggered. Exiting main loop.")
+            break
+
+        time.sleep(1)
+
+
+# ------------------ INITIAL STARTUP ------------------
+
+def startup_bot():
+    """
+    Initialize bot, ask portfolio mode, start streams, sync positions.
+    """
+    print("Do you want this bot to only trade coins already in your portfolio (P),")
+    print("or should it scan top USDT pairs dynamically for new buys (D) while respecting your 5% max per coin rule?")
+    choice = input("Enter P for portfolio only, D for dynamic scan [P/D]: ").strip().upper()
+    portfolio_only = choice == 'P'
+
+    global rest_client, bot
+    bot = BinanceTradingBot()
+    rest_client = bot.client
+
+    # Initial REST sync
+    initial_sync_from_rest(bot)
+
+    # Start user stream and market websockets
+    start_user_stream()
+    start_market_websocket()
+
+    # Start main loop
+    main_loop(bot, portfolio_only=portfolio_only)
+
+# ------------------ UTILITY FUNCTIONS ------------------
+
+def fetch_daily_and_monthly_trends(bot: BinanceTradingBot, symbol: str):
+    """
+    Fetches daily klines for 14-day trend check and monthly klines for 180-day trend check.
+    Returns a tuple: (14_day_bullish, 180_day_bullish)
+    """
+    try:
+        # 14-day daily trend
+        daily_klines = bot.client.get_klines(symbol=symbol, interval='1d', limit=15)
+        daily_closes = [safe_decimal(k[4]) for k in daily_klines]  # Close prices
+        bullish_14 = all(daily_closes[i] > daily_closes[i - 1] for i in range(1, len(daily_closes)))
+
+        # 180-day 1-month interval trend
+        monthly_klines = bot.client.get_klines(symbol=symbol, interval='1M', limit=7)
+        monthly_closes = [safe_decimal(k[4]) for k in monthly_klines]
+        bullish_180 = all(monthly_closes[i] > monthly_closes[i - 1] for i in range(1, len(monthly_closes)))
+
+        return bullish_14, bullish_180
+    except Exception as e:
+        logger.debug(f"Trend fetch failed for {symbol}: {e}")
+        return False, False
+
+
+def get_top_usdt_symbols(bot: BinanceTradingBot, top_n=50):
+    """
+    Returns a list of top USDT symbols by 24h volume.
+    """
+    try:
+        tickers = bot.client.get_ticker_24hr()
+        symbols = [
+            t['symbol'] for t in tickers
+            if t['symbol'].endswith('USDT') and t['symbol'] not in {'USDCUSDT', 'BUSDUSDT'}
+        ]
+        # Sort by quoteVolume descending
+        symbols_sorted = sorted(
+            symbols,
+            key=lambda s: safe_decimal(next(t['quoteVolume'] for t in tickers if t['symbol'] == s)),
+            reverse=True
+        )
+        return symbols_sorted[:top_n]
+    except Exception as e:
+        logger.error(f"Top symbols fetch failed: {e}")
+        return []
+
+
+def update_active_symbols(bot: BinanceTradingBot, portfolio_only=False):
+    """
+    Updates buy/sell grids for all active symbols or top USDT symbols.
+    Ensures no coin exceeds 5% of portfolio allocation.
+    """
+    try:
+        usdt_total = bot.get_balance()
+        portfolio_symbols = list(valid_symbols_dict.keys()) if portfolio_only else get_top_usdt_symbols(bot)
+
+        for symbol in portfolio_symbols:
+            price = live_prices.get(symbol, ZERO)
+            if price <= ZERO:
+                continue
+
+            # Calculate max allowable allocation per coin
+            max_allocation = usdt_total * Decimal('0.05')
+            base_asset = symbol.replace('USDT', '')
+            asset_balance = bot.get_asset_balance(base_asset)
+            current_value = asset_balance * price
+
+            if current_value >= max_allocation:
+                logger.debug(f"{symbol}: Skipping, exceeds 5% max allocation")
+                continue
+
+            # Fetch 14-day and 180-day bullish trends
+            bullish_14, bullish_180 = fetch_daily_and_monthly_trends(bot, symbol)
+
+            if not bullish_14:
+                logger.debug(f"{symbol}: Skipping, 14-day trend not bullish")
+                continue
+
+            # Only grid if bullish 14-day trend or if already holding (to respect portfolio coins)
+            regrid_symbol_with_strategy(bot, symbol, strategy='trend' if bullish_180 else 'volume_anchored')
+
+    except Exception as e:
+        logger.error(f"Update active symbols failed: {e}")
+
+
+def format_decimal(value: Decimal, precision=8) -> str:
+    """
+    Helper to format Decimal for printing or logging.
+    """
+    return f"{value:.{precision}f}"
+
+
+
 
 
 
