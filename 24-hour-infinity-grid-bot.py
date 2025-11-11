@@ -341,11 +341,11 @@ def start_streams():
     if symbols:
         streams = [f"{s}@ticker" for s in symbols]
         chunks = [streams[i:i+MAX_STREAMS_PER_CONNECTION] for i in range(0, len(streams), MAX_STREAMS_PER_CONNECTION)]
-               for chunk in chunks:
-            url = WS_BASE + '/'.join(chunk)
-            ws = HeartbeatWebSocket(url, on_market_message)
-            ws_instances.append(ws)
-            threading.Thread(target=ws.run_forever, daemon=True).start()
+            for chunk in chunks:
+                url = WS_BASE + '/'.join(chunk)
+                ws = HeartbeatWebSocket(url, on_market_message)
+                ws_instances.append(ws)
+                threading.Thread(target=ws.run_forever, daemon=True).start()
 
     # User
     try:
