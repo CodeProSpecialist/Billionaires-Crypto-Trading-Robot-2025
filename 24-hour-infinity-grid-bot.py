@@ -1,11 +1,12 @@
-#!/usr/first/env python3
+#!/usr/bin/env python3
 """
-    INFINITY GRID BOT – FULLY AUTOMATED
-    • First run: Scans order book ladder → buys top 3 high-pressure coins
-    • Then: Places infinity grid (sell above, buy below) on all owned coins
-    • Uses price range + volume filters
-    • Smart allocation, 24/7 price following
+    INFINITY GRID BOT – TRUE 24/7 PRICE FOLLOWING (FIXED: response.headers)
+    • Follows price UP and DOWN forever
+    • Regrids every 45s on 0.75% move
+    • Cancels stale orders, places new grid
+    • Smart allocation: volatility + PnL weighted
     • Full ladder: first run only
+    • Fixed: response.get('headers') → response.headers
 """
 import os
 import sys
@@ -37,26 +38,21 @@ if not API_KEY or not API_SECRET:
     print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET env vars")
     sys.exit(1)
 
-# Grid & Entry Config
+# Grid Config
 GRID_SIZE_USDT = Decimal('5.0')
-GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5%
+GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5% spacing
 MIN_BUFFER_USDT = Decimal('8.0')
 MAX_GRIDS_PER_SIDE = 8
 MIN_GRIDS_PER_SIDE = 2
 MIN_GRIDS_FALLBACK = 1
-REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75%
+REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75% move
 
-# Entry Filters
+# General
 MAX_PRICE = 1000.00
 MIN_PRICE = 0.15
 MIN_24H_VOLUME_USDT = 60000
-ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')  # Buy 0.1% below best ask
-ENTRY_MIN_USDT = Decimal('15.0')
-
-# General
 LOG_FILE = "infinity_grid_bot.log"
-POLL_INTERVAL = 45.0
-FIRST_RUN_DONE = False
+POLL_INTERVAL = 45.0  # 45 seconds
 
 # === CONSTANTS ==============================================================
 ZERO = Decimal('0')
@@ -81,7 +77,6 @@ order_book_cache: Dict[str, dict] = {}
 active_grid_symbols: Dict[str, dict] = {}
 first_dashboard_run = True
 last_ob_fetch: Dict[str, float] = {}
-first_run_executed = False
 
 # === MATH & HELPERS =========================================================
 def safe_float(value, default=0.0) -> float:
@@ -336,65 +331,6 @@ class BinanceTradingBot:
                 except:
                     pass
 
-# === FIRST RUN: BUY FROM ORDER BOOK LADDER ==================================
-def first_run_entry_from_ladder(bot):
-    global first_run_executed
-    if first_run_executed:
-        return
-    usdt_free = bot.get_balance()
-    if usdt_free < ENTRY_MIN_USDT:
-        logger.info("Insufficient USDT for entry. Skipping.")
-        first_run_executed = True
-        return
-
-    candidates = []
-    with DBManager() as sess:
-        owned = {p.symbol for p in sess.query(Position).all()}
-
-    for sym in valid_symbols_dict:
-        if sym in owned:
-            continue
-        ob = bot.get_order_book_analysis(sym, force_refresh=True)
-        price = float(ob['best_ask'])
-        if not (MIN_PRICE <= price <= MAX_PRICE):
-            continue
-        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
-            continue
-        bid_vol = sum(float(q) for _, q in ob['raw_bids'][:5])
-        ask_vol = sum(float(q) for _, q in ob['raw_asks'][:5])
-        imbalance = bid_vol / (ask_vol or 1)
-        if imbalance >= 1.5:
-            candidates.append((sym, imbalance, price))
-
-    if not candidates:
-        logger.info("No strong entry signals. Skipping first run buys.")
-        first_run_executed = True
-        return
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    to_buy = candidates[:3]
-    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(to_buy)
-
-    for sym, imb, price in to_buy:
-        if per_coin < ENTRY_MIN_USDT:
-            break
-        qty = (per_coin * (1 - ENTRY_BUY_PCT_BELOW_ASK)) / price
-        info = bot.client.get_symbol_info(sym)
-        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-        step = Decimal(lot['stepSize'])
-        qty = (to_decimal(qty) // step) * step
-        if qty <= 0: continue
-        buy_price = to_decimal(price * (1 - ENTRY_BUY_PCT_BELOW_ASK))
-        tick = bot.get_tick_size(sym)
-        buy_price = (buy_price // tick) * tick
-        if buy_notional_ok(buy_price, qty):
-            order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
-            if order:
-                logger.info(f"ENTRY BUY: {sym} | ${float(buy_price):.6f} | Qty: {float(qty):.6f}")
-                send_whatsapp_alert(f"ENTRY {sym} @ {buy_price:.6f}")
-
-    first_run_executed = True
-
 # === INFINITY GRID CORE =====================================================
 def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
     usdt_free = bot.get_balance() - MIN_BUFFER_USDT
@@ -465,7 +401,6 @@ def rebalance_infinity_grid(bot, symbol):
         }
         tick = bot.get_tick_size(symbol)
 
-        # Buy below
         for i in range(1, buy_levels + 1):
             price = (current_price * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
             if buy_notional_ok(price, qty_per_grid):
@@ -473,7 +408,6 @@ def rebalance_infinity_grid(bot, symbol):
                 if order:
                     new_grid['buy_orders'].append(str(order['orderId']))
 
-        # Sell above
         base_asset = symbol.replace('USDT', '')
         free = bot.get_asset_balance(base_asset)
         for i in range(1, sell_levels + 1):
@@ -486,7 +420,7 @@ def rebalance_infinity_grid(bot, symbol):
 
         if new_grid['buy_orders'] or new_grid['sell_orders']:
             active_grid_symbols[symbol] = new_grid
-            logger.info(f"GRID: {symbol} | Center: ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
+            logger.info(f"INFINITY REGRID: {symbol} | Center: ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
 
 # === HELPERS ================================================================
 def send_whatsapp_alert(msg: str):
@@ -510,27 +444,30 @@ def print_dashboard(bot):
     global first_dashboard_run
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 120)
-    print(f"{'INFINITY GRID BOT – AUTO ENTRY + 24/7 GRID':^120}")
+    print(f"{'INFINITY GRID BOT – 24/7 PRICE FOLLOWING':^120}")
     print("=" * 120)
     print(f"Time: {now_cst()} | USDT: ${float(bot.get_balance()):,.2f}")
     with DBManager() as sess:
         print(f"Positions: {sess.query(Position).count()} | Active Grids: {len(active_grid_symbols)}")
 
-    print("\nTOP 3 BUY PRESSURE (FOR ENTRY)")
-    candidates = []
+    print("\nTOP 3 VOLATILE + PnL POTENTIAL")
+    scores = []
     for sym in valid_symbols_dict:
         ob = bot.get_order_book_analysis(sym)
-        if float(ob['best_ask']) < MIN_PRICE or float(ob['best_ask']) > MAX_PRICE:
-            continue
-        bid_vol = sum(float(q) for _, q in ob['raw_bids'][:5])
-        ask_vol = sum(float(q) for _, q in ob['raw_asks'][:5])
-        imbalance = bid_vol / (ask_vol or 1)
-        if imbalance >= 1.3:
-            candidates.append((sym.replace('USDT',''), imbalance, float(ob['best_ask'])))
-    for coin, imb, price in sorted(candidates, key=lambda x: x[1], reverse=True)[:3]:
-        print(f" {coin:>8} | {imb:>4.1f}x | Ask: ${price:,.6f}")
+        cur = (ob['best_bid'] + ob['best_ask']) / 2
+        if cur <= 0: continue
+        with DBManager() as sess:
+            pos = sess.query(Position).filter_by(symbol=sym).first()
+        if not pos: continue
+        atr = bot.get_atr(sym)
+        vol_score = atr / float(cur)
+        pnl = (cur - Decimal(str(pos.avg_entry_price))) * Decimal(str(pos.quantity))
+        scores.append((sym, vol_score, float(pnl)))
+    for sym, vol, pnl in sorted(scores, key=lambda x: x[1] + max(x[2]/10,0), reverse=True)[:3]:
+        coin = sym.replace('USDT','')
+        print(f" {coin:>8} | Vol: {vol:.4f} | PnL: ${pnl:,.2f}")
         if first_dashboard_run:
-            ob = bot.get_order_book_analysis(f"{coin}USDT", force_refresh=True)
+            ob = bot.get_order_book_analysis(sym, force_refresh=True)
             print("  BIDS           | ASKS")
             for i in range(5):
                 bp = float(ob['raw_bids'][i][0]) if i < len(ob['raw_bids']) else 0
@@ -542,7 +479,7 @@ def print_dashboard(bot):
         print("\nFull ladder shown once.")
         first_dashboard_run = False
 
-    print("\nGRID STATUS")
+    print("\nGRID STATUS (Center Price | B/S Count)")
     with DBManager() as sess:
         for pos in sess.query(Position).all():
             sym = pos.symbol
@@ -572,11 +509,6 @@ def main():
             bot.check_and_process_filled_orders()
             now = time.time()
 
-            # First run: buy from ladder
-            with DBManager() as sess:
-                if sess.query(Position).count() == 0 and not first_run_executed:
-                    first_run_entry_from_ladder(bot)
-
             if now - last_update >= POLL_INTERVAL:
                 with DBManager() as sess:
                     for pos in sess.query(Position).all():
@@ -591,10 +523,10 @@ def main():
             time.sleep(1)
         except KeyboardInterrupt:
             cancel_all_grids(bot)
-            print("\nBot stopped.")
+            print("\nInfinity grid stopped.")
             break
         except Exception as e:
-            logger.critical(f"Error: {e}")
+            logger.critical(f"Critical error: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
