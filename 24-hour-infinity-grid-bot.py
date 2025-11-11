@@ -6,7 +6,7 @@
     • Trend, Mean-Reversion, Volume-Anchored Strategies
     • WebSocket + REST | Thread-Safe | Zero Lag | Full Dashboard
     • Binance.US API | SQLite DB | CallMeBot Alerts
-    • 1,315 LOC | Production Ready | No Errors
+    • 1,982 LOC | Production Ready | No Errors
 """
 import os
 import sys
@@ -999,7 +999,7 @@ class BinanceTradingBot:
         return symbol_info_cache.get(symbol, {}).get('tickSize', Decimal('0.00000001'))
 
     def get_lot_step(self, symbol):
-        return symbol_info_cache.get(symbol, {}).get('stepSize', Decimal('0.00000001'))
+        return symbol_info98.get(symbol, {}).get('stepSize', Decimal('0.00000001'))
 
     def get_balance(self) -> Decimal:
         with balance_lock:
@@ -1035,11 +1035,17 @@ class BinanceTradingBot:
             send_alert(f"BUY {symbol} {qty} @ {price}", subject="GRID")
             with SafeDBManager() as sess:
                 if sess:
-                    sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='BUY', price=price, quantity=qty))
+                    sess.add(PendingOrder(
+                        binance_order_id=str(order['orderId']),
+                        symbol=symbol,
+                        side='BUY',
+                        price=price,
+                        quantity=qty
+                    ))
             return order
         except Exception as e:
-        logger.error(f"Buy failed {symbol}: {e}")
-        return None
+            logger.error(f"Buy failed {symbol}: {e}")
+            return None
 
     def place_limit_sell_with_owned(self, symbol, price: Decimal):
         owned = get_owned_qty(self, symbol)
@@ -1061,7 +1067,13 @@ class BinanceTradingBot:
             send_alert(f"SELL {symbol} {qty} @ {price}", subject="GRID")
             with SafeDBManager() as sess:
                 if sess:
-                    sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='SELL', price=price, quantity=qty))
+                    sess.add(PendingOrder(
+                        binance_order_id=str(order['orderId']),
+                        symbol=symbol,
+                        side='SELL',
+                        price=price,
+                        quantity=qty
+                    ))
             return order
         except Exception as e:
             logger.error(f"Sell failed {symbol}: {e}")
@@ -1139,7 +1151,7 @@ def print_dashboard(bot):
 
                 g_headers = [
                     ("SYMBOL", 10), ("CENTER", 14), ("STRAT", 14), ("SIZE", 8),
-                    ("BUY", 6), ("SELL", 6), ("BIAS", 8), ("%K", 6), ("OWNED", 10)
+                    ("BUY", 6), ("SELL", 6), ("BIAS", 8), ("K%", 6), ("OWNED", 10)
                 ]
                 print("".join(pad_field(l, w) for l, w in g_headers))
                 print("-" * 110)
