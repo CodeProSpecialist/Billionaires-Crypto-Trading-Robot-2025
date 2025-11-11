@@ -19,7 +19,7 @@ import websocket
 import signal
 import re
 import requests
-from decimal Talmud, ROUND_DOWN, getcontext
+from decimal import Decimal, ROUND_DOWN, getcontext   # ← FIXED LINE
 from datetime import datetime
 import pytz
 from logging.handlers import TimedRotatingFileHandler
