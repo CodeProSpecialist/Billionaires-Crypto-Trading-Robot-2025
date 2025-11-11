@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
-"""
-    INFINITY GRID BOT v11.0.0 – ULTIMATE BINANCE.US EDITION
-    • Uses YOUR WORKING UMFutures + UMFuturesWebsocketClient
-    • Full black-on-white dashboard with live Binance order IDs
-    • WhatsApp alerts with 5-minute cooldown
-    • Profit Management Engine (PME)
-    • Startup scaling + high-liquidity purchases
-    • 5000+ lines fully expanded – ZERO ERRORS
-"""
-import os, sys, threading, time, logging, pytz, requests, traceback
+# -*- coding: utf-8 -*-
+
+import os, sys, time, threading, logging, requests, pytz
+from decimal import Decimal, getcontext
 from logging.handlers import TimedRotatingFileHandler
-from decimal import Decimal, ROUND_DOWN, getcontext
-from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
+from binance.client import Client
+from binance.streams import ThreadedWebsocketManager
 
-# === YOUR WORKING BINANCE.US CLIENTS ========================================
-from binance.um_futures import UMFutures
-from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
-
+# === PRECISION ==============================================================
 getcontext().prec = 28
 
 # === CONFIGURATION ===========================================================
@@ -39,25 +30,13 @@ MIN_BUFFER_USDT = Decimal('8.0')
 MAX_GRIDS_PER_SIDE = 32
 REBALANCE_THRESHOLD_PCT = Decimal('0.0075')
 MAX_POSITION_PCT = Decimal('0.05')
-PME_PROFIT_THRESHOLD = Decimal('25.0')
-PME_CHECK_INTERVAL = 60
 POLL_INTERVAL = 45.0
 LOG_FILE = "infinity_grid_bot.log"
 
 MIN_PRICE = Decimal('1.00')
 MAX_PRICE = Decimal('1000.00')
 MIN_BID_VOLUME = Decimal('100000')
-
-# === COLORS =================================================================
-WHITE_BG = "\033[47m"
-BLACK = "\033[30m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-RED = "\033[31m"
-YELLOW = "\033[33m"
-MAGENTA = "\033[35m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
+EXCLUDE_SYMBOLS = {'BTCUSDT','BCHUSDT','ETHUSDT'}
 
 # === LOGGING ================================================================
 logging.basicConfig(level=logging.DEBUG)
@@ -65,46 +44,6 @@ logger = logging.getLogger(__name__)
 handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", backupCount=30)
 handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s'))
 logger.addHandler(handler)
-
-CST_TZ = pytz.timezone('America/Chicago')
-
-# === GLOBAL STATE ===========================================================
-price_cache = {}
-orderbook_cache = {}
-cache_lock = threading.Lock()
-
-valid_symbols_dict = {}
-active_grid_symbols = {}
-total_realized_pnl = Decimal('0')
-last_reported_pnl = Decimal('0')
-realized_lock = threading.Lock()
-
-startup_scaling_done = False
-startup_purchases_done = False
-filled_history = []
-
-# === ALERT SYSTEM ===========================================================
-last_alert_time = 0
-ALERT_COOLDOWN = 5 * 60
-alert_lock = threading.Lock()
-
-def send_whatsapp_alert(msg: str):
-    global last_alert_time
-    now = time.time()
-    with alert_lock:
-        if now - last_alert_time < ALERT_COOLDOWN:
-            return
-        last_alert_time = now
-    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
-        try:
-            url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                logger.info(f"Alert sent: {msg}")
-            else:
-                logger.warning(f"Alert failed: {response.text}")
-        except Exception as e:
-            logger.error(f"Alert error: {e}")
 
 # === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
@@ -116,8 +55,8 @@ class Position(Base):
     __tablename__ = "positions"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(20), unique=True, nullable=False, index=True)
-    quantity = Column(Numeric(20, 8), nullable=False)
-    avg_entry_price = Column(Numeric(20, 8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
+    avg_entry_price = Column(Numeric(20,8), nullable=False)
 
 class PendingOrder(Base):
     __tablename__ = "pending_orders"
@@ -125,17 +64,17 @@ class PendingOrder(Base):
     binance_order_id = Column(String(64), unique=True, nullable=False, index=True)
     symbol = Column(String(20), nullable=False)
     side = Column(String(4), nullable=False)
-    price = Column(Numeric(20, 8), nullable=False)
-    quantity = Column(Numeric(20, 8), nullable=False)
+    price = Column(Numeric(20,8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
 
 class TradeRecord(Base):
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(20), nullable=False)
     side = Column(String(4), nullable=False)
-    price = Column(Numeric(20, 8), nullable=False)
-    quantity = Column(Numeric(20, 8), nullable=False)
-    fee = Column(Numeric(20, 8), nullable=False, default=0)
+    price = Column(Numeric(20,8), nullable=False)
+    quantity = Column(Numeric(20,8), nullable=False)
+    fee = Column(Numeric(20,8), nullable=False, default=0)
     timestamp = Column(DateTime, default=func.now())
 
 if not os.path.exists("binance_trades.db"):
@@ -155,286 +94,275 @@ class DBManager:
                 self.session.rollback()
         self.session.close()
 
-# === BINANCE CLIENT =========================================================
-client = UMFutures(key=API_KEY, secret=API_SECRET, base_url="https://fapi.binance.us")
+# === BINANCE CLIENT ========================================================
+client = Client(API_KEY, API_SECRET)
+twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+twm.start()
 
-# === UTILITIES ==============================================================
-def to_decimal(val):
+# === GLOBAL STATE ===========================================================
+price_cache = {}
+orderbook_cache = {}
+cache_lock = threading.Lock()
+active_symbols = set()
+last_alert_time = 0
+
+# === UTILITY FUNCTIONS =====================================================
+
+def send_whatsapp_alert(msg: str, interval=300):
+    global last_alert_time
+    now = time.time()
+    if now - last_alert_time < interval:
+        return
+    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
+        try:
+            requests.get(
+                f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}",
+                timeout=5
+            )
+            last_alert_time = now
+            logger.info(f"Sent WhatsApp alert: {msg}")
+        except Exception as e:
+            logger.error(f"Error sending WhatsApp alert: {e}")
+
+def get_balance():
     try:
-        return Decimal(str(val)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
-    except:
+        info = client.get_asset_balance('USDT')
+        return Decimal(info['free'])
+    except Exception as e:
+        logger.error(f"Error getting USDT balance: {e}")
         return Decimal('0')
 
-def get_balance(asset='USDT'):
+def get_position(symbol):
+    with DBManager() as session:
+        pos = session.query(Position).filter(Position.symbol==symbol).first()
+        if pos:
+            return Decimal(pos.quantity), Decimal(pos.avg_entry_price)
+        return Decimal('0'), Decimal('0')
+
+def place_limit_order(symbol, side, price, quantity):
     try:
-        info = client.account()
-        for b in info['assets']:
-            if b['asset'] == asset:
-                return to_decimal(b['availableBalance'])
+        order = client.create_order(
+            symbol=symbol,
+            side=side,
+            type='LIMIT',
+            timeInForce='GTC',
+            quantity=float(quantity),
+            price=str(price)
+        )
+        with DBManager() as session:
+            po = PendingOrder(
+                binance_order_id=str(order['orderId']),
+                symbol=symbol,
+                side=side,
+                price=price,
+                quantity=quantity
+            )
+            session.add(po)
+        logger.info(f"Placed {side} order: {symbol} {quantity} @ {price}")
     except Exception as e:
-        logger.error(f"Balance error: {e}")
-    return Decimal('0')
+        logger.error(f"Error placing order {symbol}: {e}")
 
-def get_asset_balance(asset):
-    try:
-        info = client.account()
-        for b in info['assets']:
-            if b['asset'] == asset:
-                return to_decimal(b['walletBalance'])
-    except: pass
-    return Decimal('0')
+def scale_grids(symbol):
+    total_balance = get_balance()
+    grids = min(MAX_GRIDS_PER_SIDE, max(1, int(total_balance // GRID_SIZE_USDT)))
+    return grids
 
-def now_cst():
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+def calculate_grid_prices(price, grids):
+    buy_prices = [price * (1 - GRID_INTERVAL_PCT * (i+1)) for i in range(grids)]
+    sell_prices = [price * (1 + GRID_INTERVAL_PCT * (i+1)) for i in range(grids)]
+    return buy_prices, sell_prices
 
-# === WEBSOCKET ==============================================================
-def start_websocket():
-    def handle_ticker(msg):
+def rebalance_grids(symbol, price, pending_orders):
+    threshold = REBALANCE_THRESHOLD_PCT
+    for order in pending_orders:
+        order_price = Decimal(order.price)
         try:
-            if 'data' in msg:
-                data = msg['data']
-            else:
-                data = msg
-            symbol = data.get('s')
-            if not symbol: return
-            with cache_lock:
-                price_cache[symbol] = to_decimal(data['c'])
-        except: pass
-
-    def handle_depth(msg):
-        try:
-            if 'data' in msg:
-                data = msg['data']
-            else:
-                data = msg
-            symbol = data.get('s')
-            if not symbol: return
-            bids = data.get('b', [])
-            asks = data.get('a', [])
-            if bids and asks:
-                with cache_lock:
-                    orderbook_cache[symbol] = {
-                        'bid': to_decimal(bids[0][0]),
-                        'bid_qty': to_decimal(bids[0][1]),
-                        'ask': to_decimal(asks[0][0]),
-                        'ask_qty': to_decimal(asks[0][1])
-                    }
-        except: pass
-
-    ws = UMFuturesWebsocketClient()
-    ws.start()
-    streams = []
-    for sym in valid_symbols_dict.keys():
-        s = sym.lower()
-        streams.append(f"{s}@ticker")
-        streams.append(f"{s}@depth5@100ms")
-    if streams:
-        ws.combined_streams(streams=streams, callback=lambda msg: (handle_ticker(msg), handle_depth(msg)))
-        logger.info(f"WebSocket LIVE: {len(streams)} streams")
-    return ws
-
-# === ORDER MANAGEMENT =======================================================
-def place_limit_buy(symbol, price, qty):
-    price_str = f"{float(price):.8f}".rstrip('0').rstrip('.')
-    qty_str = f"{float(qty):.8f}".rstrip('0').rstrip('.')
-    try:
-        order = client.new_order(symbol=symbol, side='BUY', type='LIMIT', quantity=qty_str, price=price_str, timeInForce='GTC')
-        oid = str(order['orderId'])
-        with DBManager() as s:
-            s.add(PendingOrder(binance_order_id=oid, symbol=symbol, side='BUY', price=price, quantity=qty))
-        logger.info(f"BUY {symbol} {qty_str} @ {price_str} | ID: {oid}")
-        send_whatsapp_alert(f"BUY {symbol} {qty_str} @ ${price_str} | ID: {oid}")
-        return order
-    except Exception as e:
-        logger.error(f"BUY FAILED {symbol}: {e}")
-        return None
-
-def place_limit_sell(symbol, price, qty):
-    price_str = f"{float(price):.8f}".rstrip('0').rstrip('.')
-    qty_str = f"{float(qty):.8f}".rstrip('0').rstrip('.')
-    try:
-        order = client.new_order(symbol=symbol, side='SELL', type='LIMIT', quantity=qty_str, price=price_str, timeInForce='GTC')
-        oid = str(order['orderId'])
-        with DBManager() as s:
-            s.add(PendingOrder(binance_order_id=oid, symbol=symbol, side='SELL', price=price, quantity=qty))
-        logger.info(f"SELL {symbol} {qty_str} @ {price_str} | ID: {oid}")
-        send_whatsapp_alert(f"SELL {symbol} {qty_str} @ ${price_str} | ID: {oid}")
-        return order
-    except Exception as e:
-        logger.error(f"SELL FAILED {symbol}: {e}")
-        return None
-
-def check_filled_orders():
-    global total_realized_pnl, filled_history
-    with DBManager() as sess:
-        for po in sess.query(PendingOrder).all():
-            try:
-                o = client.get_order(symbol=po.symbol, orderId=int(po.binance_order_id))
-                if o['status'] == 'FILLED':
-                    fill_price = to_decimal(o['price']) if o['price'] else Decimal('0')
-                    qty = po.quantity
-                    fee = to_decimal(o.get('commission', '0')) or Decimal('0')
-                    pnl = Decimal('0')
-                    with DBManager() as s2:
-                        pos = s2.query(Position).filter_by(symbol=po.symbol).first()
-                        if po.side == 'BUY':
-                            if pos:
-                                new_qty = pos.quantity + qty
-                                new_avg = (pos.avg_entry_price * pos.quantity + fill_price * qty) / new_qty
-                                pos.quantity = new_qty
-                                pos.avg_entry_price = new_avg
-                            else:
-                                s2.add(Position(symbol=po.symbol, quantity=qty, avg_entry_price=fill_price))
-                        elif po.side == 'SELL' and pos:
-                            pnl = (fill_price - pos.avg_entry_price) * qty - fee
-                            with realized_lock:
-                                total_realized_pnl += pnl
-                            pos.quantity -= qty
-                            if pos.quantity <= Decimal('0'):
-                                s2.delete(pos)
-                        trade = TradeRecord(symbol=po.symbol, side=po.side, price=fill_price, quantity=qty, fee=fee)
-                        s2.add(trade)
-                        s2.flush()
-                        trade_time = trade.timestamp.strftime("%H:%M:%S")
-                    sess.delete(po)
-                    filled_history.append({'time': trade_time, 'symbol': po.symbol, 'side': po.side, 'price': fill_price, 'qty': qty, 'pnl': pnl})
-                    if len(filled_history) > 10: filled_history.pop(0)
-                    send_whatsapp_alert(f"FILLED {po.side} {po.symbol} {qty} @ ${fill_price} | P&L: ${pnl:+.2f}")
-            except: pass
-
-# === GRID ENGINE ============================================================
-def rebalance_grid(symbol):
-    price = price_cache.get(symbol, Decimal('0'))
-    bid_vol = orderbook_cache.get(symbol, {}).get('bid_qty', Decimal('0'))
-    if price <= 0 or bid_vol < MIN_BID_VOLUME: return
-
-    grid = active_grid_symbols.get(symbol, {})
-    old_center = grid.get('center', price)
-    move = abs(price - old_center)/old_center if old_center > 0 else Decimal('1')
-
-    if move >= REBALANCE_THRESHOLD_PCT or symbol not in active_grid_symbols:
-        for o in grid.get('orders', []):
-            oid = o.get('order_id')
-            if oid:
-                try: client.cancel_order(symbol=symbol, orderId=oid)
-                except: pass
-        active_grid_symbols.pop(symbol, None)
-
-        qty = (GRID_SIZE_USDT / price).quantize(Decimal('0.00000001'), ROUND_DOWN)
-        if qty <= 0: return
-
-        info = client.exchange_info()['symbols']
-        sym_info = next(s for s in info if s['symbol'] == symbol)
-        tick = to_decimal([f['tickSize'] for f in sym_info['filters'] if f['filterType']=='PRICE_FILTER'][0])
-        step = to_decimal([f['stepSize'] for f in sym_info['filters'] if f['filterType']=='LOT_SIZE'][0])
-
-        new_grid = {'center': price, 'qty': qty, 'orders': []}
-        for i in range(1, MAX_GRIDS_PER_SIDE+1):
-            bp = (price * (1 - GRID_INTERVAL_PCT * i)) // tick * tick
-            if bp * qty >= Decimal('1.25'):
-                o = place_limit_buy(symbol, bp, qty)
-                if o: new_grid['orders'].append({'price': bp, 'qty': qty, 'order_id': str(o['orderId']), 'side': 'BUY'})
-
-        free = get_asset_balance(symbol.replace('USDT',''))
-        sqty = qty
-        for i in range(1, MAX_GRIDS_PER_SIDE+1):
-            sp = (price * (1 + GRID_INTERVAL_PCT * i)) // tick * tick
-            sell_q = min(sqty, free)
-            if sell_q > 0 and sp * sell_q >= Decimal('3.25'):
-                o = place_limit_sell(symbol, sp, sell_q)
-                if o: new_grid['orders'].append({'price': sp, 'qty': sell_q, 'order_id': str(o['orderId']), 'side': 'SELL'})
-                free -= sell_q
-                sqty -= sell_q
-
-        if new_grid['orders']:
-            active_grid_symbols[symbol] = new_grid
-
-# === PME ====================================================================
-def pme_thread():
-    global total_realized_pnl, last_reported_pnl
-    while True:
-        try:
-            if total_realized_pnl - last_reported_pnl >= PME_PROFIT_THRESHOLD:
-                profit = float(total_realized_pnl - last_reported_pnl)
-                logger.info(f"PME ${profit:.2f} → REGRID ALL")
-                send_whatsapp_alert(f"PME ${profit:.2f} → REGRIDDING ALL")
-                with DBManager() as s:
-                    for p in s.query(Position).all():
-                        rebalance_grid(p.symbol)
-                last_reported_pnl = total_realized_pnl
-            time.sleep(PME_CHECK_INTERVAL)
-        except: time.sleep(10)
-
-# === DASHBOARD ==============================================================
-def print_dashboard():
-    os.system('cls' if os.name=='nt' else 'clear')
-    print(WHITE_BG + BLACK)
-    now = now_cst()
-    usdt = get_balance()
-    orders = sum(len(g.get('orders',[])) for g in active_grid_symbols.values())
-    assets = len(active_grid_symbols)
-    print(f"{'═'*130}")
-    print(f"{BOLD}{CYAN} INFINITY GRID BOT v11.0.0 – BINANCE.US FINAL {RESET}{BLACK}| {now} CST {RESET}".center(130))
-    print(f"{'═'*130}")
-    print(f"{MAGENTA}USDT:{RESET} {GREEN}${float(usdt):,.2f}{RESET} {BLACK}| PNL: {GREEN if total_realized_pnl>=0 else RED}${float(total_realized_pnl):+.2f}{RESET}")
-    print(f"{CYAN}WS:{RESET} {GREEN}LIVE{RESET} {CYAN}| Orders:{RESET} {BLACK}{orders}{RESET} {CYAN}| Assets:{RESET} {BLACK}{assets}{RESET}")
-    print(f"\n{CYAN}ACTIVE GRID ORDERS{RESET}")
-    print(f"┌{'─'*12}┬{'─'*8}┬{'─'*14}┬{'─'*10}┬{'─'*14}┐")
-    print(f"│ {BOLD}Coin       │ Side   │ Price         │ Qty       │ Binance ID     {RESET}│")
-    print(f"├{'─'*12}┼{'─'*8}┼{'─'*14}┼{'─'*10}┼{'─'*14}┤")
-    order_list = []
-    for s, g in active_grid_symbols.items():
-        for o in g.get('orders', []):
-            order_list.append((s, o['side'], o['price'], o['qty'], o['order_id']))
-    for sym, side, p, q, oid in order_list[:8]:
-        c = GREEN if side=="BUY" else RED
-        print(f"│ {c}{sym:<10}{RESET} │ {c}{side:<6}{RESET} │ {c}${float(p):>12,.6f}{RESET} │ {c}{float(q):>8.4f}{RESET} │ {oid:<12} │")
-    print(f"└{'─'*12}┴{'─'*8}┴{'─'*14}┴{'─'*10}┴{'─'*14}┘")
-    print(f"\n{CYAN}FILLED HISTORY{RESET}")
-    for t in reversed(filled_history):
-        c = GREEN if t['side']=="BUY" else RED
-        pc = GREEN if t['pnl']>=0 else RED
-        print(f"│ {t['time']} │ {c}{t['symbol']:<10}{RESET} │ {c}{t['side']:<5}{RESET} │ ${float(t['price']):>12,.6f} │ {float(t['qty']):>8.4f} │ {pc}${float(t['pnl']):+8.2f}{RESET} │")
-    print(f"{GREEN}BINANCE.US • PROFIT PRINTING • ZERO LATENCY{RESET}")
-    print(f"{'═'*130}")
-    print(RESET, end='')
-
-# === MAIN ===================================================================
-def main():
-    global valid_symbols_dict
-    info = client.exchange_info()
-    for s in info['symbols']:
-        if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING':
-            valid_symbols_dict[s['symbol']] = s
-    logger.info(f"Loaded {len(valid_symbols_dict)} symbols")
-
-    ws_client = start_websocket()
-    threading.Thread(target=pme_thread, daemon=True).start()
-
-    time.sleep(15)
-    logger.info("WebSocket ready")
-
-    last_check = 0
-    last_dash = 0
-    while True:
-        try:
-            now = time.time()
-            check_filled_orders()
-            if now - last_check >= POLL_INTERVAL:
-                with DBManager() as s:
-                    for p in s.query(Position).all():
-                        rebalance_grid(p.symbol)
-                last_check = now
-            if now - last_dash >= 60:
-                print_dashboard()
-                last_dash = now
-            time.sleep(1)
-        except KeyboardInterrupt:
-            ws_client.stop()
-            break
+            if order.side == 'BUY' and order_price < price * (1 - threshold):
+                client.cancel_order(symbol=symbol, orderId=order.binance_order_id)
+            elif order.side == 'SELL' and order_price > price * (1 + threshold):
+                client.cancel_order(symbol=symbol, orderId=order.binance_order_id)
         except Exception as e:
-            logger.critical(f"CRASH: {traceback.format_exc()}")
-            time.sleep(10)
+            logger.error(f"Error cancelling order {order.symbol}: {e}")
 
-if __name__ == "__main__":
-    main()
+# === GRID LOOP ==============================================================
+def grid_loop(symbol):
+    while True:
+        try:
+            price = price_cache.get(symbol)
+            if not price:
+                time.sleep(1)
+                continue
+
+            grids = scale_grids(symbol)
+            buy_prices, sell_prices = calculate_grid_prices(price, grids)
+
+            with DBManager() as session:
+                pending_orders = session.query(PendingOrder).filter(PendingOrder.symbol==symbol).all()
+
+            rebalance_grids(symbol, price, pending_orders)
+
+            usdt_balance = get_balance()
+
+            for bp in buy_prices:
+                if any(Decimal(po.price)==bp and po.side=='BUY' for po in pending_orders):
+                    continue
+                if usdt_balance > GRID_SIZE_USDT + MIN_BUFFER_USDT:
+                    qty = (GRID_SIZE_USDT / bp).quantize(Decimal('0.0001'))
+                    place_limit_order(symbol, 'BUY', bp, qty)
+                    usdt_balance -= GRID_SIZE_USDT
+
+            pos_qty, _ = get_position(symbol)
+            if pos_qty * price >= GRID_SIZE_USDT:
+                for sp in sell_prices:
+                    if any(Decimal(po.price)==sp and po.side=='SELL' for po in pending_orders):
+                        continue
+                    sell_qty = min((GRID_SIZE_USDT / sp).quantize(Decimal('0.0001')), pos_qty)
+                    if sell_qty * sp >= GRID_SIZE_USDT:
+                        place_limit_order(symbol, 'SELL', sp, sell_qty)
+
+            time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            logger.error(f"Error in grid loop for {symbol}: {e}")
+            time.sleep(5)
+
+# === WEBSOCKET HANDLER =====================================================
+def handle_trade(msg):
+    try:
+        if msg['e'] != 'executionReport':
+            return
+        data = msg
+        symbol = data['s']
+        side = data['S']
+        qty = Decimal(data['l'])
+        price = Decimal(data['L'])
+        order_id = data['i']
+        fee = Decimal(data.get('n', '0'))
+
+        with DBManager() as session:
+            pending = session.query(PendingOrder).filter(PendingOrder.binance_order_id==str(order_id)).first()
+            if pending:
+                session.delete(pending)
+
+            pos = session.query(Position).filter(Position.symbol==symbol).first()
+            if not pos:
+                pos = Position(symbol=symbol, quantity=qty if side=='BUY' else -qty, avg_entry_price=price)
+                session.add(pos)
+            else:
+                if side=='BUY':
+                    total_cost = pos.avg_entry_price * pos.quantity + price * qty
+                    pos.quantity += qty
+                    pos.avg_entry_price = total_cost / pos.quantity
+                else:
+                    pos.quantity -= qty
+                    if pos.quantity <= 0:
+                        pos.quantity = 0
+                        pos.avg_entry_price = 0
+
+            trade = TradeRecord(symbol=symbol, side=side, price=price, quantity=qty, fee=fee)
+            session.add(trade)
+
+        send_whatsapp_alert(f"{symbol} {side} {qty}@{price}")
+    except Exception as e:
+        logger.error(f"Error processing trade: {e}")
+
+# === START USER STREAM =====================================================
+listen_key = client.stream_get_listen_key()['listenKey']
+twm.start_user_socket(callback=handle_trade)
+
+# === PRICE WEBSOCKET =======================================================
+def handle_price(msg):
+    try:
+        symbol = msg['s']
+        price = Decimal(msg['c'])
+        price_cache[symbol] = price
+    except Exception as e:
+        logger.error(f"Error updating price cache: {e}")
+
+# === ORDERBOOK MONITOR =====================================================
+def update_orderbook(symbol):
+    while True:
+        try:
+            depth = client.get_order_book(symbol=symbol, limit=5)
+            with cache_lock:
+                orderbook_cache[symbol] = depth
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Error updating orderbook for {symbol}: {e}")
+            time.sleep(5)
+
+def select_top_coins():
+    symbols = client.get_all_tickers()
+    bids_volumes = []
+    for s in symbols:
+        sym = s['symbol']
+        if sym in EXCLUDE_SYMBOLS or not sym.endswith('USDT'):
+            continue
+        try:
+            depth = client.get_order_book(symbol=sym, limit=5)
+            top_bid = Decimal(depth['bids'][0][1])
+            if top_bid * Decimal(depth['bids'][0][0]) >= MIN_BID_VOLUME:
+                bids_volumes.append((sym, top_bid))
+        except:
+            continue
+    bids_volumes.sort(key=lambda x: x[1], reverse=True)
+    top_symbols = [x[0] for x in bids_volumes[:10]]
+    return top_symbols
+
+# === PROFIT MONITOR ========================================================
+def profit_monitor_loop():
+    time.sleep(120)
+    while True:
+        total_pnl = Decimal('0')
+        with DBManager() as session:
+            positions = session.query(Position).all()
+            for pos in positions:
+                current_price = price_cache.get(pos.symbol)
+                if current_price:
+                    total_pnl += (current_price - pos.avg_entry_price) * pos.quantity
+        send_whatsapp_alert(f"Total unrealized PnL: {total_pnl}")
+        time.sleep(3600)
+
+# === TOP COIN ROTATION =====================================================
+def rotate_top_coins_loop():
+    while True:
+        try:
+            top_symbols = select_top_coins()
+            logger.info(f"Rotating top symbols: {top_symbols}")
+
+            # Remove symbols no longer in top list
+            for sym in list(active_symbols):
+                if sym not in top_symbols:
+                    active_symbols.remove(sym)
+                    logger.info(f"Stopped trading {sym}")
+
+            # Add new top symbols
+            for sym in top_symbols:
+                if sym not in active_symbols:
+                    active_symbols.add(sym)
+                    twm.start_symbol_ticker_socket(symbol=sym, callback=handle_price)
+                    threading.Thread(target=grid_loop, args=(sym,), daemon=True).start()
+                    threading.Thread(target=update_orderbook, args=(sym,), daemon=True).start()
+                    logger.info(f"Started trading {sym}")
+        except Exception as e:
+            logger.error(f"Error rotating top coins: {e}")
+        time.sleep(1200)  # 20 minutes
+
+# === START TRADING =========================================================
+def start_bot():
+    initial_top = select_top_coins()
+    logger.info(f"Selected symbols for trading: {initial_top}")
+    for sym in initial_top:
+        active_symbols.add(sym)
+        twm.start_symbol_ticker_socket(symbol=sym, callback=handle_price)
+        threading.Thread(target=grid_loop, args=(sym,), daemon=True).start()
+        threading.Thread(target=update_orderbook, args=(sym,), daemon=True).start()
+
+    threading.Thread(target=profit_monitor_loop, daemon=True).start()
+    threading.Thread(target=rotate_top_coins_loop, daemon=True).start()
+
+logger.info("Infinity Grid Bot starting...")
+start_bot()
+
+# Keep main thread alive
+while True:
+    time.sleep(60)
