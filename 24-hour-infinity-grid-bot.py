@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID + REBALANCER v7.8 – CASH-AWARE AI TRADER
+    INFINITY GRID + REBALANCER v7.8 – CASH-AWARE SMART TRADER
     • Cash-First Order Sizing | $5 Min Order | Sell-Stop Protection
     • Profit Monitoring Engine (PME) | Real-Time Strategy Switching
     • Trend, Mean-Reversion, Volume-Anchored Strategies
     • WebSocket + REST | Thread-Safe | Zero Lag | Full Dashboard
     • Binance.US API | SQLite DB | CallMeBot Alerts
-    • 2,000+ LOC | Production Ready | No Errors
+    • 1,315 LOC | Production Ready | No Errors
 """
 import os
 import sys
