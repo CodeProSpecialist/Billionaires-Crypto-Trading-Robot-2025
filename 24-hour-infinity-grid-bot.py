@@ -615,6 +615,81 @@ def format_decimal(value: Decimal, precision=8) -> str:
     """
     return f"{value:.{precision}f}"
 
+# ------------------ ENTRY POINT & STARTUP ------------------
+
+if __name__ == "__main__":
+    import os
+    import sys
+
+    # Load Binance API keys from environment variables
+    API_KEY = os.getenv('BINANCE_API_KEY')
+    API_SECRET = os.getenv('BINANCE_API_SECRET')
+
+    if not API_KEY or not API_SECRET:
+        print("FATAL: Set BINANCE_API_KEY and BINANCE_API_SECRET")
+        sys.exit(1)
+
+    # Initialize bot instance
+    bot = BinanceTradingBot()
+
+    # Ask user for portfolio or dynamic scan mode
+    print("\nDo you want this bot to only trade coins already in your portfolio,")
+    print("or should it scan top USDT pairs dynamically for new buys while respecting your 5% max per coin rule?")
+    print("Enter 'P' for portfolio-only mode, or 'D' for dynamic mode (default: P): ", end='')
+    user_input = input().strip().upper()
+    portfolio_only_mode = True if user_input != 'D' else False
+
+    mode_text = "Portfolio-only mode" if portfolio_only_mode else "Dynamic scan mode"
+    logger.info(f"Bot starting in {mode_text}")
+
+    # Initial REST sync of balances and positions
+    try:
+        initial_sync_from_rest(bot)
+        logger.info("Initial REST sync completed.")
+    except Exception as e:
+        logger.error(f"Initial REST sync failed: {e}")
+        sys.exit(1)
+
+    # Start WebSocket streams
+    start_market_websocket()
+    start_user_stream()
+
+    # Start keepalive for user stream
+    threading.Thread(target=keepalive_user_stream, daemon=True).start()
+
+    # Start PME (Profit Monitoring Engine) loop
+    threading.Thread(target=profit_monitoring_engine, daemon=True).start()
+
+    # Start 10-minute update loop for active symbols
+    def periodic_symbol_update():
+        while not SHUTDOWN_EVENT.is_set():
+            update_active_symbols(bot, portfolio_only=portfolio_only_mode)
+            time.sleep(600)  # 10 minutes
+
+    threading.Thread(target=periodic_symbol_update, daemon=True).start()
+
+    # Start dashboard refresh loop
+    def dashboard_loop():
+        while not SHUTDOWN_EVENT.is_set():
+            print_dashboard(bot)
+            time.sleep(DASHBOARD_REFRESH)
+
+    threading.Thread(target=dashboard_loop, daemon=True).start()
+
+    # Signal handler will gracefully shutdown threads
+    try:
+        while not SHUTDOWN_EVENT.is_set():
+            time.sleep(1)
+            if check_stop_loss():
+                logger.critical("Emergency STOP-LOSS triggered. Shutting down bot.")
+                SHUTDOWN_EVENT.set()
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received. Shutting down...")
+        SHUTDOWN_EVENT.set()
+
+    # Wait briefly to allow threads to clean up
+    time.sleep(2)
+    logger.info("Bot has shut down gracefully.")
 
 
 
