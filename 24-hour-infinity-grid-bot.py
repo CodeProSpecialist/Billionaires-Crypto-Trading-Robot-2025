@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from binance.client import Client
 from binance.streams import ThreadedWebsocketManager
+from binance import ThreadedWebsocketManager
 
 # === PRECISION ==============================================================
 getcontext().prec = 28
