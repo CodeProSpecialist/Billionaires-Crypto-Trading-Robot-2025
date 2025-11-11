@@ -133,6 +133,15 @@ def send_alert(message, subject="Trading Bot Alert"):
     except Exception as e:
         logger.error(f"WhatsApp error: {e}")
 
+# ------------------ HELPERS ------------------
+def safe_decimal(value, default=ZERO) -> Decimal:
+    try: 
+        return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
+    except: 
+        return default
+
+
+
 
 
 
