@@ -77,3 +77,26 @@ STRATEGY_COLORS = {'trend': MAGENTA,'mean_reversion': CYAN,'volume_anchored': BL
 STRATEGY_LABELS = {'trend': 'TREND','mean_reversion': 'MEAN-REV','volume_anchored': 'VOL-ANCHOR'}
 
 CST_TZ = pytz.timezone('America/Chicago')
+
+# ------------------ LOGGING ------------------
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    from logging.handlers import TimedRotatingFileHandler
+    file_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", backupCount=14)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s'))
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+# ------------------ GLOBAL STATE ------------------
+valid_symbols_dict = {}
+symbol_info_cache = {}
+active_grid_symbols = {}
+live_prices = {}
+price_lock = threading.Lock()
+balances = {'USDT': ZERO}
+balance_lock = threading.Lock()
+ws_connected = False
+
