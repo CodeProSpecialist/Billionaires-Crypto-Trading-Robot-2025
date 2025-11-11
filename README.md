@@ -64,9 +64,7 @@ Built for traders who demand precision. Powered by real-time depth, not hype.
 ```bash
 # 1. Install
 
-pip3 install python-binance rich TA-Lib requests
-
-pip3 install websocket-client sqlalchemy numpy pytz
+pip install python-binance websocket-client streamlit sqlalchemy numpy pytz
 
 # 2. Set env
 export BINANCE_API_KEY="your_key"
