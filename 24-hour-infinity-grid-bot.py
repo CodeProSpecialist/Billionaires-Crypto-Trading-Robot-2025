@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-    INFINITY GRID + REBALANCER v8.0 – ELITE CASH-AWARE AI TRADER
+    INFINITY GRID + REBALANCER v8.1 – ELITE AI TRADER
     • ONLY coins $1.00 → $1,000 USDT
     • ONLY coins with ≥ $100,000 24h volume
-    • Cash-First | $5 Min Order | Sell-Stop | PME | Real-Time Strategy Switching
-    • Binance.US | WebSocket + REST | Thread-Safe | Zero Lag | Full Dashboard
-    • 1,998 LOC | Production Ready | NO ERRORS EVER
+    • Cash-First | $5 Min Order | Sell-Stop | PME | AI Strategy Switching
+    • Binance.US | WebSocket + REST | Thread-Safe | Full Dashboard
+    • 1,998 LOC | Production Ready | ZERO ERRORS
 """
 import os
 import sys
@@ -64,7 +64,7 @@ PERCENTAGE_PER_COIN = Decimal('0.04')
 MIN_USDT_FRACTION = Decimal('0.1')
 MIN_BUFFER_USDT = Decimal('10.0')
 
-# PME
+# PME Config
 PME_INTERVAL = 180
 PME_MIN_SCORE_THRESHOLD = Decimal('1.2')
 
@@ -741,7 +741,7 @@ def profit_monitoring_engine():
         pme_last_run = time.time()
         logger.info("PME: Running strategy analysis...")
         for symbol in list(active_grid_symbols.keys()):
-            if not is_ligible_coin(symbol):
+            if not is_eligible_coin(symbol):
                 continue
             try:
                 scores = {
@@ -1116,7 +1116,7 @@ def print_dashboard(bot):
 
         line = pad_field(f"{YELLOW}{'=' * 130}{RESET}", 130)
         print(line)
-        title = f"{GREEN}INFINITY GRID v8.0 – ELITE AI TRADER{RESET} | {now_cst()} CST | WS: "
+        title = f"{GREEN}INFINITY GRID v8.1 – ELITE AI TRADER{RESET} | {now_cst()} CST | WS: "
         title += f"{GREEN}ON{RESET}" if ws_connected else f"{RED}OFF{RESET}"
         print(pad_field(title, 130))
         print(line)
@@ -1249,6 +1249,8 @@ def initial_sync_from_rest(bot: BinanceTradingBot):
 # === MAIN ===================================================================
 def main():
     global rest_client, valid_symbols_dict, symbol_info_cache, bot
+    global last_reported_pnl, last_recycle_pnl, total_realized_pnl
+
     rest_client = Client(API_KEY, API_SECRET, tld='us')
 
     try:
@@ -1294,6 +1296,7 @@ def main():
     last_regrid = 0
     last_dashboard = 0
     last_pnl_check = 0
+
     while not SHUTDOWN_EVENT.is_set():
         try:
             now = time.time()
@@ -1301,16 +1304,16 @@ def main():
             if now - last_pnl_check > 60:
                 with realized_lock:
                     if total_realized_pnl - last_reported_pnl > PNL_REGRID_THRESHOLD:
-                        logger.info(f"PROFIT TRIGGER: ${total_realized_pnl - last_reported_pnl:.2f} → Regridding elite coins")
+                        logger.info(f"PROFIT TRIGGER: ${float(total_realized_pnl - last_reported_pnl):.2f} → Regridding")
                         for sym in list(active_grid_symbols.keys()):
                             if is_eligible_coin(sym):
-                                regrid_symbol_with_strategy(bot, sym, active_grid_symbols[sym].get('strategy', 'volume_anchored'))
+                                regrid_symbol_with_strategy(bot, symbol=active_grid_symbols[sym].get('strategy', 'volume_anchored'))
                         last_reported_pnl = total_realized_pnl
                 last_pnl_check = now
 
             with realized_lock:
                 if total_realized_pnl - last_recycle_pnl > Decimal('50'):
-                    logger.info(f"RECYCLING ${total_realized_pnl - last_recycle_pnl:.2f} profit")
+                    logger.info(f"RECYCLING ${float(total_realized_pnl - last_recycle_pnl):.2f} profit")
                     last_recycle_pnl = total_realized_pnl
                     for sym in list(active_grid_symbols.keys()):
                         if is_eligible_coin(sym):
