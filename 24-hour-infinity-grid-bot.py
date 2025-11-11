@@ -1,187 +1,135 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/first/env python3
 """
-    INFINITY GRID BOT v7.2 – FULLY FIXED + WEBSOCKETS + PME + DASHBOARD + DYNAMIC SCANNING + RSI/TREND FILTERS + ORDER BOOK SCAN
-    • Trades portfolio OR dynamic top 20 USDT pairs by buy bid volume (vol >100k, price $1-$1000)
-    • Strategy switching: Trend / Mean-Reversion / Volume-Anchored via PME
-    • Real-time dashboard with strategy labels
-    • Bundled WhatsApp alerts
-    • 5% max per coin | 20% cash reserve (1/5 unspent) | RSI + trend filters
+    INFINITY GRID BOT – FULLY AUTOMATED
+    • First run: Scans order book ladder → buys top 3 high-pressure coins
+    • Then: Places infinity grid (sell above, buy below) on all owned coins
+    • Uses price range + volume filters
+    • Smart allocation, 24/7 price following
+    • Full ladder: first run only
 """
-
 import os
 import sys
 import time
-import json
-import threading
 import logging
-import websocket
-import signal
-import re
+import numpy as np
+import talib
 import requests
-import urllib.parse
-from decimal import Decimal, ROUND_DOWN, getcontext
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Any, Optional, Tuple, List
+from collections import deque
+import threading
 import pytz
 from logging.handlers import TimedRotatingFileHandler
 from binance.client import Client
+from binance.enums import *
 from binance.exceptions import BinanceAPIException
-from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, func
-from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.exc import OperationalError, IntegrityError
+from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, ForeignKey, func
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.exc import SQLAlchemyError
 
-getcontext().prec = 28
-
-# === CONFIG ===
+# === CONFIGURATION ===========================================================
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
-
 if not API_KEY or not API_SECRET:
-    print("FATAL: Set BINANCE_API_KEY and BINANCE_API_SECRET")
+    print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET env vars")
     sys.exit(1)
 
-# === CONSTANTS ===
-MIN_USDT_TO_BUY = Decimal('8.0')
-DEFAULT_GRID_SIZE_USDT = Decimal('8.0')
-MAX_GRIDS_PER_SIDE = 12
-REGRID_INTERVAL = 600
-DASHBOARD_REFRESH = 20
-VP_UPDATE_INTERVAL = 300
-STOP_LOSS_PCT = Decimal('-0.05')
-PME_INTERVAL = 180
-PME_MIN_SCORE_THRESHOLD = Decimal('1.2')
-MAX_PERCENT_PER_COIN = Decimal('0.05')        # <<< FIX >>> 5% max per coin
-RESERVE_FRACTION = Decimal('0.20')           # <<< FIX >>> Keep 1/5 (20%) unspent
-RSI_BUY = Decimal('70')
-RSI_SELL = Decimal('58')
-RSI_PERIOD = 14
-DEFAULT_GRID_INTERVAL_PCT = Decimal('0.012')
+# Grid & Entry Config
+GRID_SIZE_USDT = Decimal('5.0')
+GRID_INTERVAL_PCT = Decimal('0.015')  # 1.5%
+MIN_BUFFER_USDT = Decimal('8.0')
+MAX_GRIDS_PER_SIDE = 8
+MIN_GRIDS_PER_SIDE = 2
+MIN_GRIDS_FALLBACK = 1
+REBALANCE_THRESHOLD_PCT = Decimal('0.0075')  # 0.75%
 
-HEARTBEAT_INTERVAL = 25
-KEEPALIVE_INTERVAL = 1800
-MAX_STREAMS_PER_CONNECTION = 100
+# Entry Filters
+MAX_PRICE = 1000.00
+MIN_PRICE = 0.15
+MIN_24H_VOLUME_USDT = 60000
+ENTRY_BUY_PCT_BELOW_ASK = Decimal('0.001')  # Buy 0.1% below best ask
+ENTRY_MIN_USDT = Decimal('15.0')
 
-WS_BASE = "wss://stream.binance.us:9443/stream?streams="
-USER_STREAM_BASE = "wss://stream.binance.us:9443/ws/"
-
+# General
 LOG_FILE = "infinity_grid_bot.log"
-SHUTDOWN_EVENT = threading.Event()
+POLL_INTERVAL = 45.0
+FIRST_RUN_DONE = False
 
+# === CONSTANTS ==============================================================
 ZERO = Decimal('0')
-ONE = Decimal('1')
-GREEN = "\033[92m"
-RED = "\033[91m"
-YELLOW = "\033[93m"
-BLUE = "\033[94m"
-MAGENTA = "\033[95m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
+HUNDRED = Decimal('100')
 
-STRATEGY_COLORS = {'trend': MAGENTA, 'mean_reversion': CYAN, 'volume_anchored': BLUE}
-STRATEGY_LABELS = {'trend': 'TREND', 'mean_reversion': 'MEAN-REV', 'volume_anchored': 'VOL-ANCHOR'}
-
-CST_TZ = pytz.timezone('America/Chicago')
-
-# === LOGGING ===
+# === LOGGING ================================================================
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 if not logger.handlers:
-    file_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", backupCount=14)
+    file_handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=7)
     file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(name)s:%(funcName)s:%(lineno)d - %(message)s'))
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
-# === GLOBAL STATE ===
+CST_TZ = pytz.timezone('America/Chicago')
+
+# === GLOBAL STATE ===========================================================
 valid_symbols_dict: Dict[str, dict] = {}
-symbol_info_cache: Dict[str, dict] = {}
+order_book_cache: Dict[str, dict] = {}
 active_grid_symbols: Dict[str, dict] = {}
-live_prices: Dict[str, Decimal] = {}
-price_lock = threading.Lock()
-balances: Dict[str, Decimal] = {'USDT': ZERO}
-balance_lock = threading.Lock()
-kline_lock = threading.Lock()
-ws_instances: List[websocket.WebSocketApp] = []
-user_ws: Optional[websocket.WebSocketApp] = None
-listen_key: Optional[str] = None
-listen_key_lock = threading.Lock()
-ws_connected = False
+first_dashboard_run = True
+last_ob_fetch: Dict[str, float] = {}
+first_run_executed = False
 
-alert_queue = []
-alert_queue_lock = threading.Lock()
-last_alert_sent = 0
-ALERT_COOLDOWN = 300
-
-realized_pnl_per_symbol: Dict[str, Decimal] = {}
-total_realized_pnl = ZERO
-peak_pnl = ZERO
-realized_lock = threading.Lock()
-
-ticker_24h_stats: Dict[str, dict] = {}
-stats_lock = threading.Lock()
-trend_bias: Dict[str, Decimal] = {}
-kline_data: Dict[str, List[dict]] = {}
-volume_profile: Dict[str, dict] = {}
-last_vp_update = 0
-strategy_scores: Dict[str, dict] = {}
-pme_last_run = 0
-
-# === ALERTS ===
-def now_cst() -> str:
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-def send_alert(message, subject="Trading Bot Alert"):
-    global last_alert_sent
-    current_time = time.time()
-    with alert_queue_lock:
-        alert_queue.append(f"[{now_cst()}] {subject}: {message}")
-        if current_time - last_alert_sent < ALERT_COOLDOWN and len(alert_queue) < 50:
-            return
-        full_message = "\n".join(alert_queue[-50:])
-        alert_queue.clear()
-    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
-        logger.error("Missing CALLMEBOT_API_KEY or CALLMEBOT_PHONE")
-        return
-    encoded = urllib.parse.quote_plus(full_message)
-    url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={encoded}&apikey={CALLMEBOT_API_KEY}"
+# === MATH & HELPERS =========================================================
+def safe_float(value, default=0.0) -> float:
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            last_alert_sent = current_time
-            logger.info(f"BUNDLED WhatsApp sent ({len(full_message.splitlines())} lines)")
-        else:
-            logger.error(f"WhatsApp failed: {response.text}")
-    except Exception as e:
-        logger.error(f"WhatsApp error: {e}")
-
-# === HELPERS ===
-def safe_decimal(value, default=ZERO) -> Decimal:
-    try:
-        return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
+        return float(value) if value is not None and np.isfinite(float(value)) else default
     except:
         return default
 
-def pad_field(text: str, width: int) -> str:
-    visible = len(re.sub(r'\033\[[0-9;]*m', '', str(text)))
-    return text + ' ' * max(0, width - visible)
+def to_decimal(value) -> Decimal:
+    try:
+        return Decimal(str(value)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN)
+    except:
+        return ZERO
 
-def meets_min_notional(symbol: str, price: Decimal, qty: Decimal) -> bool:
-    info = symbol_info_cache.get(symbol, {})
-    step = info.get('stepSize', ZERO)
-    min_notional = info.get('minNotional', Decimal('5.0'))
-    if qty < step:
-        return False
-    if (qty * price) < min_notional:
-        return False
-    return True
+def buy_notional_ok(price: Decimal, qty: Decimal) -> bool:
+    return price * qty >= Decimal('1.25')
 
-# === DATABASE ===
+def sell_notional_ok(price: Decimal, qty: Decimal) -> bool:
+    return price * qty >= Decimal('3.25')
+
+# === RETRY DECORATOR ========================================================
+def retry_custom(func):
+    def wrapper(*args, **kwargs):
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except BinanceAPIException as e:
+                if hasattr(e, 'response') and e.response is not None:
+                    hdr = e.response.headers
+                    if e.status_code in (429, 418):
+                        retry_after = int(hdr.get('Retry-After', 60))
+                        logger.warning(f"Rate limit {e.status_code}: sleeping {retry_after}s")
+                        time.sleep(retry_after)
+                    else:
+                        delay = 2 ** i
+                        logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__}: {e}")
+                        time.sleep(delay)
+                else:
+                    if i == max_retries - 1:
+                        raise
+                    time.sleep(2 ** i)
+        return None
+    return wrapper
+
+# === DATABASE ===============================================================
 DB_URL = "sqlite:///binance_trades.db"
-engine = create_engine(DB_URL, echo=False, future=True, pool_pre_ping=True)
+engine = create_engine(DB_URL, echo=False, future=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
@@ -191,6 +139,7 @@ class Position(Base):
     symbol = Column(String(20), unique=True, nullable=False, index=True)
     quantity = Column(Numeric(20, 8), nullable=False)
     avg_entry_price = Column(Numeric(20, 8), nullable=False)
+    buy_fee_rate = Column(Numeric(10, 6), nullable=False, default=0.001)
 
 class PendingOrder(Base):
     __tablename__ = "pending_orders"
@@ -201,676 +150,452 @@ class PendingOrder(Base):
     price = Column(Numeric(20, 8), nullable=False)
     quantity = Column(Numeric(20, 8), nullable=False)
 
-class TradeRecord(Base):
-    __tablename__ = "trades"
-    id = Column(Integer, primary_key=True)
-    symbol = Column(String(20), nullable=False)
-    side = Column(String(4), nullable=False)
-    price = Column(Numeric(20, 8), nullable=False)
-    quantity = Column(Numeric(20, 8), nullable=False)
-    fee = Column(Numeric(20, 8), nullable=False, default=0)
-    timestamp = Column(DateTime, default=func.now())
-
 if not os.path.exists("binance_trades.db"):
     Base.metadata.create_all(engine)
 
-class SafeDBManager:
+class DBManager:
     def __enter__(self):
-        try:
-            self.session = SessionFactory()
-            return self.session
-        except:
-            return None
+        self.session = SessionFactory()
+        return self.session
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not hasattr(self, 'session'): return
-        if exc_type: self.session.rollback()
+        if exc_type is not None:
+            self.session.rollback()
         else:
-            try: self.session.commit()
-            except IntegrityError: self.session.rollback()
+            try:
+                self.session.commit()
+            except:
+                self.session.rollback()
         self.session.close()
 
-# === WEBSOCKET HEARTBEAT ===
-class HeartbeatWebSocket(websocket.WebSocketApp):
-    def __init__(self, url, on_message_cb, is_user_stream=False):
-        super().__init__(
-            url,
-            on_open=self.on_open,
-            on_message=on_message_cb,
-            on_error=self.on_error,
-            on_close=self.on_close,
-            on_pong=self.on_pong
-        )
-        self.is_user_stream = is_user_stream
-        self.last_pong = time.time()
-        self.heartbeat_thread = None
-        self.reconnect_delay = 1
-        self.max_delay = 60
+# === RATE MANAGER ===========================================================
+class RateManager:
+    def __init__(self, client):
+        self.client = client
+    def wait_if_needed(self, typ='REQUEST_WEIGHT'):
+        if not hasattr(self.client, 'response') or self.client.response is None:
+            return
+        hdr = self.client.response.headers
+        if typ == 'REQUEST_WEIGHT' and 'x-mbx-used-weight-1m' in hdr:
+            if int(hdr['x-mbx-used-weight-1m']) > 5700:
+                time.sleep(1.1)
+        if typ == 'ORDERS' and 'x-mbx-order-count-10s' in hdr:
+            if int(hdr['x-mbx-order-count-10s']) > 45:
+                time.sleep(1.0)
 
-    def on_open(self, ws):
-        global ws_connected
-        ws_connected = True
-        logger.info(f"WS CONNECTED: {ws.url.split('?')[0]}")
-        self.last_pong = time.time()
-        if not self.heartbeat_thread:
-            self.heartbeat_thread = threading.Thread(target=self._send_heartbeat, daemon=True)
-            self.heartbeat_thread.start()
-
-    def on_error(self, ws, error):
-        logger.warning(f"WS ERROR: {error}")
-
-    def on_close(self, ws, *args):
-        global ws_connected
-        ws_connected = False
-        logger.warning(f"WS CLOSED: {ws.url.split('?')[0]}")
-
-    def on_pong(self, ws, *args):
-        self.last_pong = time.time()
-
-    def _send_heartbeat(self):
-        while self.sock and self.sock.connected and not SHUTDOWN_EVENT.is_set():
-            if time.time() - self.last_pong > HEARTBEAT_INTERVAL + 10:
-                self.close()
-                break
-            try:
-                self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
-            except:
-                break
-            time.sleep(HEARTBEAT_INTERVAL)
-
-    def run_forever(self):
-        while not SHUTDOWN_EVENT.is_set():
-            try:
-                super().run_forever(ping_interval=None, ping_timeout=None)
-            except Exception as e:
-                logger.error(f"WS CRASH: {e}")
-            if SHUTDOWN_EVENT.is_set():
-                break
-            delay = min(self.max_delay, self.reconnect_delay)
-            time.sleep(delay)
-            self.reconnect_delay = min(self.max_delay, self.reconnect_delay * 2)
-
-# === INDICATORS ===
-def calculate_rsi(prices: List[Decimal]) -> Decimal:
-    if len(prices) < RSI_PERIOD + 1:
-        return Decimal('50')
-    gains = [max(prices[i] - prices[i-1], ZERO) for i in range(1, len(prices))]
-    losses = [max(prices[i-1] - prices[i], ZERO) for i in range(1, len(prices))]
-    avg_gain = sum(gains[-RSI_PERIOD:]) / RSI_PERIOD
-    avg_loss = sum(losses[-RSI_PERIOD:]) / RSI_PERIOD
-    if avg_loss == 0:
-        return Decimal('100')
-    rs = avg_gain / avg_loss
-    return Decimal('100') - (Decimal('100') / (ONE + rs))
-
-def is_bullish_trend(candles: List[dict], period: int, min_pct=Decimal('0.0')) -> bool:
-    if len(candles) < period:
-        return False
-    start = candles[-period]['close']
-    end = candles[-1]['close']
-    if start <= 0:
-        return False
-    pct = (end - start) / start
-    return pct >= min_pct
-
-def fetch_klines(bot, symbol, interval, limit=500):
-    try:
-        raw = bot.client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        return [{'open': safe_decimal(r[1]), 'high': safe_decimal(r[2]), 'low': safe_decimal(r[3]), 'close': safe_decimal(r[4]), 'volume': safe_decimal(r[5])} for r in raw]
-    except Exception as e:
-        logger.warning(f"Klines failed {symbol} {interval}: {e}")
-        return []
-
-def has_valid_buy_signal(bot, symbol):
-    daily_candles = fetch_klines(bot, symbol, '1d', 30)
-    monthly_candles = fetch_klines(bot, symbol, '1M', 6)
-    if not daily_candles: return False
-    closes = [c['close'] for c in daily_candles[-RSI_PERIOD:]]
-    rsi = calculate_rsi(closes)
-    if rsi < RSI_BUY: return False
-    if not is_bullish_trend(daily_candles, 14): return False
-    if not is_bullish_trend(monthly_candles, 6): return False
-    return True
-
-def update_stochastic(symbol: str):
-    with kline_lock:
-        klines = [k for k in kline_data.get(symbol, []) if k['interval'] == '1m'][-STOCH_K:]
-    if len(klines) < STOCH_K: return
-    high = max(k['high'] for k in klines)
-    low = min(k['low'] for k in klines)
-    close = klines[-1]['close']
-    k = ((close - low) / (high - low)) * 100 if high != low else Decimal('50')
-    stochastic_data.setdefault(symbol, {'k_values': []})['k_values'].append(k)
-    k_values = stochastic_data[symbol]['k_values'][-STOCH_D:]
-    d = sum(k_values) / len(k_values) if k_values else Decimal('50')
-    stochastic_data[symbol].update({'%K': k, '%D': d})
-
-def update_volume_profiles():
-    global last_vp_update
-    now = time.time()
-    if now - last_vp_update < VP_UPDATE_INTERVAL: return
-    for symbol in list(active_grid_symbols.keys()):
-        with kline_lock:
-            klines = [k for k in kline_data.get(symbol, []) if k['interval'] == '1h'][-VP_LOOKBACK:]
-        if len(klines) < 12: continue
-        price_min = min(k['low'] for k in klines)
-        price_max = max(k['high'] for k in klines)
-        if price_max <= price_min: continue
-        bin_size = (price_max - price_min) / VP_BINS
-        if bin_size <= ZERO: continue
-        bins = {}
-        total_volume = ZERO
-        for k in klines:
-            bin_start = (k['low'] // bin_size) * bin_size
-            while bin_start < k['high']:
-                bins[bin_start] = bins.get(bin_start, ZERO) + k['volume']
-                total_volume += k['volume']
-                bin_start += bin_size
-        if total_volume <= ZERO: continue
-        vwap = sum(p * v for p, v in bins.items()) / total_volume
-        volume_profile[symbol] = {'vwap': vwap.quantize(bot.get_tick_size(symbol)), 'updated': now}
-    last_vp_update = now
-
-# === PME SCORERS ===
-def score_trend_strategy(symbol: str) -> Decimal:
-    with kline_lock:
-        closes = [k['close'] for k in kline_data.get(symbol, []) if k['interval'] == '1m'][-50:]
-    if len(closes) < 50: return ZERO
-    ema20 = sum(closes[-20:]) / 20
-    ema50 = sum(closes) / 50
-    trend_strength = abs(ema20 - ema50) / closes[-1]
-    return (trend_strength * 100).quantize(Decimal('0.01'))
-
-def score_mean_reversion_strategy(symbol: str) -> Decimal:
-    with kline_lock:
-        closes = [k['close'] for k in kline_data.get(symbol, []) if k['interval'] == '1m'][-20:]
-    if len(closes) < 20: return ZERO
-    rsi = calculate_rsi(closes)
-    if rsi < 30 or rsi > 70: return Decimal('2.0')
-    return Decimal('0.5')
-
-def score_volume_anchored_strategy(symbol: str) -> Decimal:
-    vp = volume_profile.get(symbol, {})
-    if 'vwap' not in vp: return ZERO
-    current = live_prices.get(symbol, ZERO)
-    if current <= ZERO: return ZERO
-    distance = abs(current - vp['vwap']) / current
-    return Decimal('2.0') if distance < Decimal('0.01') else Decimal('1.0') / (1 + distance * 10)
-
-# === PME ENGINE ===
-def profit_monitoring_engine():
-    global pme_last_run
-    while not SHUTDOWN_EVENT.is_set():
-        if time.time() - pme_last_run < PME_INTERVAL: 
-            time.sleep(5)
-            continue
-        pme_last_run = time.time()
-        for symbol in list(active_grid_symbols.keys()):
-            scores = {
-                'trend': score_trend_strategy(symbol),
-                'mean_reversion': score_mean_reversion_strategy(symbol),
-                'volume_anchored': score_volume_anchored_strategy(symbol)
-            }
-            best = max(scores, key=scores.get)
-            current = active_grid_symbols[symbol].get('strategy', 'volume_anchored')
-            if best != current and scores[best] > PME_MIN_SCORE_THRESHOLD:
-                logger.info(f"PME switch {symbol}: {current} -> {best}")
-                send_alert(f"{symbol} STRATEGY: {current.upper()} -> {best.upper()}", subject="PME")
-                g = active_grid_symbols[symbol]
-                for oid in g['buy_orders'] + g['sell_orders']:
-                    bot.cancel_order_safe(symbol, oid)
-                active_grid_symbols.pop(symbol)
-                regrid_symbol_with_strategy(bot, symbol, best)
-            strategy_scores[symbol] = scores
-        time.sleep(1)
-
-# === ORDER BOOK SCAN ===
-def get_top_buy_volume_symbols(bot, top_n=20):
-    try:
-        tickers = bot.client.get_ticker_24hr()
-        usdt_pairs = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT') and float(t['quoteVolume']) > 100000]
-        candidates = []
-        for sym in usdt_pairs:
-            price = safe_decimal(next((t['lastPrice'] for t in tickers if t['symbol'] == sym), 0))
-            if not 1 <= float(price) <= 1000: continue
-            book = bot.client.get_order_book(symbol=sym, limit=10)
-            buy_volume = sum(safe_decimal(b[0]) * safe_decimal(b[1]) for b in book['bids'])
-            candidates.append((sym, buy_volume))
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return [s[0] for s in candidates[:top_n]]
-    except Exception as e:
-        logger.error(f"Top buy volume scan failed: {e}")
-        return []
-
-# === UPDATE ACTIVE SYMBOLS ===
-def update_active_symbols(bot, portfolio_only):
-    candidates = list(valid_symbols_dict.keys()) if portfolio_only else get_top_buy_volume_symbols(bot)
-    for sym in candidates:
-        if sym in active_grid_symbols: continue
-        if not has_valid_buy_signal(bot, sym): continue
-        usdt_free = bot.get_balance()
-        max_alloc = usdt_free * MAX_PERCENT_PER_COIN
-        if max_alloc < MIN_USDT_TO_BUY: continue
-        regrid_symbol_with_strategy(bot, sym, 'trend')
-
-    for sym in list(active_grid_symbols.keys()):
-        closes = [k['close'] for k in kline_data.get(sym, []) if k['interval'] == '1m'][-RSI_PERIOD:]
-        rsi = calculate_rsi(closes)
-        if rsi < RSI_SELL:
-            logger.info(f"{sym} RSI < {RSI_SELL}, removing grid")
-            g = active_grid_symbols.pop(sym, None)
-            if g:
-                for oid in g['buy_orders'] + g['sell_orders']:
-                    bot.cancel_order_safe(sym, oid)
-
-# === BOT CLASS ===
+# === BOT CLASS ==============================================================
 class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET, tld='us')
+        self.rate_manager = RateManager(self.client)
         self.api_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.sync_positions_from_binance()
 
+    def sync_positions_from_binance(self):
+        try:
+            with self.api_lock:
+                self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+                acct = self.client.get_account()
+            with DBManager() as sess:
+                sess.query(Position).delete()
+                for b in acct['balances']:
+                    asset = b['asset']
+                    qty = to_decimal(b['free'])
+                    if qty <= 0 or asset in {'USDT', 'USDC'}: continue
+                    sym = f"{asset}USDT"
+                    price = self.get_price_usdt(asset)
+                    if price <= ZERO: continue
+                    maker, _ = self.get_trade_fees(sym)
+                    sess.add(Position(symbol=sym, quantity=qty, avg_entry_price=price, buy_fee_rate=to_decimal(maker)))
+                sess.commit()
+        except Exception as e:
+            logger.error(f"Sync failed: {e}")
+
+    @retry_custom
+    def get_price_usdt(self, asset: str) -> Decimal:
+        if asset == 'USDT': return Decimal('1')
+        sym = asset + 'USDT'
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            ticker = self.client.get_symbol_ticker(symbol=sym)
+        return to_decimal(ticker['price'])
+
+    @retry_custom
+    def get_trade_fees(self, symbol):
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            fee = self.client.get_trade_fee(symbol=symbol)
+        return safe_float(fee[0]['makerCommission']), safe_float(fee[0]['takerCommission'])
+
+    @retry_custom
+    def get_order_book_analysis(self, symbol: str, force_refresh=False) -> dict:
+        now = time.time()
+        with self.state_lock:
+            if not force_refresh and symbol in order_book_cache and now - order_book_cache[symbol].get('ts', 0) < 900:
+                return order_book_cache[symbol]
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            depth = self.client.get_order_book(symbol=symbol, limit=50)
+        bids = depth.get('bids', [])[:50]
+        asks = depth.get('asks', [])[:50]
+        result = {
+            'best_bid': Decimal(bids[0][0]) if bids else ZERO,
+            'best_ask': Decimal(asks[0][0]) if asks else ZERO,
+            'raw_bids': [(Decimal(p), Decimal(q)) for p, q in bids],
+            'raw_asks': [(Decimal(p), Decimal(q)) for p, q in asks],
+            'ts': now
+        }
+        with self.state_lock:
+            order_book_cache[symbol] = result
+            last_ob_fetch[symbol] = now
+        return result
+
+    @retry_custom
     def get_tick_size(self, symbol):
-        return symbol_info_cache.get(symbol, {}).get('tickSize', Decimal('0.00000001'))
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            info = self.client.get_symbol_info(symbol)
+        for f in info['filters']:
+            if f['filterType'] == 'PRICE_FILTER':
+                return Decimal(f['tickSize'])
+        return Decimal('0.00000001')
 
-    def get_lot_step(self, symbol):
-        return symbol_info_cache.get(symbol, {}).get('stepSize', Decimal('0.00000001'))
+    @retry_custom
+    def get_atr(self, symbol) -> float:
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            klines = self.client.get_klines(symbol=symbol, interval='1m', limit=15)
+        highs = np.array([safe_float(k[2]) for k in klines])
+        lows = np.array([safe_float(k[3]) for k in klines])
+        closes = np.array([safe_float(k[4]) for k in klines])
+        atr = talib.ATR(highs, lows, closes, timeperiod=14)[-1]
+        return safe_float(atr)
 
     def get_balance(self) -> Decimal:
-        with balance_lock:
-            return balances.get('USDT', ZERO)
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            acct = self.client.get_account()
+        for b in acct['balances']:
+            if b['asset'] == 'USDT':
+                return to_decimal(b['free'])
+        return ZERO
 
     def get_asset_balance(self, asset: str) -> Decimal:
-        with balance_lock:
-            return balances.get(asset, ZERO)
+        with self.api_lock:
+            self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+            acct = self.client.get_account()
+        for b in acct['balances']:
+            if b['asset'] == asset:
+                return to_decimal(b['free'])
+        return ZERO
 
-    def place_limit_buy_with_tracking(self, symbol, price: Decimal, qty: Decimal):
+    def place_limit_buy_with_tracking(self, symbol, price: str, qty: float):
         try:
-            order = self.client.order_limit_buy(symbol=symbol, quantity=str(qty), price=str(price))
-            with SafeDBManager() as sess:
-                if sess:
-                    sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='BUY', price=price, quantity=qty))
+            with self.api_lock:
+                self.rate_manager.wait_if_needed('ORDERS')
+                order = self.client.order_limit_buy(symbol=symbol, quantity=qty, price=price)
+            with DBManager() as sess:
+                sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='buy',
+                                      price=to_decimal(price), quantity=to_decimal(qty)))
             return order
         except Exception as e:
-            logger.warning(f"Buy failed {symbol}: {e}")
+            logger.error(f"Buy failed: {e}")
             return None
 
-    def place_limit_sell_with_tracking(self, symbol, price: Decimal, qty: Decimal):
+    def place_limit_sell_with_tracking(self, symbol, price: str, qty: float):
         try:
-            order = self.client.order_limit_sell(symbol=symbol, quantity=str(qty), price=str(price))
-            with SafeDBManager() as sess:
-                if sess:
-                    sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='SELL', price=price, quantity=qty))
+            with self.api_lock:
+                self.rate_manager.wait_if_needed('ORDERS')
+                order = self.client.order_limit_sell(symbol=symbol, quantity=qty, price=price)
+            with DBManager() as sess:
+                sess.add(PendingOrder(binance_order_id=str(order['orderId']), symbol=symbol, side='sell',
+                                      price=to_decimal(price), quantity=to_decimal(qty)))
             return order
         except Exception as e:
-            logger.warning(f"Sell failed {symbol}: {e}")
+            logger.error(f"Sell failed: {e}")
             return None
 
     def cancel_order_safe(self, symbol, order_id):
         try:
-            self.client.cancel_order(symbol=symbol, orderId=order_id)
+            with self.api_lock:
+                self.rate_manager.wait_if_needed('ORDERS')
+                self.client.cancel_order(symbol=symbol, orderId=order_id)
         except:
             pass
 
-# === WEBSOCKET HANDLERS ===
-def on_market_message(ws, message):
-    try:
-        data = json.loads(message)
-        stream = data.get('stream', '')
-        payload = data.get('data', {})
-        if not payload or not stream:
-            return
-        symbol = stream.split('@')[0].upper()
+    def check_and_process_filled_orders(self):
+        with DBManager() as sess:
+            for po in sess.query(PendingOrder).all():
+                try:
+                    with self.api_lock:
+                        self.rate_manager.wait_if_needed('REQUEST_WEIGHT')
+                        o = self.client.get_order(symbol=po.symbol, orderId=int(po.binance_order_id))
+                    if o['status'] == 'FILLED':
+                        sess.delete(po)
+                        send_whatsapp_alert(f"{po.side.upper()} {po.symbol} @ {o['price']}")
+                except:
+                    pass
 
-        if stream.endswith('@ticker'):
-            price = safe_decimal(payload.get('c', '0'))
-            if price > ZERO:
-                with price_lock:
-                    live_prices[symbol] = price
-            with stats_lock:
-                ticker_24h_stats[symbol] = {
-                    'h': payload.get('h', '0'),
-                    'l': payload.get('l', '0'),
-                    'P': payload.get('P', '0'),
-                    'v': payload.get('q', '0')
-                }
-            pct_change = safe_decimal(payload.get('P', '0')) / 100
-            bias = pct_change / Decimal('0.03') if abs(pct_change) >= Decimal('0.005') else ZERO
-            trend_bias[symbol] = max(min(bias, ONE), -ONE)
-
-        elif stream.endswith('@kline_1m'):
-            k = payload.get('k', {})
-            if not k.get('x'): return
-            entry = {'close': safe_decimal(k.get('c')), 'high': safe_decimal(k.get('h')), 'low': safe_decimal(k.get('l')), 'interval': '1m'}
-            with kline_lock:
-                kline_data.setdefault(symbol, []).append(entry)
-                if len(kline_data[symbol]) > 200:
-                    kline_data[symbol] = kline_data[symbol][-200:]
-            update_stochastic(symbol)
-
-        elif stream.endswith('@kline_1h'):
-            k = payload.get('k', {})
-            if not k.get('x'): return
-            entry = {'close': safe_decimal(k.get('c')), 'high': safe_decimal(k.get('h')), 'low': safe_decimal(k.get('l')), 'volume': safe_decimal(k.get('v')), 'interval': '1h'}
-            with kline_lock:
-                kline_data.setdefault(symbol, []).append(entry)
-                if len(kline_data[symbol]) > VP_LOOKBACK + 10:
-                    kline_data[symbol] = kline_data[symbol][-(VP_LOOKBACK + 10):]
-            update_volume_profiles()
-
-    except Exception:
-        pass
-
-def on_user_message(ws, message):
-    try:
-        data = json.loads(message)
-        e = data.get('e')
-        if e == 'executionReport':
-            order_id = str(data.get('i'))
-            symbol = data.get('s')
-            side = data.get('S')
-            status = data.get('X')
-            price = safe_decimal(data.get('p', '0'))
-            qty = safe_decimal(data.get('q', '0'))
-            fee = safe_decimal(data.get('n', '0')) or ZERO
-
-            if status == 'FILLED' and order_id:
-                with SafeDBManager() as sess:
-                    if sess:
-                        po = sess.query(PendingOrder).filter_by(binance_order_id=order_id).first()
-                        if po:
-                            sess.delete(po)
-                        sess.add(TradeRecord(symbol=symbol, side=side, price=price, quantity=qty, fee=fee))
-
-                send_alert(f"{side} {symbol} @ ${float(price):.4f} | {float(qty):.6f}", subject="FILL")
-
-                if side == 'SELL':
-                    with SafeDBManager() as sess:
-                        if sess:
-                            pos = sess.query(Position).filter_by(symbol=symbol).first()
-                            if pos:
-                                entry = safe_decimal(pos.avg_entry_price)
-                                pnl = (price - entry) * qty - fee
-                                with realized_lock:
-                                    realized_pnl_per_symbol[symbol] = realized_pnl_per_symbol.get(symbol, ZERO) + pnl
-                                    global total_realized_pnl, peak_pnl
-                                    total_realized_pnl += pnl
-                                    peak_pnl = max(peak_pnl, total_realized_pnl)
-    except Exception as e:
-        logger.debug(f"User WS: {e}")
-
-# === SYMBOL LOADER ===
-def load_portfolio_symbols(bot):
-    global valid_symbols_dict, symbol_info_cache
-    valid_symbols_dict.clear()
-    symbol_info_cache.clear()
-    try:
-        acct = bot.client.get_account()
-        with balance_lock:
-            for b in acct['balances']:
-                asset = b['asset']
-                free = safe_decimal(b['free'])
-                if free > ZERO:
-                    balances[asset] = free
-        for b in acct['balances']:
-            asset = b['asset']
-            qty = safe_decimal(b['free'])
-            if qty <= ZERO or asset in {'USDT', 'USDC'}: continue
-            sym = f"{asset}USDT"
-            try:
-                info = bot.client.get_symbol_info(sym)
-                if not info or info['status'] != 'TRADING': continue
-                valid_symbols_dict[sym] = {}
-                tick = step = Decimal('0.00000001')
-                for f in info['filters']:
-                    if f['filterType'] == 'PRICE_FILTER':
-                        tick = safe_decimal(f['tickSize'])
-                    if f['filterType'] == 'LOT_SIZE':
-                        step = safe_decimal(f['stepSize'])
-                symbol_info_cache[sym] = {'tickSize': tick, 'stepSize': step}
-            except: continue
-        logger.info(f"Loaded {len(valid_symbols_dict)} symbols")
-    except Exception as e:
-        logger.error(f"Load symbols failed: {e}")
-
-# === WEBSOCKET STARTERS ===
-def start_market_websocket():
-    symbols = [s.lower() for s in valid_symbols_dict]
-    if not symbols: return
-    streams = [f"{s}@ticker" for s in symbols] + [f"{s}@kline_1m" for s in symbols] + [f"{s}@kline_1h" for s in symbols]
-    chunks = [streams[i:i+MAX_STREAMS_PER_CONNECTION] for i in range(0, len(streams), MAX_STREAMS_PER_CONNECTION)]
-    for chunk in chunks:
-        url = WS_BASE + '/'.join(chunk)
-        ws = HeartbeatWebSocket(url, on_message_cb=on_market_message)
-        ws_instances.append(ws)
-        threading.Thread(target=ws.run_forever, daemon=True).start()
-        time.sleep(0.5)
-
-def start_user_stream():
-    global user_ws, listen_key
-    try:
-        listen_key = bot.client.stream_get_listen_key()
-        url = f"{USER_STREAM_BASE}{listen_key}"
-        user_ws = HeartbeatWebSocket(url, on_message_cb=on_user_message, is_user_stream=True)
-        threading.Thread(target=user_ws.run_forever, daemon=True).start()
-        logger.info("User stream started")
-    except Exception as e:
-        logger.error(f"User stream failed: {e}")
-
-def keepalive_user_stream():
-    while not SHUTDOWN_EVENT.is_set():
-        time.sleep(KEEPALIVE_INTERVAL)
-        try:
-            with listen_key_lock:
-                if listen_key and bot:
-                    bot.client.stream_keepalive(listen_key)
-        except: pass
-
-
-# === GRID & STRATEGY ===
-def regrid_symbol_with_strategy(bot, symbol, strategy='volume_anchored'):
-    if symbol not in valid_symbols_dict: return
-    price = live_prices.get(symbol, ZERO)
-    if price <= ZERO: return
-
-    final_bias = trend_bias.get(symbol, ZERO)
-    base_interval = DEFAULT_GRID_INTERVAL_PCT
-
-    if strategy == 'trend':
-        base_interval *= Decimal('1.5')
-        center = price * (ONE + final_bias * Decimal('0.03'))
-    elif strategy == 'mean_reversion':
-        base_interval = Decimal('0.005')
-        center = price
-    else:
-        vp = volume_profile.get(symbol, {})
-        center = vp.get('vwap', price)
-        center = center * (ONE + final_bias * base_interval)
-
-    total_usdt = bot.get_balance()
-    dynamic_reserve = total_usdt * RESERVE_FRACTION
-    if total_usdt < dynamic_reserve + MIN_USDT_TO_BUY:
+# === FIRST RUN: BUY FROM ORDER BOOK LADDER ==================================
+def first_run_entry_from_ladder(bot):
+    global first_run_executed
+    if first_run_executed:
+        return
+    usdt_free = bot.get_balance()
+    if usdt_free < ENTRY_MIN_USDT:
+        logger.info("Insufficient USDT for entry. Skipping.")
+        first_run_executed = True
         return
 
-    usdt_free = total_usdt - dynamic_reserve
-    max_alloc = usdt_free * MAX_PERCENT_PER_COIN
-    if max_alloc < MIN_USDT_TO_BUY:
+    candidates = []
+    with DBManager() as sess:
+        owned = {p.symbol for p in sess.query(Position).all()}
+
+    for sym in valid_symbols_dict:
+        if sym in owned:
+            continue
+        ob = bot.get_order_book_analysis(sym, force_refresh=True)
+        price = float(ob['best_ask'])
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            continue
+        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
+            continue
+        bid_vol = sum(float(q) for _, q in ob['raw_bids'][:5])
+        ask_vol = sum(float(q) for _, q in ob['raw_asks'][:5])
+        imbalance = bid_vol / (ask_vol or 1)
+        if imbalance >= 1.5:
+            candidates.append((sym, imbalance, price))
+
+    if not candidates:
+        logger.info("No strong entry signals. Skipping first run buys.")
+        first_run_executed = True
         return
 
-    grid_size = min(DEFAULT_GRID_SIZE_USDT, max_alloc)
-    max_grids = int(usdt_free // grid_size)
-    if max_grids < 2: return
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    to_buy = candidates[:3]
+    per_coin = (usdt_free - MIN_BUFFER_USDT) / len(to_buy)
 
-    buy_grids = sell_grids = max_grids // 2
-    step = bot.get_lot_step(symbol)
-    tick = bot.get_tick_size(symbol)
-    qty = (grid_size / price) // step * step
-    if qty <= ZERO: return
-
-    old = active_grid_symbols.get(symbol, {})
-    for oid in old.get('buy_orders', []) + old.get('sell_orders', []):
-        bot.cancel_order_safe(symbol, oid)
-    active_grid_symbols.pop(symbol, None)
-
-    new_grid = {
-        'center': center, 'qty': qty, 'size': grid_size,
-        'buy_orders': [], 'sell_orders': [], 'strategy': strategy
-    }
-
-    for i in range(1, buy_grids + 1):
-        p = (center * (ONE - base_interval * i)).quantize(tick)
-        if p < price * Decimal('0.98'):
-            order = bot.place_limit_buy_with_tracking(symbol, p, qty)
+    for sym, imb, price in to_buy:
+        if per_coin < ENTRY_MIN_USDT:
+            break
+        qty = (per_coin * (1 - ENTRY_BUY_PCT_BELOW_ASK)) / price
+        info = bot.client.get_symbol_info(sym)
+        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        step = Decimal(lot['stepSize'])
+        qty = (to_decimal(qty) // step) * step
+        if qty <= 0: continue
+        buy_price = to_decimal(price * (1 - ENTRY_BUY_PCT_BELOW_ASK))
+        tick = bot.get_tick_size(sym)
+        buy_price = (buy_price // tick) * tick
+        if buy_notional_ok(buy_price, qty):
+            order = bot.place_limit_buy_with_tracking(sym, str(buy_price), float(qty))
             if order:
-                new_grid['buy_orders'].append(str(order['orderId']))
+                logger.info(f"ENTRY BUY: {sym} | ${float(buy_price):.6f} | Qty: {float(qty):.6f}")
+                send_whatsapp_alert(f"ENTRY {sym} @ {buy_price:.6f}")
 
-    base_asset = symbol.replace('USDT', '')
-    asset_free = bot.get_asset_balance(base_asset)
-    for i in range(1, sell_grids + 1):
-        p = (center * (ONE + base_interval * i)).quantize(tick)
-        if p > price * Decimal('1.02') and asset_free >= qty:
-            if meets_min_notional(symbol, p, qty):
-                order = bot.place_limit_sell_with_tracking(symbol, p, qty)
+    first_run_executed = True
+
+# === INFINITY GRID CORE =====================================================
+def calculate_optimal_grids(bot) -> Dict[str, Tuple[int, int]]:
+    usdt_free = bot.get_balance() - MIN_BUFFER_USDT
+    if usdt_free <= 0: return {}
+    with DBManager() as sess:
+        owned = sess.query(Position).all()
+    if not owned: return {}
+
+    scores = []
+    for pos in owned:
+        sym = pos.symbol
+        ob = bot.get_order_book_analysis(sym)
+        cur_price = (ob['best_bid'] + ob['best_ask']) / 2
+        if cur_price <= 0: continue
+        entry = Decimal(str(pos.avg_entry_price))
+        qty = Decimal(str(pos.quantity))
+        unrealized_pnl = (cur_price - entry) * qty
+        atr = bot.get_atr(sym)
+        volatility_score = atr / float(cur_price) if atr > 0 else 0
+        volume = valid_symbols_dict.get(sym, {}).get('volume', 0)
+        volume_score = min(volume / 1e6, 5.0)
+        pnl_score = max(float(unrealized_pnl) / 10.0, -2.0)
+        total_score = volatility_score * 2.0 + volume_score + max(pnl_score, 0)
+        scores.append((sym, total_score, float(qty), float(cur_price)))
+
+    if not scores: return {}
+    total_score = sum(s[1] for s in scores) or 1
+    allocations = {s[0]: (s[1] / total_score) * float(usdt_free) for s in scores}
+
+    result = {}
+    for sym, alloc in allocations.items():
+        max_possible = int(alloc // float(GRID_SIZE_USDT))
+        levels = min(MAX_GRIDS_PER_SIDE, max(MIN_GRIDS_FALLBACK, max_possible // 2))
+        levels = max(MIN_GRIDS_PER_SIDE if alloc >= 40 else MIN_GRIDS_FALLBACK, levels)
+        result[sym] = (levels, levels)
+    return result
+
+def rebalance_infinity_grid(bot, symbol):
+    ob = bot.get_order_book_analysis(symbol, force_refresh=True)
+    current_price = (ob['best_bid'] + ob['best_ask']) / 2
+    if current_price <= 0: return
+
+    grid = active_grid_symbols.get(symbol, {})
+    old_center = Decimal(str(grid.get('center', current_price)))
+    price_move = abs(current_price - old_center) / old_center if old_center > 0 else 1
+
+    if symbol not in active_grid_symbols or price_move >= REBALANCE_THRESHOLD_PCT:
+        for oid in grid.get('buy_orders', []) + grid.get('sell_orders', []):
+            bot.cancel_order_safe(symbol, oid)
+        active_grid_symbols.pop(symbol, None)
+
+        buy_levels, sell_levels = calculate_optimal_grids(bot).get(symbol, (0, 0))
+        if buy_levels == 0: return
+
+        info = bot.client.get_symbol_info(symbol)
+        lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        step = Decimal(lot['stepSize'])
+        qty_per_grid = (GRID_SIZE_USDT / current_price) // step * step
+        if qty_per_grid <= 0: return
+
+        new_grid = {
+            'center': current_price,
+            'qty': float(qty_per_grid),
+            'buy_orders': [],
+            'sell_orders': [],
+            'last_price': float(current_price),
+            'placed_at': time.time()
+        }
+        tick = bot.get_tick_size(symbol)
+
+        # Buy below
+        for i in range(1, buy_levels + 1):
+            price = (current_price * (1 - GRID_INTERVAL_PCT * i) // tick) * tick
+            if buy_notional_ok(price, qty_per_grid):
+                order = bot.place_limit_buy_with_tracking(symbol, str(price), float(qty_per_grid))
+                if order:
+                    new_grid['buy_orders'].append(str(order['orderId']))
+
+        # Sell above
+        base_asset = symbol.replace('USDT', '')
+        free = bot.get_asset_balance(base_asset)
+        for i in range(1, sell_levels + 1):
+            price = (current_price * (1 + GRID_INTERVAL_PCT * i) // tick) * tick
+            if free >= qty_per_grid and sell_notional_ok(price, qty_per_grid):
+                order = bot.place_limit_sell_with_tracking(symbol, str(price), float(qty_per_grid))
                 if order:
                     new_grid['sell_orders'].append(str(order['orderId']))
-                    asset_free -= qty
+                free -= qty_per_grid
 
-    if new_grid['buy_orders'] or new_grid['sell_orders']:
-        active_grid_symbols[symbol] = new_grid
-        color = STRATEGY_COLORS.get(strategy, GREEN)
-        label = STRATEGY_LABELS.get(strategy, strategy.upper())
-        send_alert(f"{symbol} | ${float(grid_size):.1f} | {len(new_grid['buy_orders'])}B/{len(new_grid['sell_orders'])}S | {color}{label}{RESET}", subject="GRID")
+        if new_grid['buy_orders'] or new_grid['sell_orders']:
+            active_grid_symbols[symbol] = new_grid
+            logger.info(f"GRID: {symbol} | Center: ${float(current_price):.6f} | {buy_levels}B/{sell_levels}S")
 
-# === UPDATE ACTIVE SYMBOLS ===
-def update_active_symbols(bot, portfolio_only):
-    total_usdt = bot.get_balance()
-    dynamic_reserve = total_usdt * RESERVE_FRACTION
-    usdt_free = total_usdt - dynamic_reserve
+# === HELPERS ================================================================
+def send_whatsapp_alert(msg: str):
+    if CALLMEBOT_API_KEY and CALLMEBOT_PHONE:
+        try:
+            requests.get(f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(msg)}&apikey={CALLMEBOT_API_KEY}", timeout=5)
+        except:
+            pass
 
-    candidates = list(valid_symbols_dict.keys()) if portfolio_only else get_top_buy_volume_symbols(bot)
-    for sym in candidates:
-        if sym in active_grid_symbols: continue
-        if not has_valid_buy_signal(bot, sym): continue
-        max_alloc = usdt_free * MAX_PERCENT_PER_COIN
-        if max_alloc < MIN_USDT_TO_BUY: continue
-        regrid_symbol_with_strategy(bot, sym, 'trend')
+def now_cst():
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    for sym in list(active_grid_symbols.keys()):
-        closes = [k['close'] for k in kline_data.get(sym, []) if k['interval'] == '1m'][-RSI_PERIOD:]
-        rsi = calculate_rsi(closes)
-        if rsi < RSI_SELL:
-            logger.info(f"{sym} RSI < {RSI_SELL}, removing grid")
-            g = active_grid_symbols.pop(sym, None)
-            if g:
-                for oid in g['buy_orders'] + g['sell_orders']:
-                    bot.cancel_order_safe(sym, oid)
+def cancel_all_grids(bot):
+    for sym, state in list(active_grid_symbols.items()):
+        for oid in state.get('buy_orders', []) + state.get('sell_orders', []):
+            bot.cancel_order_safe(sym, oid)
+    active_grid_symbols.clear()
 
-# === DASHBOARD ===
+# === DASHBOARD ==============================================================
 def print_dashboard(bot):
-    try:
-        os.system('cls' if os.name == 'nt' else 'clear')
-        total_usdt = bot.get_balance()
-        reserve = total_usdt * RESERVE_FRACTION
-        line = "=" * 120
-        print(f"{YELLOW}{line}{RESET}")
-        print(pad_field(f"{GREEN}INFINITY GRID BOT v7.2{RESET} | November 11, 2025 11:49 AM CST – US | WS: {'ON' if ws_connected else 'OFF'}", 120))
-        print(f"{YELLOW}{line}{RESET}")
-        print(pad_field(f"USDT: ${float(total_usdt):,.2f} | RESERVED: ${float(reserve):,.2f} | GRIDS: {len(active_grid_symbols)} | PNL: ${float(total_realized_pnl):+.2f}", 120))
-        if active_grid_symbols:
-            print(f"\n{YELLOW}ACTIVE GRIDS{RESET}")
-            print(pad_field(f"{'SYM':<12} {'PRICE':>10} {'B/S':>6} {'STRATEGY':<12}", 120))
-            for sym, g in active_grid_symbols.items():
-                p = live_prices.get(sym, ZERO)
-                strat = g.get('strategy', 'unknown')
-                color = STRATEGY_COLORS.get(strat, GREEN)
-                label = STRATEGY_LABELS.get(strat, strat.upper())
-                print(pad_field(f"{sym:<12} {float(p):>10.4f} {len(g['buy_orders'])}/{len(g['sell_orders']):>2} {color}{label}{RESET}", 120))
-        print(f"{YELLOW}{line}{RESET}")
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
+    global first_dashboard_run
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("=" * 120)
+    print(f"{'INFINITY GRID BOT – AUTO ENTRY + 24/7 GRID':^120}")
+    print("=" * 120)
+    print(f"Time: {now_cst()} | USDT: ${float(bot.get_balance()):,.2f}")
+    with DBManager() as sess:
+        print(f"Positions: {sess.query(Position).count()} | Active Grids: {len(active_grid_symbols)}")
 
+    print("\nTOP 3 BUY PRESSURE (FOR ENTRY)")
+    candidates = []
+    for sym in valid_symbols_dict:
+        ob = bot.get_order_book_analysis(sym)
+        if float(ob['best_ask']) < MIN_PRICE or float(ob['best_ask']) > MAX_PRICE:
+            continue
+        bid_vol = sum(float(q) for _, q in ob['raw_bids'][:5])
+        ask_vol = sum(float(q) for _, q in ob['raw_asks'][:5])
+        imbalance = bid_vol / (ask_vol or 1)
+        if imbalance >= 1.3:
+            candidates.append((sym.replace('USDT',''), imbalance, float(ob['best_ask'])))
+    for coin, imb, price in sorted(candidates, key=lambda x: x[1], reverse=True)[:3]:
+        print(f" {coin:>8} | {imb:>4.1f}x | Ask: ${price:,.6f}")
+        if first_dashboard_run:
+            ob = bot.get_order_book_analysis(f"{coin}USDT", force_refresh=True)
+            print("  BIDS           | ASKS")
+            for i in range(5):
+                bp = float(ob['raw_bids'][i][0]) if i < len(ob['raw_bids']) else 0
+                bq = float(ob['raw_bids'][i][1]) if i < len(ob['raw_bids']) else 0
+                ap = float(ob['raw_asks'][i][0]) if i < len(ob['raw_asks']) else 0
+                aq = float(ob['raw_asks'][i][1]) if i < len(ob['raw_asks']) else 0
+                print(f"  {bp:>10.6f}x{bq:>6.1f} | {ap:<10.6f}x{aq:<6.1f}")
+    if first_dashboard_run:
+        print("\nFull ladder shown once.")
+        first_dashboard_run = False
 
-# === STOP LOSS ===
-def check_stop_loss():
-    with realized_lock:
-        drawdown = (total_realized_pnl - peak_pnl) / peak_pnl if peak_pnl > ZERO else ZERO
-        if drawdown <= STOP_LOSS_PCT:
-            send_alert(f"STOP-LOSS: {float(drawdown*100):.2f}%", subject="EMERGENCY")
-            return True
-    return False
+    print("\nGRID STATUS")
+    with DBManager() as sess:
+        for pos in sess.query(Position).all():
+            sym = pos.symbol
+            grid = active_grid_symbols.get(sym, {})
+            center = grid.get('center', 0)
+            b = len(grid.get('buy_orders', []))
+            s = len(grid.get('sell_orders', []))
+            print(f"{sym:<10} | Center: ${float(center):>10.6f} | Grid: {b}B/{s}S")
+    print("=" * 120)
 
-# === INITIAL SYNC ===
-def initial_sync_from_rest(bot):
-    load_portfolio_symbols(bot)
-    with SafeDBManager() as sess:
-        if sess:
-            sess.query(Position).delete()
-            for sym in valid_symbols_dict:
-                base = sym.replace('USDT', '')
-                qty = bot.get_asset_balance(base)
-                if qty > ZERO:
-                    price = live_prices.get(sym, ZERO)
-                    if price <= ZERO:
-                        try:
-                            price = safe_decimal(bot.client.get_symbol_ticker(symbol=sym)['price'])
-                        except: price = ZERO
-                    if price > ZERO:
-                        sess.add(Position(symbol=sym, quantity=qty, avg_entry_price=price))
-
-# === MAIN ===
+# === MAIN ===================================================================
 def main():
-    global bot
     bot = BinanceTradingBot()
-
-    print("=== INFINITY GRID BOT v7.2 ===")
-    print("Would you like to:")
-    print("1) Use coins in your portfolio for infinity grid")
-    print("2) Buy coins from top 20 by buying bid volume")
-    choice = input("Enter 1 or 2: ").strip()
-    portfolio_only = choice == '1'
-
-    load_portfolio_symbols(bot)
-    if not valid_symbols_dict and portfolio_only:
-        logger.critical("No portfolio symbols.")
-        sys.exit(1)
-
-    start_market_websocket()
-    start_user_stream()
-    threading.Thread(target=keepalive_user_stream, daemon=True).start()
-
+    global valid_symbols_dict
     try:
-        initial_sync_from_rest(bot)
-    except Exception as e:
-        logger.critical(f"Sync failed: {e}")
-        sys.exit(1)
+        info = bot.client.get_exchange_info()
+        for s in info['symbols']:
+            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING':
+                valid_symbols_dict[s['symbol']] = {'volume': 1e6}
+    except: pass
 
-    send_alert("Bot started – WebSockets ON", subject="ONLINE")
-
-    threading.Thread(target=profit_monitoring_engine, daemon=True).start()
-
-    last_regrid = 0
+    last_update = 0
     last_dashboard = 0
-    last_symbol_update = 0
-    while not SHUTDOWN_EVENT.is_set():
-        now = time.time()
-        if now - last_symbol_update >= 300:
-            update_active_symbols(bot, portfolio_only)
-            last_symbol_update = now
-        if check_stop_loss():
-            logger.critical("Stop-loss triggered")
-            SHUTDOWN_EVENT.set()
-        if now - last_regrid >= REGRID_INTERVAL:
-            for sym in list(active_grid_symbols.keys()):
-                regrid_symbol_with_strategy(bot, sym, active_grid_symbols[sym]['strategy'])
-            last_regrid = now
-        if now - last_dashboard >= DASHBOARD_REFRESH:
-            print_dashboard(bot)
-            last_dashboard = now
-        time.sleep(1)
 
-    for ws in ws_instances + ([user_ws] if user_ws else []):
-        ws.close()
-    logger.info("Bot stopped.")
+    while True:
+        try:
+            bot.check_and_process_filled_orders()
+            now = time.time()
+
+            # First run: buy from ladder
+            with DBManager() as sess:
+                if sess.query(Position).count() == 0 and not first_run_executed:
+                    first_run_entry_from_ladder(bot)
+
+            if now - last_update >= POLL_INTERVAL:
+                with DBManager() as sess:
+                    for pos in sess.query(Position).all():
+                        if pos.symbol in valid_symbols_dict:
+                            rebalance_infinity_grid(bot, pos.symbol)
+                last_update = now
+
+            if now - last_dashboard >= 60:
+                print_dashboard(bot)
+                last_dashboard = now
+
+            time.sleep(1)
+        except KeyboardInterrupt:
+            cancel_all_grids(bot)
+            print("\nBot stopped.")
+            break
+        except Exception as e:
+            logger.critical(f"Error: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda s, f: SHUTDOWN_EVENT.set())
-    signal.signal(signal.SIGTERM, lambda s, f: SHUTDOWN_EVENT.set())
     main()
