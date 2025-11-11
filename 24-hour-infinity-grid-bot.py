@@ -720,9 +720,11 @@ def initial_sync_from_rest(bot: BinanceTradingBot):
         logger.error(f"Initial sync failed: {e}")
         raise
 
+
 # === MAIN ===================================================================
 def main():
     global rest_client, valid_symbols_dict, symbol_info_cache, bot
+    global last_reported_pnl, last_recycle_pnl, total_realized_pnl  # ← FIXED: Added this line
 
     rest_client = Client(API_KEY, API_SECRET, tld='us')
     try:
@@ -765,6 +767,8 @@ def main():
     last_regrid = 0
     last_dashboard = 0
     last_pnl_check = 0
+    last_reported_pnl = total_realized_pnl  # ← FIXED: Initialize it here
+    last_recycle_pnl = total_realized_pnl  # ← Also initialize recycle tracker
 
     while not SHUTDOWN_EVENT.is_set():
         try:
@@ -773,11 +777,17 @@ def main():
             if now - last_pnl_check > 60:
                 with realized_lock:
                     if total_realized_pnl - last_reported_pnl > PNL_REGRID_THRESHOLD:
+                        logger.info(f"PROFIT ${float(total_realized_pnl - last_reported_pnl):.2f} → Regridding all")
                         for sym in list(active_grid_symbols.keys()):
                             if is_eligible_coin(sym):
                                 regrid_symbol_with_strategy(bot, sym, 'volume_anchored')
                         last_reported_pnl = total_realized_pnl
                 last_pnl_check = now
+
+            with realized_lock:
+                if total_realized_pnl - last_recycle_pnl > Decimal('50'):
+                    logger.info(f"RECYCLING ${float(total_realized_pnl - last_recycle_pnl):.2f} profit")
+                    last_recycle_pnl = total_realized_pnl
 
             if now - last_regrid >= REGRID_INTERVAL:
                 with SafeDBManager() as sess:
