@@ -519,7 +519,7 @@ def import_portfolio_symbols() -> List[str]:
     return portfolio_symbols
 
 def update_top_bid_symbols(all_symbols: List[str], target_grid_count: int):
-    if target_grid_count < ) or target_grid_count > 50:
+    if target_grid_count < 1 or target_grid_count > 50:
         return
     global top_bid_symbols, gridded_symbols, last_regrid_time, last_regrid_str
     try:
