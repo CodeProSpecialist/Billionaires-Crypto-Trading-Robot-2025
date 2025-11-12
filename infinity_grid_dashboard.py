@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID BOT — LIVE TRADING ON BINANCE.US
-- IMPORTS CURRENT PORTFOLIO (owned coins/USDT)
-- PRIORITY: First grids owned symbols, then top 11 by volume
-- Real limit orders ($15/level)
-- Starts in 2 seconds
-- Full balance + order logging
-- Streamlit dashboard
-- FORCE_LIVE_ORDERS = "YES"
-- BINANCE.US MAINNET
+- P&L Tracking (Realized + Unrealized)
+- Grid Levels Slider (1–5)
+- NUMBER_OF_SYMBOLS_TO_GRID Slider (1–50)
+- Portfolio Import + Priority
+- CALLMEBOT WhatsApp Alerts (grid updates)
+- $20/level, no PRICE_FILTER
+- Real-time Streamlit Dashboard
 """
 
 import os
 import sys
 import time
 import threading
+import requests
 from decimal import Decimal, ROUND_DOWN, getcontext
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -37,41 +37,41 @@ CST = pytz.timezone('America/Chicago')
 # CONFIG (LIVE - BINANCE.US)
 # ---------------------------
 USE_PAPER_TRADING = False
-FORCE_LIVE_ORDERS = "YES"          # HARD-CODED
-BINANCE_TESTNET = False            # HARD-CODED: MAINNET
-NUMBER_OF_SYMBOLS_TO_GRID = 11     # ONLY TOP 11 (after portfolio)
+FORCE_LIVE_ORDERS = "YES"
+BINANCE_TESTNET = False
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
+CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')  # e.g., '+1234567890'
+CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')  # From bot activation
 
-GRID_SIZE_USDT = Decimal('15.0')   # $15 per level (passes min notional)
+GRID_SIZE_USDT = Decimal('20.0')
 GRID_INTERVAL_PCT = Decimal('0.015')
-GRID_LEVELS = 1                    # Start with 1, increase to 3 later
-FIRST_GRID_DELAY = 2               # Start in 2 seconds
+FIRST_GRID_DELAY = 2
 PRICE_UPDATE_INTERVAL = 20
 TREND_UPDATE_INTERVAL = 25 * 60
 DASHBOARD_REFRESH = 10
 DEPTH_LEVELS = 5
 TOP_N_BID_VOLUME = 25
-MIN_NOTIONAL_USDT = Decimal('10.0')  # Binance.US typical minimum
+MIN_NOTIONAL_USDT = Decimal('10.0')
 
 # ---------------------------
 # Binance.US Client + Balance Check
 # ---------------------------
 if not BINANCE_AVAILABLE:
-    print("ERROR: Install python-binance: pip install python-binance")
-    sys.exit(1)
+    st.error("Install python-binance: `pip install python-binance`")
+    st.stop()
 
 if not API_KEY or not API_SECRET:
-    print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET")
-    sys.exit(1)
+    st.error("Set BINANCE_API_KEY and BINANCE_API_SECRET")
+    st.stop()
 
 try:
     binance_client = Client(API_KEY, API_SECRET, tld='us')
-    print("Connected to BINANCE.US MAINNET")
+    st.success("Connected to BINANCE.US MAINNET")
 except Exception as e:
-    print(f"Client error: {e}")
-    sys.exit(1)
+    st.error(f"Client error: {e}")
+    st.stop()
 
 # --- BALANCE CHECK ---
 try:
@@ -80,11 +80,11 @@ try:
     if usdt_bal:
         free = Decimal(usdt_bal['free'])
         locked = Decimal(usdt_bal['locked'])
-        print(f"USDT BALANCE: {free} free, {locked} locked")
-        if free < Decimal('50'):
-            print("WARNING: Low balance. Need $50+ for 11 symbols.")
+        st.metric("USDT Balance", f"{free + locked:.2f}", f"{free:.2f} free")
+        if free < Decimal('60'):
+            st.warning("Low balance. Need $60+ for 11 symbols.")
 except Exception as e:
-    print(f"Balance check failed: {e}")
+    st.warning(f"Balance check failed: {e}")
 
 # ---------------------------
 # State & Locks
@@ -95,10 +95,15 @@ live_asks: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
 symbol_info_cache: Dict[str, dict] = {}
 top_bid_symbols: List[str] = []
 gridded_symbols: List[str] = []
-portfolio_symbols: List[str] = []  # Owned coins (e.g., BTC if BTCUSDT owned)
+portfolio_symbols: List[str] = []
 last_trend_check: Dict[str, float] = {}
 trend_bullish: Dict[str, bool] = {}
 active_grids: Dict[str, List[int]] = {}
+
+# P&L TRACKING
+realized_pnl: Dict[str, Decimal] = {}  # symbol -> realized profit
+unrealized_pnl: Dict[str, Decimal] = {}  # symbol -> current open P&L
+initial_balance: Decimal = ZERO
 
 price_lock = threading.Lock()
 book_lock = threading.Lock()
@@ -106,6 +111,40 @@ state_lock = threading.Lock()
 api_rate_lock = threading.Lock()
 
 ui_logs = []
+
+# ---------------------------
+# CALLMEBOT ALERTS
+# ---------------------------
+def send_callmebot_alert(message: str):
+    """Send WhatsApp alert via CallMeBot API"""
+    if not CALLMEBOT_PHONE or not CALLMEBOT_API_KEY:
+        log_ui("CALLMEBOT not configured - skipping alert")
+        return
+
+    url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={message}&apikey={CALLMEBOT_API_KEY}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            log_ui(f"Alert sent: {message[:50]}...")
+        else:
+            log_ui(f"Alert failed: {response.status_code}")
+    except Exception as e:
+        log_ui(f"Alert error: {e}")
+
+def alert_grid_update(gridded_symbols: List[str], grid_levels: int):
+    """Alert current grid: symbols + levels per coin"""
+    if not gridded_symbols:
+        return
+
+    msg = f"🚀 Grid Update: {len(gridded_symbols)} symbols active\n"
+    msg += f"Levels per coin: {grid_levels}\n\n"
+    msg += "Grids:\n"
+    for i, sym in enumerate(gridded_symbols[:10], 1):  # First 10
+        msg += f"{i}. {sym} ({grid_levels} levels)\n"
+    if len(gridded_symbols) > 10:
+        msg += f"... +{len(gridded_symbols)-10} more"
+    
+    send_callmebot_alert(msg)
 
 # ---------------------------
 # Utilities
@@ -187,29 +226,59 @@ def get_fee_rates(symbol: str) -> Tuple[Decimal, Decimal]:
         return Decimal('0.001'), Decimal('0.001')
 
 # ---------------------------
-# ENHANCED ORDER FUNCTION
+# P&L TRACKING
 # ---------------------------
-def place_limit_order(symbol: str, side: str, price: Decimal, quantity: Decimal) -> int:
-    info = fetch_symbol_info(symbol)
-    price = price.quantize(info['tickSize'], ROUND_DOWN)
-    quantity = (quantity // info['stepSize']) * info['stepSize']
-    notional = price * quantity
+def update_pnl():
+    """Update realized & unrealized P&L"""
+    global initial_balance
+    try:
+        account = binance_client.get_account()
+        current_usdt = Decimal('0')
+        for bal in account['balances']:
+            asset = bal['asset']
+            free = Decimal(bal['free'])
+            locked = Decimal(bal['locked'])
+            if asset == 'USDT':
+                current_usdt += free + locked
+            else:
+                symbol = f"{asset}USDT"
+                if symbol in live_prices:
+                    price = live_prices[symbol]
+                    value = (free + locked) * price
+                    current_usdt += value
+        # Realized P&L = current - initial
+        if initial_balance == ZERO:
+            initial_balance = current_usdt
+            log_ui(f"Initial balance set: ${initial_balance:.2f}")
+        realized = current_usdt - initial_balance
+        st.session_state.realized_pnl = realized
+    except Exception as e:
+        log_ui(f"PnL update failed: {e}")
 
+# ---------------------------
+# FIXED: place_limit_order
+# ---------------------------
+def place_limit_order(symbol: str, side: str, raw_price: Decimal, raw_qty: Decimal) -> int:
+    info = fetch_symbol_info(symbol)
+    price = (raw_price // info['tickSize']) * info['tickSize']
+    qty = (raw_qty // info['stepSize']) * info['stepSize']
+    notional = price * qty
     if notional < info['minNotional']:
         log_ui(f"SKIP {side} {symbol}: notional {notional} < min {info['minNotional']}")
         return 0
-
+    if price <= 0 or qty <= 0:
+        return 0
     try:
         resp = binance_client.create_order(
             symbol=symbol,
             side=side,
             type='LIMIT',
             timeInForce='GTC',
-            quantity=str(quantity),
+            quantity=str(qty),
             price=str(price)
         )
         oid = int(resp['orderId'])
-        log_ui(f"LIVE ORDER: {side} {symbol} {quantity} @ {price} -> {oid} (${notional})")
+        log_ui(f"LIVE ORDER: {side} {symbol} {qty} @ {price} -> {oid}")
         with state_lock:
             active_grids.setdefault(symbol, []).append(oid)
         return oid
@@ -231,35 +300,32 @@ def cancel_all_orders(symbol: str):
 # ---------------------------
 # Grid Logic
 # ---------------------------
-def place_new_grid(symbol: str):
+def place_new_grid(symbol: str, levels: int):
     cancel_all_orders(symbol)
     price = get_current_price(symbol)
     if price <= ZERO:
-        log_ui(f"No price for {symbol}")
         return
     qty = compute_qty_for_notional(symbol, GRID_SIZE_USDT)
     if qty <= ZERO:
-        log_ui(f"Qty zero for {symbol}")
         return
+
     info = fetch_symbol_info(symbol)
     if (qty * price) < MIN_NOTIONAL_USDT:
-        log_ui(f"Notional too low: {qty * price}")
         return
 
     # BUY GRID
-    for i in range(1, GRID_LEVELS + 1):
-        buy_price = (price * (1 - GRID_INTERVAL_PCT * i)).quantize(info['tickSize'], ROUND_DOWN)
-        place_limit_order(symbol, 'BUY', buy_price, qty)
+    for i in range(1, levels + 1):
+        raw_buy = price * (1 - GRID_INTERVAL_PCT * i)
+        place_limit_order(symbol, 'BUY', raw_buy, qty)
 
     # SELL GRID
     maker_fee, _ = get_fee_rates(symbol)
     multiplier = Decimal('1') + maker_fee + Decimal('0.01')
-    for i in range(1, GRID_LEVELS + 1):
-        raw_sp = price * (1 + GRID_INTERVAL_PCT * i)
-        sell_price = (raw_sp * multiplier).quantize(info['tickSize'], ROUND_DOWN)
-        place_limit_order(symbol, 'SELL', sell_price, qty)
+    for i in range(1, levels + 1):
+        raw_sell = price * (1 + GRID_INTERVAL_PCT * i) * multiplier
+        place_limit_order(symbol, 'SELL', raw_sell, qty)
 
-    log_ui(f"GRID ACTIVE: {symbol} @ {price}")
+    log_ui(f"GRID ACTIVE: {symbol} @ {price} ({levels} levels)")
 
 def compute_qty_for_notional(symbol: str, notional: Decimal) -> Decimal:
     price = get_current_price(symbol)
@@ -273,7 +339,6 @@ def compute_qty_for_notional(symbol: str, notional: Decimal) -> Decimal:
 # PORTFOLIO IMPORT
 # ---------------------------
 def import_portfolio_symbols() -> List[str]:
-    """Fetch owned assets >0 and map to USDT symbols (e.g., BTC -> BTCUSDT)"""
     try:
         account = binance_client.get_account()
         balances = account['balances']
@@ -287,7 +352,6 @@ def import_portfolio_symbols() -> List[str]:
                     log_ui(f"Portfolio: USDT {free + locked}")
                 else:
                     symbol = f"{asset}USDT"
-                    # Quick check if symbol exists
                     try:
                         binance_client.get_symbol_ticker(symbol=symbol)
                         owned.append(symbol)
@@ -296,7 +360,7 @@ def import_portfolio_symbols() -> List[str]:
                         log_ui(f"Portfolio: {asset} (no USDT pair)")
         with state_lock:
             global portfolio_symbols
-            portfolio_symbols = list(set(owned))  # unique
+            portfolio_symbols = list(set(owned))
         log_ui(f"Imported {len(portfolio_symbols)} owned symbols")
         return portfolio_symbols
     except Exception as e:
@@ -322,7 +386,7 @@ def is_symbol_bullish(symbol: str) -> bool:
     except:
         return True
 
-def update_top_bid_symbols(all_symbols: List[str]):
+def update_top_bid_symbols(all_symbols: List[str], target_grid_count: int):
     global top_bid_symbols, gridded_symbols
     try:
         vols = []
@@ -333,30 +397,33 @@ def update_top_bid_symbols(all_symbols: List[str]):
         vols.sort(key=lambda x: x[1], reverse=True)
         with state_lock:
             top_bid_symbols = [s for s, _ in vols[:TOP_N_BID_VOLUME]]
-            # PRIORITY: Portfolio first, then top N from remaining
             remaining = [s for s in top_bid_symbols if s not in portfolio_symbols]
-            gridded_symbols = portfolio_symbols + remaining[:NUMBER_OF_SYMBOLS_TO_GRID - len(portfolio_symbols)]
-        log_ui(f"Top {TOP_N_BID_VOLUME} updated | Portfolio: {len(portfolio_symbols)} | Gridding: {len(gridded_symbols)} symbols")
+            gridded_symbols = portfolio_symbols + remaining[:target_grid_count - len(portfolio_symbols)]
+            if len(gridded_symbols) > target_grid_count:
+                gridded_symbols = gridded_symbols[:target_grid_count]
+        log_ui(f"Gridding updated to {len(gridded_symbols)} symbols")
+        # Send alert on update
+        alert_grid_update(gridded_symbols, st.session_state.grid_levels if 'grid_levels' in st.session_state else 1)
     except Exception as e:
         log_ui(f"top update error: {e}")
 
 # ---------------------------
-# Rebalancer (PORTFOLIO FIRST)
+# Rebalancer
 # ---------------------------
-def grid_rebalancer(all_symbols: List[str]):
+def grid_rebalancer(all_symbols: List[str], target_grid_count: int, grid_levels: int):
     time.sleep(FIRST_GRID_DELAY)
-    log_ui(f"GRID REBALANCER STARTED — PRIORITY: PORTFOLIO THEN TOP {NUMBER_OF_SYMBOLS_TO_GRID}")
+    log_ui(f"GRID REBALANCER STARTED — {target_grid_count} symbols, {grid_levels} levels")
     last_top = 0
     while True:
         try:
             now = time.time()
             if now - last_top > PRICE_UPDATE_INTERVAL:
-                update_top_bid_symbols(all_symbols)
+                update_top_bid_symbols(all_symbols, target_grid_count)
                 last_top = now
 
             for sym in gridded_symbols:
                 if is_symbol_bullish(sym):
-                    place_new_grid(sym)
+                    place_new_grid(sym, grid_levels)
             time.sleep(40)
         except Exception as e:
             log_ui(f"rebalancer error: {e}")
@@ -365,8 +432,8 @@ def grid_rebalancer(all_symbols: List[str]):
 # ---------------------------
 # Background Threads
 # ---------------------------
-def start_background_threads(all_symbols):
-    threading.Thread(target=grid_rebalancer, args=(all_symbols,), daemon=True).start()
+def start_background_threads(all_symbols, target_grid_count, grid_levels):
+    threading.Thread(target=grid_rebalancer, args=(all_symbols, target_grid_count, grid_levels), daemon=True).start()
 
     def price_updater():
         while True:
@@ -375,40 +442,103 @@ def start_background_threads(all_symbols):
             time.sleep(PRICE_UPDATE_INTERVAL)
     threading.Thread(target=price_updater, daemon=True).start()
 
+    def pnl_updater():
+        while True:
+            update_pnl()
+            time.sleep(30)
+    threading.Thread(target=pnl_updater, daemon=True).start()
+
 # ---------------------------
-# Streamlit UI
+# Streamlit UI (FULLY INTERACTIVE)
 # ---------------------------
 def run_streamlit_ui(all_symbols):
-    st.set_page_config(page_title="Infinity Grid — BINANCE.US (Portfolio Priority)", layout="wide")
+    st.set_page_config(page_title="Infinity Grid — BINANCE.US LIVE", layout="wide")
     st.title("Infinity Grid — BINANCE.US LIVE")
-    st.caption(f"Portfolio Priority: Owned first, then TOP {NUMBER_OF_SYMBOLS_TO_GRID} | $15/level | REAL MONEY")
+    st.caption("P&L | Grid Levels | Portfolio | WhatsApp Alerts")
 
+    # --- SIDEBAR CONTROLS ---
     with st.sidebar:
-        st.write("**LIVE BOT**")
-        st.write(f"Portfolio: {len(portfolio_symbols)} symbols")
-        st.write(f"Gridding: {NUMBER_OF_SYMBOLS_TO_GRID} total")
-        st.write(f"Grid: {GRID_LEVELS}×${GRID_SIZE_USDT} @ ±1.5%")
-        if st.button("Force Regrid (Portfolio First)"):
+        st.header("Bot Settings")
+        target_grid_count = st.slider(
+            "NUMBER_OF_SYMBOLS_TO_GRID",
+            min_value=1, max_value=50, value=11, step=1,
+            help="Total symbols to grid (portfolio first)"
+        )
+        grid_levels = st.slider(
+            "GRID_LEVELS (per side)",
+            min_value=1, max_value=5, value=1, step=1,
+            help="Buy + Sell levels per symbol"
+        )
+        st.write(f"**Target Symbols:** {target_grid_count}")
+        st.write(f"**Grid Levels:** {grid_levels}")
+        if CALLMEBOT_PHONE and CALLMEBOT_API_KEY:
+            st.success("✅ CALLMEBOT Alerts Enabled")
+        else:
+            st.warning("⚠️ Set CALLMEBOT_PHONE & CALLMEBOT_API_KEY for alerts")
+        if st.button("Force Regrid All"):
             for s in gridded_symbols:
-                place_new_grid(s)
+                place_new_grid(s, grid_levels)
+            alert_grid_update(gridded_symbols, grid_levels)
+            st.success("Regrid triggered + Alert sent!")
 
+    # --- MAIN DASHBOARD ---
     col1, col2 = st.columns([2, 1])
     placeholder = st.empty()
+
+    # Initialize session state
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = True
+        st.session_state.target_grid_count = target_grid_count
+        st.session_state.grid_levels = grid_levels
+        st.session_state.realized_pnl = Decimal('0')
+        import_portfolio_symbols()
+        start_background_threads(all_symbols, target_grid_count, grid_levels)
+
+    # Update on slider change
+    if (st.session_state.target_grid_count != target_grid_count or
+        st.session_state.grid_levels != grid_levels):
+        st.session_state.target_grid_count = target_grid_count
+        st.session_state.grid_levels = grid_levels
+        update_top_bid_symbols(all_symbols, target_grid_count)
+        log_ui(f"Settings updated: {target_grid_count} symbols, {grid_levels} levels")
 
     while True:
         with placeholder.container():
             col1.subheader(f"Status — {now_str()}")
-            col1.metric("Portfolio Symbols", ", ".join(portfolio_symbols) if portfolio_symbols else "—")
-            col1.metric("Gridded Symbols", ", ".join(gridded_symbols) if gridded_symbols else "—")
-            col1.write("Active Orders")
-            rows = []
-            for sym in gridded_symbols:
-                oids = active_grids.get(sym, [])
-                rows.append({"Symbol": sym, "Orders": len(oids)})
-            col1.dataframe(rows, use_container_width=True)
+            col1.metric("Target Symbols", target_grid_count)
+            col1.metric("Grid Levels", grid_levels)
+            col1.metric("Portfolio", len(portfolio_symbols))
+            col1.metric("Gridded", len(gridded_symbols))
 
-            col2.subheader("Logs")
-            for line in ui_logs[-50:]:
+            # P&L
+            realized = st.session_state.realized_pnl
+            col1.metric("Realized P&L", f"${realized:+.2f}", 
+                       delta=f"{realized:+.2f}", delta_color="normal")
+
+            # Portfolio Table
+            if portfolio_symbols:
+                col1.write("**Imported Portfolio**")
+                port_data = []
+                for sym in portfolio_symbols:
+                    orders = len(active_grids.get(sym, []))
+                    port_data.append({"Symbol": sym, "Orders": orders})
+                col1.dataframe(port_data, use_container_width=True)
+
+            # Grids Table
+            col1.write("**Active Grids**")
+            grid_data = []
+            for sym in gridded_symbols:
+                orders = len(active_grids.get(sym, []))
+                grid_data.append({
+                    "Symbol": sym,
+                    "Orders": orders,
+                    "Levels": grid_levels,
+                    "In Portfolio": "Yes" if sym in portfolio_symbols else "No"
+                })
+            col1.dataframe(grid_data, use_container_width=True)
+
+            col2.subheader("Recent Logs")
+            for line in ui_logs[-30:]:
                 col2.text(line)
 
         time.sleep(DASHBOARD_REFRESH)
@@ -429,9 +559,6 @@ def initialize():
 
 def main():
     all_symbols = initialize()
-    import_portfolio_symbols()  # IMPORT OWNED COINS FIRST
-    log_ui(f"Bot live — portfolio: {len(portfolio_symbols)} | gridding {NUMBER_OF_SYMBOLS_TO_GRID} total")
-    start_background_threads(all_symbols)
     run_streamlit_ui(all_symbols)
 
 if __name__ == "__main__":
