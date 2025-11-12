@@ -718,36 +718,129 @@ with log_container.container():
     for line in st.session_state.logs[-50:]:
         st.text(line)
 
+
 # --------------------------------------------------------------
 # BACKGROUND THREAD: Auto Rotation + Refresh
 # --------------------------------------------------------------
 def background_worker():
-    initial_setup()
+    global last_full_refresh
     last_rotate = time.time()
+    last_full_refresh = time.time()
+
+    log_ui("BACKGROUND WORKER STARTED — Bot is LIVE")
+
     while True:
         time.sleep(10)
+
+        # Skip if emergency stopped
         if st.session_state.emergency_stopped:
             continue
-        update_pnl()
-        now = time.time()
-        if st.session_state.auto_rotate_enabled and now - last_rotate > st.session_state.rotation_interval:
-            rotate_to_top25()
-            last_rotate = now
-        if now - last_full_refresh > REFRESH_INTERVAL:
-            update_account_cache()
-            update_top_bid_symbols()
 
-threading.Thread(target=background_worker, daemon=True).start()
+        try:
+            update_pnl()
 
-st.info("Bot is running in background. Refresh page to see updates.")
+            now = time.time()
+
+            # Auto-rotation
+            if (st.session_state.auto_rotate_enabled and 
+                now - last_rotate >= st.session_state.rotation_interval):
+                rotate_to_top25()
+                last_rotate = now
+
+            # Periodic refresh
+            if now - last_full_refresh >= REFRESH_INTERVAL:
+                update_account_cache()
+                update_top_bid_symbols()
+                import_portfolio_symbols()
+                last_full_refresh = now
+
+        except Exception as e:
+            log_ui(f"Background worker error: {e}")
+            send_callmebot_alert(f"BACKGROUND ERROR: {e}", force_send=True)
 
 
 # --------------------------------------------------------------
-# MAIN
+# INITIAL SETUP — Loads symbols, starts websockets
+# --------------------------------------------------------------
+def initial_setup():
+    global all_symbols
+    try:
+        log_ui("Fetching exchange info...")
+        exchange_info = safe_api_call(binance_client.get_exchange_info, weight=10)
+        all_symbols = [
+            s['symbol'] for s in exchange_info['symbols'] 
+            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
+        ]
+        log_ui(f"Loaded {len(all_symbols)} USDT trading pairs")
+
+        import_portfolio_symbols()
+        start_all_websockets()
+        update_account_cache()
+        update_pnl()
+        log_ui("Initial setup complete")
+
+    except Exception as e:
+        log_ui(f"initial_setup() failed: {e}")
+        send_callmebot_alert(f"INIT FAILED: {e}", force_send=True)
+
+
+# --------------------------------------------------------------
+# MAIN ENTRY POINT — Prevents duplicate starts
 # --------------------------------------------------------------
 def main():
-    all_symbols = initialize()
-    run_streamlit_ui()
+    """
+    Main function — called once when script starts.
+    Prevents multiple threads on Streamlit rerun.
+    """
+    if not st.session_state.get('bot_initialized', False):
+        st.session_state.bot_initialized = True
+        st.session_state.worker_started = True
 
+        log_ui("=== INFINITY GRID BOT STARTING ===")
+        
+        # Run initial setup
+        initial_setup()
+
+        # Start background worker
+        threading.Thread(target=background_worker, daemon=True).start()
+
+        log_ui("Bot fully initialized and running")
+        send_callmebot_alert("INFINITY GRID BOT STARTED SUCCESSFULLY", force_send=True)
+        
+        st.success("Bot is LIVE and running in background")
+    else:
+        log_ui("main() skipped — already initialized (Streamlit rerun)")
+
+
+# --------------------------------------------------------------
+# FINAL UI STATUS
+# --------------------------------------------------------------
+st.markdown("---")
+st.subheader("Bot Status")
+if st.session_state.get('bot_initialized', False):
+    st.success("RUNNING")
+    st.write(f"• Grids Active: {len(gridded_symbols)}")
+    st.write(f"• Auto-Rotate: {'ON' if st.session_state.auto_rotate_enabled else 'OFF'}")
+    st.write(f"• Last Regrid: {last_regrid_str}")
+else:
+    st.warning("Starting up...")
+
+st.info("""
+**Infinity Grid Bot is LIVE**  
+• Real-time price & depth streaming  
+• Top 25 bid volume rotation  
+• ≥1.8% profit gate (built into sell levels)  
+• WhatsApp alerts via CallMeBot  
+• Emergency stop protection  
+• No blocking loops — fully async  
+""")
+
+# --------------------------------------------------------------
+# AUTO-START ON SCRIPT LOAD
+# --------------------------------------------------------------
 if __name__ == "__main__":
     main()
+
+# --------------------------------------------------------------
+# END OF SCRIPT — NOTHING BELOW THIS LINE
+# --------------------------------------------------------------
