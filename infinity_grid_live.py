@@ -53,6 +53,35 @@ alert_queue: List[Tuple[str, bool]] = []
 last_bundle_sent = 0
 BUNDLE_INTERVAL = 600  # 10 minutes
 
+
+# 1. ALWAYS initialize session state variables at the top level
+#    (before any widget or logic that might read them)
+def init_session_state():
+    defaults = {
+        "counter": 0,
+        "user_name": "",
+        "data": None,
+        "logged_in": False,
+        "theme": "light",
+        # add any other keys you need
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+# Call it immediately
+init_session_state()
+
+# Now you can safely use st.session_state anywhere
+st.write("Counter:", st.session_state.counter)
+
+if st.button("Increment"):
+    st.session_state.counter += 1
+    st.rerun()
+
+name = st.text_input("Name", value=st.session_state.user_name)
+st.session_state.user_name = name
+
 # --------------------------------------------------------------
 # Streamlit Session State Initialization
 # --------------------------------------------------------------
