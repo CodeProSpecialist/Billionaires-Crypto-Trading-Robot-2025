@@ -7,7 +7,6 @@ FINAL PRODUCTION v9.1 — 100% COMPLETE
 • Profit Monitoring Engine (PME) → rebalance + regrid only
 • Top 25 bid volume rotation + profit gate ≥1.8%
 • CallMeBot + Streamlit + green/red lights
-• 1050 lines — bulletproof
 """
 
 import os
