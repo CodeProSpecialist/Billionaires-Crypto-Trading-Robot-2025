@@ -9,7 +9,7 @@ INFINITY GRID BOT — BINANCE.US LIVE
 - CALLMEBOT: BUNDLED EVERY 10 MIN
 - CUSTOM WEBSOCKETS: websocket-client + wss://stream.binance.us:9443
 - GREEN/RED LIGHTS: WebSocket + Binance API
-- NO IP BAN — REAL-TIME DATA
+- WEBSOCKETS — REAL-TIME DATA
 """
 
 import os
