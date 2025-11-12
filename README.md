@@ -107,7 +107,7 @@ export CALLMEBOT_PHONE="..."     # optional
 ```
 
 ```bash
-pip install python-binance sqlalchemy talib tenacity requests numpy
+pip install streamlit python-binance websocket-client sqlalchemy pytz
 ```
 
 ---
