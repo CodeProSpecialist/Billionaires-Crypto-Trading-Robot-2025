@@ -250,7 +250,7 @@ api_rate_lock = threading.Lock()
 # ==============================================================
 try:
     from binance.client import Client
-except Exception as as e:
+except Exception as e:
     st.error(f"Binance import failed: {e}")
     st.stop()
 
