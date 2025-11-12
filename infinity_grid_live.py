@@ -833,7 +833,7 @@ def main():
         # Start background worker
         threading.Thread(target=background_worker, daemon=True).start()
 
-        log_ui("Bot fully initialized and running")
+        log_ui("Bot fully initialized and running in background")
         send_callmebot_alert("INFINITY GRID BOT STARTED SUCCESSFULLY", force_send=True)
         
         st.success("Bot is LIVE and running in background")
@@ -849,7 +849,7 @@ st.subheader("Bot Status")
 if st.session_state.get('bot_initialized', False):
     st.success("RUNNING")
     st.write(f"• Grids Active: {len(gridded_symbols)}")
-    st.write(f"• Auto-Rotate: {'ON' if st.session_state.auto_rotate_enabled else 'OFF'}")
+    st.write(f"• Auto-Rotate: {'Yes' if st.session_state.auto_rotate_enabled else 'No'}")
     st.write(f"• Last Regrid: {last_regrid_str}")
 else:
     st.warning("Starting up...")
@@ -858,18 +858,14 @@ st.info("""
 **Infinity Grid Bot is LIVE**  
 • Real-time price & depth streaming  
 • Top 25 bid volume rotation  
-• ≥1.8% profit gate (built into sell levels)  
+• ≥1.8% profit gate on sells  
 • WhatsApp alerts via CallMeBot  
 • Emergency stop protection  
 • No blocking loops — fully async  
 """)
 
 # --------------------------------------------------------------
-# AUTO-START ON SCRIPT LOAD
+# RUN MAIN() ON SCRIPT START
 # --------------------------------------------------------------
 if __name__ == "__main__":
     main()
-
-# --------------------------------------------------------------
-# END OF SCRIPT — NOTHING BELOW THIS LINE
-# --------------------------------------------------------------
