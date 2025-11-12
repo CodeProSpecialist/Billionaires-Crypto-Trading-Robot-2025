@@ -6,7 +6,7 @@ REAL WEBSOCKET STREAMING + FULL STREAMLIT UI + LIVE BUTTONS
 AUTO-ROTATION ≥1.8% PROFIT GATE + TOP 25 BID VOLUME
 CALLMEBOT WHATSAPP + EMERGENCY STOP + P&L
 NO BLOCKING LOOPS — FULLY WORKING — 1,900+ LINES
-FIXED: set_page_config() is now FIRST
+FIXED: set_page_config() FIRST + listenKey string index error
 """
 
 import streamlit as st
@@ -16,7 +16,6 @@ import os
 import time
 import threading
 import requests
-import re
 import json
 import websocket
 import pandas as pd
@@ -53,35 +52,6 @@ alert_queue: List[Tuple[str, bool]] = []
 last_bundle_sent = 0
 BUNDLE_INTERVAL = 600  # 10 minutes
 
-
-# 1. ALWAYS initialize session state variables at the top level
-#    (before any widget or logic that might read them)
-def init_session_state():
-    defaults = {
-        "counter": 0,
-        "user_name": "",
-        "data": None,
-        "logged_in": False,
-        "theme": "light",
-        # add any other keys you need
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-# Call it immediately
-init_session_state()
-
-# Now you can safely use st.session_state anywhere
-st.write("Counter:", st.session_state.counter)
-
-if st.button("Increment"):
-    st.session_state.counter += 1
-    st.rerun()
-
-name = st.text_input("Name", value=st.session_state.user_name)
-st.session_state.user_name = name
-
 # --------------------------------------------------------------
 # Streamlit Session State Initialization
 # --------------------------------------------------------------
@@ -100,6 +70,8 @@ if 'initialized' not in st.session_state:
     st.session_state.min_new_coins = 3
     st.session_state.profit_threshold_pct = Decimal('1.8')
     st.session_state.logs = []
+    st.session_state.bot_initialized = False
+    st.session_state.worker_started = False
 
 # --------------------------------------------------------------
 # CONFIG & VALIDATION
@@ -153,6 +125,7 @@ all_symbols: List[str] = []
 price_ws = None
 depth_ws = None
 user_ws = None
+current_listen_key = None
 
 # --------------------------------------------------------------
 # Utilities
@@ -394,12 +367,22 @@ def start_depth_stream():
     threading.Thread(target=depth_ws.run_forever, daemon=True).start()
 
 # --------------------------------------------------------------
-# WEBSOCKET: USER DATA
+# WEBSOCKET: USER DATA — FIXED listenKey
 # --------------------------------------------------------------
 def get_listen_key() -> Optional[str]:
+    global current_listen_key
     try:
         resp = safe_api_call(binance_client.stream_get_listen_key, weight=1)
-        return resp['listenKey']
+        # FIXED: Use .json() parsing instead of treating string as dict
+        data = resp.json() if hasattr(resp, 'json') else json.loads(resp)
+        key = data.get("listenKey")
+        if key:
+            current_listen_key = key
+            log_ui(f"New listenKey obtained: {key[:8]}...")
+            return key
+        else:
+            log_ui("listenKey missing in response")
+            return None
     except Exception as e:
         log_ui(f"ListenKey error: {e}")
         return None
@@ -407,10 +390,13 @@ def get_listen_key() -> Optional[str]:
 def on_user_message(ws, message):
     try:
         data = json.loads(message)
-        if data['e'] == 'outboundAccountPosition':
+        if data.get('e') == 'outboundAccountPosition':
             for b in data['B']:
-                balances[b['a']] = to_decimal(b['f']) + to_decimal(b['l'])
-        elif data['e'] == 'executionReport' and data['X'] == 'FILLED':
+                asset = b['a']
+                free = to_decimal(b['f'])
+                locked = to_decimal(b['l'])
+                balances[asset] = free + locked
+        elif data.get('e') == 'executionReport' and data.get('X') == 'FILLED':
             symbol = data['s']
             side = data['S']
             qty = to_decimal(data['z'])
@@ -430,6 +416,7 @@ def start_user_stream():
             pass
     key = get_listen_key()
     if not key:
+        log_ui("Failed to get listenKey, retrying in 10s...")
         time.sleep(10)
         start_user_stream()
         return
@@ -441,11 +428,11 @@ def keep_user_stream_alive():
     while True:
         time.sleep(1800)
         try:
-            key = get_listen_key()
-            if key:
-                safe_api_call(binance_client.stream_keepalive, listenKey=key, weight=1)
-        except:
-            pass
+            if current_listen_key:
+                safe_api_call(binance_client.stream_keepalive, listenKey=current_listen_key, weight=1)
+                log_ui("listenKey keep-alive sent")
+        except Exception as e:
+            log_ui(f"Keep-alive failed: {e}")
 
 # --------------------------------------------------------------
 # START ALL WEBSOCKETS
@@ -493,7 +480,8 @@ def update_account_cache():
     try:
         acct = safe_api_call(binance_client.get_account, weight=10)
         for b in acct['balances']:
-            account_cache[b['asset']] = to_decimal(b['free']) + to_decimal(b['locked'])
+            asset = b['asset']
+            account_cache[asset] = to_decimal(b['free']) + to_decimal(b['locked'])
         log_ui("Account cache updated")
     except Exception as e:
         log_ui(f"Account cache failed: {e}")
@@ -686,16 +674,83 @@ def emergency_stop(reason: str):
 # --------------------------------------------------------------
 def initial_setup():
     global all_symbols
-    exchange_info = safe_api_call(binance_client.get_exchange_info, weight=10)
-    all_symbols = [s['symbol'] for s in exchange_info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
-    log_ui(f"Loaded {len(all_symbols)} USDT pairs")
-    import_portfolio_symbols()
-    start_all_websockets()
-    update_account_cache()
-    update_pnl()
+    try:
+        log_ui("Fetching exchange info...")
+        exchange_info = safe_api_call(binance_client.get_exchange_info, weight=10)
+        all_symbols = [
+            s['symbol'] for s in exchange_info['symbols'] 
+            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
+        ]
+        log_ui(f"Loaded {len(all_symbols)} USDT trading pairs")
+
+        import_portfolio_symbols()
+        start_all_websockets()
+        update_account_cache()
+        update_pnl()
+        log_ui("Initial setup complete")
+
+    except Exception as e:
+        log_ui(f"initial_setup() failed: {e}")
+        send_callmebot_alert(f"INIT FAILED: {e}", force_send=True)
 
 # --------------------------------------------------------------
-# MAIN UI
+# BACKGROUND THREAD: Auto Rotation + Refresh
+# --------------------------------------------------------------
+def background_worker():
+    global last_full_refresh
+    last_rotate = time.time()
+    last_full_refresh = time.time()
+
+    log_ui("BACKGROUND WORKER STARTED — Bot is LIVE")
+
+    while True:
+        time.sleep(10)
+
+        if st.session_state.emergency_stopped:
+            continue
+
+        try:
+            update_pnl()
+
+            now = time.time()
+
+            if (st.session_state.auto_rotate_enabled and 
+                now - last_rotate >= st.session_state.rotation_interval):
+                rotate_to_top25()
+                last_rotate = now
+
+            if now - last_full_refresh >= REFRESH_INTERVAL:
+                update_account_cache()
+                update_top_bid_symbols()
+                import_portfolio_symbols()
+                last_full_refresh = now
+
+        except Exception as e:
+            log_ui(f"Background worker error: {e}")
+            send_callmebot_alert(f"BACKGROUND ERROR: {e}", force_send=True)
+
+# --------------------------------------------------------------
+# MAIN ENTRY POINT
+# --------------------------------------------------------------
+def main():
+    if not st.session_state.get('bot_initialized', False):
+        st.session_state.bot_initialized = True
+
+        log_ui("=== INFINITY GRID BOT STARTING ===")
+        
+        initial_setup()
+
+        threading.Thread(target=background_worker, daemon=True).start()
+
+        log_ui("Bot fully initialized and running in background")
+        send_callmebot_alert("INFINITY GRID BOT STARTED SUCCESSFULLY", force_send=True)
+        
+        st.success("Bot is LIVE and running in background")
+    else:
+        log_ui("main() skipped — already initialized (Streamlit rerun)")
+
+# --------------------------------------------------------------
+# UI
 # --------------------------------------------------------------
 st.title("Infinity Grid Bot — Binance.US Live")
 st.markdown("**Top 25 Bid Volume + Auto-Rotation ≥1.8% Profit Gate**")
@@ -727,7 +782,7 @@ with left:
     if st.button("CANCEL ALL ORDERS", type="secondary"):
         cancel_all_orders_global()
 
-    if st.button("EMERGENCY STOP", type="primary", help="Cancels all + stops bot"):
+    if st.button("EMERGENCY STOP", type="primary"):
         emergency_stop("Manual trigger")
 
     if st.button("Resume Bot"):
@@ -747,103 +802,6 @@ with log_container.container():
     for line in st.session_state.logs[-50:]:
         st.text(line)
 
-
-# --------------------------------------------------------------
-# BACKGROUND THREAD: Auto Rotation + Refresh
-# --------------------------------------------------------------
-def background_worker():
-    global last_full_refresh
-    last_rotate = time.time()
-    last_full_refresh = time.time()
-
-    log_ui("BACKGROUND WORKER STARTED — Bot is LIVE")
-
-    while True:
-        time.sleep(10)
-
-        # Skip if emergency stopped
-        if st.session_state.emergency_stopped:
-            continue
-
-        try:
-            update_pnl()
-
-            now = time.time()
-
-            # Auto-rotation
-            if (st.session_state.auto_rotate_enabled and 
-                now - last_rotate >= st.session_state.rotation_interval):
-                rotate_to_top25()
-                last_rotate = now
-
-            # Periodic refresh
-            if now - last_full_refresh >= REFRESH_INTERVAL:
-                update_account_cache()
-                update_top_bid_symbols()
-                import_portfolio_symbols()
-                last_full_refresh = now
-
-        except Exception as e:
-            log_ui(f"Background worker error: {e}")
-            send_callmebot_alert(f"BACKGROUND ERROR: {e}", force_send=True)
-
-
-# --------------------------------------------------------------
-# INITIAL SETUP — Loads symbols, starts websockets
-# --------------------------------------------------------------
-def initial_setup():
-    global all_symbols
-    try:
-        log_ui("Fetching exchange info...")
-        exchange_info = safe_api_call(binance_client.get_exchange_info, weight=10)
-        all_symbols = [
-            s['symbol'] for s in exchange_info['symbols'] 
-            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
-        ]
-        log_ui(f"Loaded {len(all_symbols)} USDT trading pairs")
-
-        import_portfolio_symbols()
-        start_all_websockets()
-        update_account_cache()
-        update_pnl()
-        log_ui("Initial setup complete")
-
-    except Exception as e:
-        log_ui(f"initial_setup() failed: {e}")
-        send_callmebot_alert(f"INIT FAILED: {e}", force_send=True)
-
-
-# --------------------------------------------------------------
-# MAIN ENTRY POINT — Prevents duplicate starts
-# --------------------------------------------------------------
-def main():
-    """
-    Main function — called once when script starts.
-    Prevents multiple threads on Streamlit rerun.
-    """
-    if not st.session_state.get('bot_initialized', False):
-        st.session_state.bot_initialized = True
-        st.session_state.worker_started = True
-
-        log_ui("=== INFINITY GRID BOT STARTING ===")
-        
-        # Run initial setup
-        initial_setup()
-
-        # Start background worker
-        threading.Thread(target=background_worker, daemon=True).start()
-
-        log_ui("Bot fully initialized and running in background")
-        send_callmebot_alert("INFINITY GRID BOT STARTED SUCCESSFULLY", force_send=True)
-        
-        st.success("Bot is LIVE and running in background")
-    else:
-        log_ui("main() skipped — already initialized (Streamlit rerun)")
-
-
-# --------------------------------------------------------------
-# FINAL UI STATUS
-# --------------------------------------------------------------
 st.markdown("---")
 st.subheader("Bot Status")
 if st.session_state.get('bot_initialized', False):
@@ -865,7 +823,7 @@ st.info("""
 """)
 
 # --------------------------------------------------------------
-# RUN MAIN() ON SCRIPT START
+# RUN MAIN()
 # --------------------------------------------------------------
 if __name__ == "__main__":
     main()
