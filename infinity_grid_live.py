@@ -30,12 +30,12 @@ ROTATION_INTERVAL = 300
 # --------------------------------------------------------------
 # GLOBALS
 # --------------------------------------------------------------
-client = Client(API_KEY, API_SECRET, testnet=False)
+client = Client(API_KEY, API_SECRET, tld='us')
 client.API_URL = 'https://api.binance.us/api'
 client.WITHDRAW_API_URL = 'https://api.binance.us/wapi'
 client.WEBSITE_URL = 'https://www.binance.us'
 
-twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
+twm = ThreadedWebsocketManager(API_KEY, API_SECRET, tld='us')
 twm.API_URL = 'wss://stream.binance.us:9443'
 
 all_symbols = []
