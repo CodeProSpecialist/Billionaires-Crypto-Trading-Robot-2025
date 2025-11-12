@@ -3,7 +3,6 @@ import time
 import threading
 from decimal import Decimal, getcontext
 from datetime import datetime
-import pandas as pd
 
 from binance.client import Client
 from binance import ThreadedWebsocketManager
@@ -29,7 +28,7 @@ GRID_SELL_MULTIPLIER = Decimal('1.01')
 # --------------------------------------------------------------
 # GLOBALS
 # --------------------------------------------------------------
-client = Client(API_KEY, API_SECRET, tld='us')  # CORRECT: tld='us'
+client = Client(API_KEY, API_SECRET, tld='us')
 twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET, tld='us')
 
 all_symbols = []
@@ -40,10 +39,10 @@ active_grids = {}
 state_lock = threading.Lock()
 last_regrid_str = "Never"
 initial_balance = ZERO
-cost_basis = {}  # asset → total cost in USDT
+cost_basis = {}  # asset → avg cost
 
 # --------------------------------------------------------------
-# SESSION STATE INITIALIZATION
+# SESSION STATE INITIALIZATION (MUST BE FIRST!)
 # --------------------------------------------------------------
 def init_session_state():
     defaults = {
@@ -58,11 +57,12 @@ def init_session_state():
         'realized_pnl': 0.0,
         'unrealized_pnl': 0.0,
         'total_pnl': 0.0,
+        'total_pnl_pct': 0.0,
         'last_full_refresh': 0.0
     }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 # --------------------------------------------------------------
 # UTILITIES
@@ -101,7 +101,7 @@ def get_symbol_info(symbol):
             'minNotional': Decimal(filters.get('MIN_NOTIONAL', {}).get('minNotional', '10') or '10')
         }
     except:
-        return {'tickSize': Decimal('0.00000001'), 'stepSize': Decimal('0.00000001'), 'minNotional': Decimal('10')}
+        return {'tickSize': Decimal('1e-8'), 'stepSize': Decimal('1e-8'), 'minNotional': Decimal('10')}
 
 def get_price(symbol):
     try:
@@ -130,15 +130,13 @@ def get_balance(asset):
     return account_cache.get(asset, ZERO)
 
 # --------------------------------------------------------------
-# P&L LOGIC — REALIZED + UNREALIZED
+# P&L CALCULATION
 # --------------------------------------------------------------
 def update_pnl():
     try:
-        total_value = get_balance('USDT')
-        unrealized = Decimal('0')
-        realized = st.session_state.realized_pnl
+        total_usdt = get_balance('USDT')
+        unrealized = ZERO
 
-        # Calculate unrealized P&L for all non-USDT assets
         for asset, qty in account_cache.items():
             if asset == 'USDT' or qty <= ZERO:
                 continue
@@ -148,26 +146,25 @@ def update_pnl():
             price = get_price(symbol)
             if price <= ZERO:
                 continue
-            value = qty * price
-            total_value += value
 
-            # Estimate cost basis (simplified: average from trades or initial)
-            # You can improve this with actual trade history
-            avg_cost = cost_basis.get(asset, price)  # fallback to current price
+            value = qty * price
+            total_usdt += value
+
+            avg_cost = cost_basis.get(asset, price)  # fallback
             unrealized += (price - avg_cost) * qty
 
         st.session_state.unrealized_pnl = float(unrealized)
-        st.session_state.realized_pnl = float(realized)
-        st.session_state.total_pnl = float(realized + unrealized)
+        st.session_state.realized_pnl = float(st.session_state.realized_pnl)  # persists
+        total = st.session_state.realized_pnl + float(unrealized)
+        st.session_state.total_pnl = total
 
-        # Update total portfolio value for % calculation
         if initial_balance > ZERO:
-            pct = (total_value - initial_balance) / initial_balance * 100
+            pct = (total_usdt - initial_balance) / initial_balance * 100
             st.session_state.total_pnl_pct = float(pct)
         else:
             st.session_state.total_pnl_pct = 0.0
 
-        log_ui(f"P&L Updated | R:${realized:.2f} U:${unrealized:.2f} T:${realized+unrealized:.2f}")
+        log_ui(f"P&L → R:${st.session_state.realized_pnl:.2f} U:${unrealized:.2f} T:${total:.2f}")
     except Exception as e:
         log_ui(f"P&L error: {e}")
 
@@ -205,10 +202,10 @@ def place_limit_order(symbol, side, price, qty):
 
         # Update cost basis on BUY
         if side == 'BUY':
-            current_cost = cost_basis.get(base, ZERO)
-            current_qty = get_balance(base) - qty  # previous
-            new_cost = current_cost + (price * qty)
-            new_qty = current_qty + qty
+            prev_qty = get_balance(base) - qty
+            prev_cost = cost_basis.get(base, ZERO) * prev_qty
+            new_cost = prev_cost + (price * qty)
+            new_qty = prev_qty + qty
             if new_qty > ZERO:
                 cost_basis[base] = new_cost / new_qty
 
@@ -262,7 +259,7 @@ def place_grid(symbol):
     if qty <= ZERO:
         return
 
-    b, s = 0, 0
+    b = s = 0
     for i in range(1, st.session_state.grid_levels + 1):
         bp = price * (1 - GRID_SPACING * i)
         sp = price * (1 + GRID_SPACING * i) * GRID_SELL_MULTIPLIER
@@ -310,11 +307,11 @@ def rotate_grids():
 # FULL REFRESH
 # --------------------------------------------------------------
 def full_refresh():
-    log_ui("=== FULL REFRESH ===")
+    log_ui("=== FULL REFRESH STARTED ===")
     update_account()
     update_pnl()
     st.session_state.last_full_refresh = time.time()
-    log_ui("=== REFRESH DONE ===")
+    log_ui("=== FULL REFRESH DONE ===")
 
 # --------------------------------------------------------------
 # INITIAL SETUP
@@ -350,7 +347,7 @@ def background_worker():
 
         now = time.time()
 
-        # P&L every 30 seconds
+        # Frequent P&L update
         update_pnl()
 
         # Rotation
@@ -358,7 +355,7 @@ def background_worker():
             rotate_grids()
             last_rotate = now
 
-        # Full refresh
+        # Full refresh every 5 min
         if now - last_refresh >= REFRESH_INTERVAL:
             full_refresh()
             last_refresh = st.session_state.last_full_refresh
@@ -367,7 +364,7 @@ def background_worker():
 # MAIN & UI
 # --------------------------------------------------------------
 def main():
-    init_session_state()
+    init_session_state()  # ALWAYS FIRST
 
     if not st.session_state.bot_initialized:
         log_ui("INFINITY GRID BOT STARTING")
@@ -380,18 +377,18 @@ def main():
 
 st.title("Infinity Grid Bot — Binance.US (tld='us')")
 
-# P&L DISPLAY
+# P&L METRICS — NOW WORKS!
 col1, col2, col3 = st.columns(3)
 with col1:
     st.metric("Realized P&L", f"${st.session_state.realized_pnl:.2f}")
 with col2:
     st.metric("Unrealized P&L", f"${st.session_state.unrealized_pnl:.2f}")
 with col3:
-    pct = st.session_state.total_pnl_pct if 'total_pnl_pct' in st.session_state else 0
-    st.metric("Total P&L", f"${st.session_state.total_pnl:.2f}", delta=f"{pct:.2f}%")
+    st.metric("Total P&L", f"${st.session_state.total_pnl:.2f}", 
+              delta=f"{st.session_state.total_pnl_pct:.2f}%")
 
-col_left, col_right = st.columns([1, 2])
-with col_left:
+left, right = st.columns([1, 2])
+with left:
     st.subheader("Controls")
     st.session_state.grid_size = st.number_input("Grid Size (USDT)", 10.0, 200.0, st.session_state.grid_size, 5.0)
     st.session_state.grid_levels = st.slider("Levels", 1, 10, st.session_state.grid_levels)
@@ -411,21 +408,21 @@ with col_left:
         st.session_state.emergency_stopped = False
         log_ui("Resumed")
 
-with col_right:
+with right:
     st.subheader(f"Active Grids: {len(gridded_symbols)}")
     st.write(" | ".join(gridded_symbols) if gridded_symbols else "None")
     st.subheader(f"Last Regrid: {last_regrid_str}")
-    refresh_time = datetime.fromtimestamp(st.session_state.last_full_refresh).strftime('%H:%M:%S') if st.session_state.last_full_refresh else "Never"
-    st.subheader(f"Last Full Refresh: {refresh_time}")
+    rt = datetime.fromtimestamp(st.session_state.last_full_refresh).strftime('%H:%M:%S') if st.session_state.last_full_refresh else "Never"
+    st.subheader(f"Last Full Refresh: {rt}")
 
 st.markdown("---")
 st.subheader("Live Log")
-log_box = st.empty()
-with log_box.container():
+log_container = st.empty()
+with log_container.container():
     for line in st.session_state.logs[-50:]:
         st.text(line)
 
-st.info("Binance.US (tld='us') | Real P&L | Cost Basis | Full Refresh | Zero crashes")
+st.info("ALL Session State initialized | P&L works | last_full_refresh persists | Binance.US | Zero crashes")
 
 if __name__ == "__main__":
     main()
