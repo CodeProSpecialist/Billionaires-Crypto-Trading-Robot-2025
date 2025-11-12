@@ -48,7 +48,7 @@ KEEPALIVE_INTERVAL = 1800
 RECONNECT_DELAY = 5
 MAX_RECONNECT_ATTEMPTS = 10
 
-LOG_FILE = "/var/log/infinity_grid_bot.log"
+LOG_FILE = "/infinity_grid_bot.log"
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 LOG_BACKUPS = 7
 
