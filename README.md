@@ -64,7 +64,8 @@ Built for traders who demand precision. Powered by real-time depth, not hype.
 ```bash
 # 1. Install
 
-pip install python-binance websocket-client streamlit sqlalchemy numpy pytz
+pip install streamlit python-binance websocket-client sqlalchemy pytz
+
 
 # 2. Set env
 export BINANCE_API_KEY="your_key"
@@ -73,7 +74,14 @@ export CALLMEBOT_API_KEY="123456"
 export CALLMEBOT_PHONE="15551234567"
 
 # 3. Run
-python3 24-hour-infinity-grid-bot.py
+streamlit run infinity_grid_live.py
+
+open web browser on the computer that
+is running this python program and go to the web page address. 
+You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+
 ```
  
 **NO SUBSCRIPTION • NO CLOUD • FULL CONTROL**
