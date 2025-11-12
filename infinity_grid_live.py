@@ -265,23 +265,33 @@ def setup():
 # --------------------------------------------------------------
 # BACKGROUND WORKER
 # --------------------------------------------------------------
-def worker():
+# REPLACE your background_worker() with this
+def background_worker():
+    global last_full_refresh
+    last_full_refresh = st.session_state.last_full_refresh
     last_rotate = time.time()
+
+    log_ui("BACKGROUND WORKER STARTED")
+
     while True:
         time.sleep(10)
         if st.session_state.get('emergency_stopped', False):
             continue
 
         now = time.time()
-        if (st.session_state.auto_rotate_enabled and
-            now - last_rotate >= st.session_state.rotation_interval):
-            rotate_grids()
+
+        if st.session_state.auto_rotate_enabled and now - last_rotate >= st.session_state.rotation_interval:
+            rotate_to_top25()
             last_rotate = now
 
-        if now - last_full_refresh > 300:
-            update_account()
-            global last_full_refresh
+        if now - last_full_refresh >= REFRESH_INTERVAL:
+            log_ui("FULL REFRESH: Updating balance, portfolio, top 25...")
+            update_account_cache()
+            import_portfolio_symbols()
+            update_top_bid_symbols()
             last_full_refresh = now
+            st.session_state.last_full_refresh = now
+            log_ui("Full refresh done.")
 
 # --------------------------------------------------------------
 # MAIN & UI
