@@ -6,8 +6,9 @@ INFINITY GRID BOT — BINANCE.US LIVE
 - TOP 25 BID VOLUME + ROTATE + SELL NON-TOP 25
 - RISK MANAGEMENT + EMERGENCY STOP
 - P&L + UNREALIZED + DASHBOARD
-- CALLMEBOT: BUNDLED EVERY 10 MIN VIA SINGLE THREAD
+- CALLMEBOT: BUNDLED EVERY 10 MIN
 - CUSTOM WEBSOCKETS: websocket-client + wss://stream.binance.us:9443
+- GREEN/RED LIGHTS: WebSocket + Binance API
 - NO IP BAN — REAL-TIME DATA
 """
 
@@ -100,16 +101,16 @@ last_auto_rotation = 0
 last_top25_snapshot: List[str] = []
 
 # Alert Bundling
-alert_queue: List[Tuple[str, bool]] = []  # (message, force_send)
+alert_queue: List[Tuple[str, bool]] = []
 last_bundle_sent = 0
-BUNDLE_INTERVAL = 10 * 60  # 10 minutes
+BUNDLE_INTERVAL = 10 * 60
 alert_thread_running = False
 
 # Timers
 last_regrid_time = 0
 last_regrid_str = "Never"
 last_full_refresh = 0
-REFRESH_INTERVAL = 300  # 5 minutes
+REFRESH_INTERVAL = 300
 
 price_lock = threading.Lock()
 state_lock = threading.Lock()
@@ -220,7 +221,7 @@ def can_rotate_on_profit() -> Tuple[bool, List[str]]:
     underperforming = []
     try:
         for asset, bal in balances.items():
-            if asset == 'USDT' or bal <= ZERO:
+            if asset == 'USDT': or bal <= ZERO:
                 continue
             symbol = f"{asset}USDT"
             price = get_current_price(symbol)
@@ -349,16 +350,19 @@ def on_price_close(ws, code, msg):
     time.sleep(5)
     start_price_stream()
 
+def on_price_open(ws):
+    log_ui("PRICE WS CONNECTED")
+
 def start_price_stream():
     global price_ws
     price_ws = websocket.WebSocketApp(
         PRICE_STREAM,
         on_message=on_price_message,
         on_error=on_price_error,
-        on_close=on_price_close
+        on_close=on_price_close,
+        on_open=on_price_open
     )
     threading.Thread(target=price_ws.run_forever, kwargs={'ping_interval': 15, 'ping_timeout': 10}, daemon=True).start()
-    log_ui("PRICE STREAM STARTED")
 
 # ---------------------------
 # WEBSOCKETS: DEPTH
@@ -388,6 +392,9 @@ def on_depth_close(ws, code, msg):
     time.sleep(5)
     start_depth_stream()
 
+def on_depth_open(ws):
+    log_ui("DEPTH WS CONNECTED")
+
 def start_depth_stream():
     global depth_ws
     stream_url = build_depth_stream(all_symbols[:50])
@@ -395,10 +402,10 @@ def start_depth_stream():
         stream_url,
         on_message=on_depth_message,
         on_error=on_depth_error,
-        on_close=on_depth_close
+        on_close=on_depth_close,
+        on_open=on_depth_open
     )
     threading.Thread(target=depth_ws.run_forever, kwargs={'ping_interval': 15, 'ping_timeout': 10}, daemon=True).start()
-    log_ui(f"DEPTH STREAM STARTED: {len(all_symbols[:50])} symbols")
 
 # ---------------------------
 # WEBSOCKETS: KLINES
@@ -437,6 +444,9 @@ def on_kline_close(ws, code, msg):
     time.sleep(5)
     start_kline_stream()
 
+def on_kline_open(ws):
+    log_ui("KLINE WS CONNECTED")
+
 def start_kline_stream():
     global kline_ws
     stream_url = build_kline_stream(gridded_symbols)
@@ -444,10 +454,10 @@ def start_kline_stream():
         stream_url,
         on_message=on_kline_message,
         on_error=on_kline_error,
-        on_close=on_kline_close
+        on_close=on_kline_close,
+        on_open=on_kline_open
     )
     threading.Thread(target=kline_ws.run_forever, kwargs={'ping_interval': 15, 'ping_timeout': 10}, daemon=True).start()
-    log_ui(f"KLINE STREAM STARTED: {len(gridded_symbols)} symbols")
 
 # ---------------------------
 # WEBSOCKETS: USER DATA
@@ -496,6 +506,9 @@ def on_user_close(ws, code, msg):
     time.sleep(5)
     start_user_stream()
 
+def on_user_open(ws):
+    log_ui("USER DATA WS CONNECTED")
+
 def start_user_stream():
     global user_data_ws
     key = get_listen_key()
@@ -506,17 +519,19 @@ def start_user_stream():
         stream_url,
         on_message=on_user_message,
         on_error=on_user_error,
-        on_close=on_user_close
+        on_close=on_user_close,
+        on_open=on_user_open
     )
     threading.Thread(target=user_data_ws.run_forever, kwargs={'ping_interval': 15, 'ping_timeout': 10}, daemon=True).start()
-    log_ui("USER DATA STREAM STARTED")
 
 def keep_user_stream_alive():
     while True:
         time.sleep(1800)
         try:
-            binance_client.stream_keepalive(get_listen_key())
-            log_ui("User stream keepalive sent")
+            key = get_listen_key()
+            if key:
+                binance_client.stream_keepalive(key)
+                log_ui("User stream keepalive sent")
         except:
             start_user_stream()
 
@@ -617,7 +632,7 @@ def place_new_grid(symbol: str, levels: int, grid_size: Decimal):
         place_limit_order(symbol, 'SELL', raw_sell, qty)
     last_regrid_time = time.time()
     last_regrid_str = now_str()
-    log_ui(f"GRID: {symbol} @ {price} ({5}L, ${grid_size})")
+    log_ui(f"GRID: {symbol} @ {price} ({levels}L, ${grid_size})")
 
 def compute_qty_for_notional(symbol: str, notional: Decimal) -> Decimal:
     price = get_current_price(symbol)
@@ -718,6 +733,48 @@ def emergency_stop(reason: str = "MANUAL"):
     log_ui(msg)
 
 # ---------------------------
+# DASHBOARD STATUS LIGHTS
+# ---------------------------
+def get_ws_status():
+    return (
+        (price_ws and price_ws.sock and price_ws.sock.connected) or
+        (depth_ws and depth_ws.sock and depth_ws.sock.connected) or
+        (kline_ws and kline_ws.sock and kline_ws.sock.connected) or
+        (user_data_ws and user_data_ws.sock and user_data_ws.sock.connected)
+    )
+
+def get_api_status():
+    try:
+        with api_rate_lock:
+            binance_client.get_server_time()
+        return True
+    except:
+        return False
+
+def display_status_lights():
+    col1, col2 = st.columns(2)
+    ws_ok = get_ws_status()
+    api_ok = get_api_status()
+
+    with col1:
+        st.markdown("### WebSocket")
+        if ws_ok:
+            st.markdown("**ONLINE**")
+            st.markdown('<div style="width:30px;height:30px;background:#00ff00;border-radius:50%;display:inline-block;margin:10px 0;"></div>', unsafe_allow_html=True)
+        else:
+            st.markdown("**OFFLINE**")
+            st.markdown('<div style="width:30px;height:30px;background:#ff0000;border-radius:50%;display:inline-block;margin:10px 0;"></div>', unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("### Binance API")
+        if api_ok:
+            st.markdown("**ONLINE**")
+            st.markdown('<div style="width:30px;height:30px;background:#00ff00;border-radius:50%;display:inline-block;margin:10px 0;"></div>', unsafe_allow_html=True)
+        else:
+            st.markdown("**OFFLINE**")
+            st.markdown('<div style="width:30px;height:30px;background:#ff0000;border-radius:50%;display:inline-block;margin:10px 0;"></div>', unsafe_allow_html=True)
+
+# ---------------------------
 # BACKGROUND THREADS
 # ---------------------------
 def start_background_threads():
@@ -748,6 +805,41 @@ def start_background_threads():
                 time.sleep(5)
 
     threading.Thread(target=rebalancer, daemon=True).start()
+
+# ---------------------------
+# STREAMLIT UI
+# ---------------------------
+def run_streamlit_ui():
+    st.title("INFINITY GRID BOT — BINANCE.US LIVE")
+    st.markdown("---")
+
+    # === STATUS LIGHTS ===
+    display_status_lights()
+    st.markdown("---")
+
+    # === P&L ===
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("P&L")
+        realized = st.session_state.get('realized_pnl', ZERO)
+        unrealized = calculate_unrealized_pnl()
+        total = realized + unrealized
+        st.metric("Realized", f"${realized:+.2f}")
+        st.metric("Unrealized", f"${unrealized:+.2f}")
+        st.metric("Total P&L", f"${total:+.2f}", delta=f"{total:+.2f}")
+
+    with col2:
+        st.subheader("Grid Status")
+        st.write(f"**Active Grids:** {len(gridded_symbols)}")
+        st.write(f"**Last Regrid:** {last_regrid_str}")
+        st.write(f"**USDT Balance:** ${get_balance('USDT'):.2f}")
+
+    st.markdown("---")
+    st.subheader("Logs")
+    log_container = st.empty()
+    while True:
+        log_container.text("\n".join(ui_logs[-20:]))
+        time.sleep(1)
 
 # ---------------------------
 # INIT & MAIN
