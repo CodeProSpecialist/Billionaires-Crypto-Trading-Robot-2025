@@ -265,7 +265,7 @@ def setup():
 # --------------------------------------------------------------
 # BACKGROUND WORKER
 # --------------------------------------------------------------
-# REPLACE your background_worker() with this
+
 def background_worker():
     global last_full_refresh
     last_full_refresh = st.session_state.last_full_refresh
