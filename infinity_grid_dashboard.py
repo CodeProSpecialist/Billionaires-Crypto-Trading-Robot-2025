@@ -221,7 +221,7 @@ def can_rotate_on_profit() -> Tuple[bool, List[str]]:
     underperforming = []
     try:
         for asset, bal in balances.items():
-            if asset == 'USDT': or bal <= ZERO:
+            if asset == 'USDT' or bal <= ZERO:
                 continue
             symbol = f"{asset}USDT"
             price = get_current_price(symbol)
