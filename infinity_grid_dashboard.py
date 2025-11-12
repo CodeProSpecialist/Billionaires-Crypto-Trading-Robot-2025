@@ -24,7 +24,7 @@ import streamlit as st
 # --------------------------------------------------------------
 # 1. SET PAGE CONFIG FIRST
 # --------------------------------------------------------------
-st.set_page_config(page_title="Infinity Grid — BINANCE.US LIVE", layout="wide")
+st.set_page_config(page_title="Infinity Grid Bot for BINANCE.US LIVE", layout="wide")
 
 # --------------------------------------------------------------
 # 2. Binance Client
