@@ -167,7 +167,7 @@ def place_limit_order(symbol, side, price, quantity):
         return False
 
     notional = price * quantity
-    if notional < Decimal(info['minNotional']:
+    if notional < Decimal(info['minNotional']):
         log(f"Notional too low {symbol}: {notional} < {info['minNotional']}")
         return False
 
