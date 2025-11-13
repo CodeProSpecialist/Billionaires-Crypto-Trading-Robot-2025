@@ -5,6 +5,7 @@ INFINITY GRID BOT 2025 — SAFE MONEY EDITION
 - Qty check before SELL
 - Never overspend
 - Never sell what you don't have
+- Run counter + WhatsApp alert on every rebalance
 """
 
 import streamlit as st
@@ -16,11 +17,12 @@ import requests
 import websocket
 from decimal import Decimal, getcontext
 from datetime import datetime
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+import pytz
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import sys
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 # ========================= CONFIG =========================
 getcontext().prec = 28
@@ -29,6 +31,7 @@ SAFETY_BUFFER = Decimal('0.95')  # Use only 95% of available balance
 COOLDOWN_SECONDS = 72 * 3600  # 72 hours
 
 LOG_FILE = os.path.expanduser("~/infinity_grid_bot.log")
+COUNTER_FILE = "run_counter.txt"  # <-- Run counter file
 
 def setup_logging():
     logger = logging.getLogger("infinity_bot")
@@ -75,8 +78,46 @@ def send_whatsapp(msg):
         try:
             msg = requests.utils.quote(msg)
             requests.get(f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={msg}&apikey={key}", timeout=5)
-        except:
-            pass
+        except Exception as e:
+            log(f"WhatsApp send failed: {e}")
+
+# ========================= RUN COUNTER WITH ALERT =========================
+def increment_run_counter(to_add, to_remove, new_grid_count, total_positions):
+    """
+    Log rebalance in format:
+    +X Buy, -Y Sell = Z Total Grids for N positions
+    With 24-hour Central Time and WhatsApp alert.
+    """
+    central_tz = pytz.timezone('US/Central')
+
+    # Determine next run number
+    if os.path.exists(COUNTER_FILE):
+        with open(COUNTER_FILE, 'r') as f:
+            run_number = len(f.readlines()) + 1
+    else:
+        run_number = 1
+
+    # 24-hour Central Time
+    now_central = datetime.now(central_tz)
+    timestamp = now_central.strftime("%B %d %Y %H:%M:%S Central Time")
+    # Clean up leading zero in day
+    timestamp = timestamp.replace(" 0", " ").replace("  ", " ")
+
+    # Format: +3 Buy, -1 Sell = 10 Total Grids for 187 positions
+    summary = (f"+{len(to_add)} Buy, "
+               f"-{len(to_remove)} Sell = "
+               f"{new_grid_count} Total Grids for {total_positions} positions")
+
+    line = f"Run #{run_number}: {timestamp} | {summary}\n"
+
+    # Write to file
+    with open(COUNTER_FILE, 'a') as f:
+        f.write(line)
+
+    # Log and send alert
+    log(f"Rebalance recorded → {summary}")
+    alert_msg = f"REBALANCE #{run_number}\n{summary}\n{timestamp}"
+    send_whatsapp(alert_msg)
 
 # ========================= BALANCE & INFO =========================
 def update_balances():
@@ -126,7 +167,7 @@ def place_limit_order(symbol, side, price, quantity):
         return False
 
     notional = price * quantity
-    if notional < Decimal(info['minNotional']):
+    if notional < Decimal(info['minNotional']:
         log(f"Notional too low {symbol}: {notional} < {info['minNotional']}")
         return False
 
@@ -305,8 +346,18 @@ def rotate_grids():
 
     maintain_mandatory_buys()
 
+    # Count total USDT trading pairs
+    total_positions = len([s for s in all_symbols if s.endswith('USDT')])
+
     log(f"ROTATED +{len(to_add)} -{len(to_remove)} → {len(gridded_symbols)} GRIDS")
-    send_whatsapp(f"GRID UPDATE: {len(to_add)} new grids")
+
+    # RECORD REBALANCE WITH 24H TIME + ALERT
+    increment_run_counter(
+        to_add=to_add,
+        to_remove=to_remove,
+        new_grid_count=len(gridded_symbols),
+        total_positions=total_positions
+    )
 
 # ========================= WEBSOCKET =========================
 def start_websockets():
