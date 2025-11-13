@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID BOT 2025 — SAFE MONEY EDITION
-- Cash check before BUY
-- Qty check before SELL
-- Never overspend
-- Never sell what you don't have
-- Run counter + WhatsApp alert on every rebalance
+- Rebalance on every fill
+- Auto-rotate on timer
+- WebSocket always alive + status
+- gridded_symbols & total_positions updated in real-time
+- Dashboard shows Active / Total
 """
 
 import streamlit as st
@@ -27,11 +27,11 @@ from binance.exceptions import BinanceAPIException
 # ========================= CONFIG =========================
 getcontext().prec = 28
 ZERO = Decimal('0')
-SAFETY_BUFFER = Decimal('0.95')  # Use only 95% of available balance
-COOLDOWN_SECONDS = 72 * 3600  # 72 hours
+SAFETY_BUFFER = Decimal('0.95')
+COOLDOWN_SECONDS = 72 * 3600
 
 LOG_FILE = os.path.expanduser("~/infinity_grid_bot.log")
-COUNTER_FILE = "run_counter.txt"  # <-- Run counter file
+COUNTER_FILE = "run_counter.txt"
 
 def setup_logging():
     logger = logging.getLogger("infinity_bot")
@@ -81,43 +81,44 @@ def send_whatsapp(msg):
         except Exception as e:
             log(f"WhatsApp send failed: {e}")
 
-# ========================= RUN COUNTER WITH ALERT =========================
+# ========================= RUN COUNTER WITH STATE SYNC =========================
 def increment_run_counter(to_add, to_remove, new_grid_count, total_positions):
     """
-    Log rebalance in format:
-    +X Buy, -Y Sell = Z Total Grids for N positions
-    With 24-hour Central Time and WhatsApp alert.
+    Updates:
+    - run_counter.txt
+    - WhatsApp alert
+    - st.session_state.gridded_symbols (in sync)
+    - st.session_state.total_positions
     """
     central_tz = pytz.timezone('US/Central')
 
-    # Determine next run number
     if os.path.exists(COUNTER_FILE):
         with open(COUNTER_FILE, 'r') as f:
             run_number = len(f.readlines()) + 1
     else:
         run_number = 1
 
-    # 24-hour Central Time
     now_central = datetime.now(central_tz)
     timestamp = now_central.strftime("%B %d %Y %H:%M:%S Central Time")
-    # Clean up leading zero in day
     timestamp = timestamp.replace(" 0", " ").replace("  ", " ")
 
-    # Format: +3 Buy, -1 Sell = 10 Total Grids for 187 positions
     summary = (f"+{len(to_add)} Buy, "
                f"-{len(to_remove)} Sell = "
                f"{new_grid_count} Total Grids for {total_positions} positions")
 
     line = f"Run #{run_number}: {timestamp} | {summary}\n"
 
-    # Write to file
     with open(COUNTER_FILE, 'a') as f:
         f.write(line)
 
-    # Log and send alert
     log(f"Rebalance recorded → {summary}")
     alert_msg = f"REBALANCE #{run_number}\n{summary}\n{timestamp}"
     send_whatsapp(alert_msg)
+
+    # === CRITICAL: Sync Streamlit state ===
+    st.session_state.gridded_symbols = gridded_symbols.copy()
+    st.session_state.total_positions = total_positions
+    st.session_state.last_regrid_str = now_str()
 
 # ========================= BALANCE & INFO =========================
 def update_balances():
@@ -171,7 +172,6 @@ def place_limit_order(symbol, side, price, quantity):
         log(f"Notional too low {symbol}: {notional} < {info['minNotional']}")
         return False
 
-    # CASH CHECK FOR BUY
     if side == 'BUY':
         needed = notional * SAFETY_BUFFER
         usdt_free = account_balances.get('USDT', ZERO)
@@ -179,7 +179,6 @@ def place_limit_order(symbol, side, price, quantity):
             log(f"NOT ENOUGH USDT for {symbol} BUY: need {needed:.2f}, have {usdt_free:.2f}")
             return False
 
-    # QTY CHECK FOR SELL
     if side == 'SELL':
         base = symbol.replace('USDT', '')
         coin_free = account_balances.get(base, ZERO)
@@ -254,7 +253,6 @@ def place_grid(symbol):
         log(f"Qty too small for {symbol}")
         return
 
-    # Check total BUY cost
     total_buy_cost = qty * price * st.session_state.grid_levels * SAFETY_BUFFER
     if total_buy_cost > account_balances.get('USDT', ZERO):
         log(f"SKIPPING {symbol}: Not enough USDT for {st.session_state.grid_levels} buy levels")
@@ -270,8 +268,6 @@ def place_grid(symbol):
         if place_limit_order(symbol, 'SELL', sell_price, qty):
             sells += 1
 
-    global last_regrid_str
-    last_regrid_str = now_str()
     log(f"GRID {symbol} | B:{buys} S:{sells} | ${qty_usdt} per level")
 
 # ========================= MAINTAIN MANDATORY BUYS =========================
@@ -308,7 +304,7 @@ def maintain_mandatory_buys():
 
 # ========================= ROTATE WITH SAFETY =========================
 def rotate_grids():
-    update_balances()  # Refresh balance
+    update_balances()
     if not bid_volume:
         log("No price data, skipping rotation")
         return
@@ -325,9 +321,7 @@ def rotate_grids():
             log(f"Canceled orders for {s}")
         except Exception as e:
             log(f"Cancel failed for {s}: {e}")
-        # Sell holdings
         place_market_sell(s)
-        # Blacklist
         st.session_state.blacklisted[s] = time.time()
         gridded_symbols.remove(s)
 
@@ -346,12 +340,11 @@ def rotate_grids():
 
     maintain_mandatory_buys()
 
-    # Count total USDT trading pairs
     total_positions = len([s for s in all_symbols if s.endswith('USDT')])
 
     log(f"ROTATED +{len(to_add)} -{len(to_remove)} → {len(gridded_symbols)} GRIDS")
 
-    # RECORD REBALANCE WITH 24H TIME + ALERT
+    # === SYNC STATE TO DASHBOARD ===
     increment_run_counter(
         to_add=to_add,
         to_remove=to_remove,
@@ -361,17 +354,27 @@ def rotate_grids():
 
 # ========================= WEBSOCKET =========================
 def start_websockets():
+    if st.session_state.get('ws_thread_running', False):
+        return
+
     streams = "/".join([f"{s.lower()}@ticker" for s in all_symbols[:100]])
     url = f"wss://stream.binance.us:9443/stream?streams={streams}"
 
     def run():
+        st.session_state.ws_thread_running = True
+        st.session_state.ws_last_connected = now_str()
+        log("WebSocket thread started")
         ws = websocket.WebSocketApp(url, on_message=lambda ws, msg: on_msg(msg))
-        while True:
+        while st.session_state.bot_running and not st.session_state.shutdown:
             try:
                 ws.run_forever(ping_interval=25)
+                if st.session_state.bot_running:
+                    time.sleep(5)
+            except Exception as e:
+                log(f"WS crashed: {e}")
                 time.sleep(5)
-            except:
-                time.sleep(5)
+        st.session_state.ws_thread_running = False
+        log("WebSocket thread terminated")
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -386,13 +389,89 @@ def on_msg(msg):
                 bid_volume[sym] = Decimal(str(payload['c']))
     except: pass
 
+# ========================= WEBSOCKET KEEPER =========================
+def websocket_keeper():
+    last_restart = 0
+    while not st.session_state.shutdown:
+        time.sleep(5)
+        if st.session_state.bot_running:
+            if (not st.session_state.get('ws_thread_running', False) or
+                time.time() - last_restart > 3600):
+                log("WebSocket keeper: starting/restarting...")
+                start_websockets()
+                last_restart = time.time()
+
+# ========================= ORDER MONITOR =========================
+def start_order_monitor():
+    if st.session_state.get('order_monitor_running', False):
+        return
+
+    def keepalive(listen_key):
+        while not st.session_state.shutdown:
+            time.sleep(1800)
+            try:
+                client.stream_keepalive(listen_key)
+                log("User stream keepalive sent")
+            except Exception as e:
+                log(f"Keepalive failed: {e}")
+
+    def on_open(ws): log("User stream connected")
+    def on_close(ws, *args): log("User stream closed")
+    def on_error(ws, error): log(f"User stream error: {error}")
+
+    def on_message(ws, msg):
+        try:
+            data = json.loads(msg)
+            if data['e'] == 'executionReport' and data['X'] in ['FILLED', 'PARTIALLY_FILLED']:
+                symbol = data['s']
+                side = data['S']
+                qty = data['q']
+                price = data['p']
+                log(f"Order filled for {symbol}: {side} {qty} @ {price}")
+                rotate_grids()
+        except Exception as e:
+            log(f"User stream message error: {e}")
+
+    try:
+        listen_key = client.stream_get_listen_key()['listenKey']
+    except Exception as e:
+        log(f"Failed to get listen key: {e}")
+        return
+
+    url = f"wss://stream.binance.us:9443/ws/{listen_key}"
+    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+    threading.Thread(target=keepalive, args=(listen_key,), daemon=True).start()
+
+    def run_ws():
+        while not st.session_state.shutdown:
+            try:
+                ws.run_forever(ping_interval=25)
+                time.sleep(5)
+            except:
+                time.sleep(5)
+
+    threading.Thread(target=run_ws, daemon=True).start()
+    st.session_state.order_monitor_running = True
+    log("Order monitor thread started")
+
+# ========================= AUTO-ROTATE =========================
+def auto_rotate_loop():
+    while not st.session_state.shutdown:
+        time.sleep(st.session_state.rotation_interval)
+        if st.session_state.auto_rotate and st.session_state.bot_running:
+            log("AUTO-ROTATE triggered by timer")
+            rotate_grids()
+
 # ========================= MAIN =========================
 def main():
-    for k, v in {
+    defaults = {
         'bot_running': False, 'grid_size': 50.0, 'grid_levels': 5,
         'target_grid_count': 10, 'auto_rotate': True, 'rotation_interval': 300,
-        'logs': [], 'shutdown': False, 'blacklisted': {}
-    }.items():
+        'logs': [], 'shutdown': False, 'blacklisted': {},
+        'order_monitor_running': False, 'ws_thread_running': False,
+        'gridded_symbols': [], 'total_positions': 0, 'last_regrid_str': "Never"
+    }
+    for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -415,6 +494,9 @@ def main():
                 load_symbol_info()
                 update_balances()
                 start_websockets()
+                start_order_monitor()
+                threading.Thread(target=websocket_keeper, daemon=True).start()
+                threading.Thread(target=auto_rotate_loop, daemon=True).start()
                 time.sleep(3)
                 rotate_grids()
                 st.session_state.bot_running = True
@@ -424,19 +506,43 @@ def main():
     else:
         update_balances()
         usdt = account_balances.get('USDT', ZERO)
-        st.metric("USDT Available", f"${usdt:.2f}")
-        st.metric("Active Grids", len(gridded_symbols))
-        st.metric("Last Update", last_regrid_str)
+
+        # === LIVE METRICS ===
+        colm1, colm2, colm3, colm4 = st.columns(4)
+        with colm1:
+            st.metric("USDT Available", f"${usdt:.2f}")
+        with colm2:
+            active = len(st.session_state.gridded_symbols)
+            total = st.session_state.total_positions
+            st.metric("Active Grids", active, f"/ {total} total")
+        with colm3:
+            st.metric("Last Rebalance", st.session_state.last_regrid_str)
+        with colm4:
+            ws_status = "CONNECTED" if st.session_state.get('ws_thread_running', False) else "OFFLINE"
+            ws_color = "green" if ws_status == "CONNECTED" else "red"
+            last_conn = st.session_state.get('ws_last_connected', 'Never')
+            st.markdown(
+                f"<div style='text-align: center;'><strong>WS</strong><br>"
+                f"<span style='color: {ws_color}; font-size: 1.2em;'>{ws_status}</span><br>"
+                f"<small>{last_conn}</small></div>",
+                unsafe_allow_html=True
+            )
 
         col1, col2 = st.columns([1, 2])
         with col1:
             st.session_state.grid_size = st.number_input("Grid Size", 10.0, 500.0, st.session_state.grid_size)
             st.session_state.grid_levels = st.slider("Levels", 1, 10, st.session_state.grid_levels)
             st.session_state.target_grid_count = st.slider("Max Grids", 1, 25, st.session_state.target_grid_count)
-            if st.button("Rotate Now"): rotate_grids()
+            st.session_state.auto_rotate = st.checkbox("Auto-rotate", value=st.session_state.auto_rotate)
+            st.session_state.rotation_interval = st.number_input(
+                "Rotate every (seconds)", 60, 3600, st.session_state.rotation_interval, step=60
+            )
+            if st.button("Rotate Now"):
+                rotate_grids()
 
         with col2:
-            st.write("**Active:** " + " | ".join(gridded_symbols[:15]))
+            active_symbols = st.session_state.gridded_symbols[:15]
+            st.write("**Active:** " + " | ".join(active_symbols) if active_symbols else "None")
 
         st.markdown("---")
         st.subheader("Log")
@@ -444,6 +550,14 @@ def main():
             st.code(line)
 
         st.success("CASH & QTY CHECKED — NO OVERSpending")
+
+        if st.button("STOP BOT", type="primary"):
+            st.session_state.bot_running = False
+            st.session_state.shutdown = True
+            st.rerun()
+        else:
+            time.sleep(10)
+            st.rerun()
 
 if __name__ == "__main__":
     main()
