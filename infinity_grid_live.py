@@ -26,6 +26,7 @@ import sys
 getcontext().prec = 28
 ZERO = Decimal('0')
 SAFETY_BUFFER = Decimal('0.95')  # Use only 95% of available balance
+COOLDOWN_SECONDS = 72 * 3600  # 72 hours
 
 LOG_FILE = os.path.expanduser("~/infinity_grid_bot.log")
 
@@ -164,6 +165,36 @@ def place_limit_order(symbol, side, price, quantity):
         log(f"ORDER ERROR {symbol}: {e}")
         return False
 
+def place_market_sell(symbol):
+    info = symbol_info.get(symbol)
+    if not info:
+        return False
+
+    base = symbol.replace('USDT', '')
+    quantity = account_balances.get(base, ZERO) * SAFETY_BUFFER
+    quantity = round_step(quantity, info['stepSize'])
+
+    if quantity < info['minQty']:
+        log(f"Qty too small for market sell {symbol}: {quantity}")
+        return False
+
+    try:
+        order = client.create_order(
+            symbol=symbol,
+            side='SELL',
+            type='MARKET',
+            quantity=f"{quantity:.8f}".rstrip('0').rstrip('.')
+        )
+        log(f"MARKET SOLD {symbol} {quantity}")
+        send_whatsapp(f"MARKET SOLD {symbol} {quantity}")
+        return True
+    except BinanceAPIException as e:
+        log(f"MARKET SELL FAILED {symbol}: {e.message} (Code: {e.code})")
+        return False
+    except Exception as e:
+        log(f"MARKET SELL ERROR {symbol}: {e}")
+        return False
+
 # ========================= SAFE GRID =========================
 def place_grid(symbol):
     price = bid_volume.get(symbol, ZERO)
@@ -202,6 +233,38 @@ def place_grid(symbol):
     last_regrid_str = now_str()
     log(f"GRID {symbol} | B:{buys} S:{sells} | ${qty_usdt} per level")
 
+# ========================= MAINTAIN MANDATORY BUYS =========================
+def maintain_mandatory_buys():
+    update_balances()
+    for asset, bal in account_balances.items():
+        if asset == 'USDT' or bal <= ZERO:
+            continue
+        symbol = asset + 'USDT'
+        if symbol not in symbol_info:
+            continue
+        if symbol in st.session_state.blacklisted:
+            timestamp = st.session_state.blacklisted[symbol]
+            if time.time() - timestamp < COOLDOWN_SECONDS:
+                continue
+        try:
+            open_orders = client.get_open_orders(symbol=symbol)
+            has_buy = any(o['side'] == 'BUY' for o in open_orders)
+            if has_buy:
+                continue
+        except Exception as e:
+            log(f"Open orders check failed for {symbol}: {e}")
+            continue
+        price = bid_volume.get(symbol, ZERO)
+        if price <= ZERO:
+            continue
+        buy_price = price * Decimal('0.985')
+        qty_usdt = Decimal(str(st.session_state.grid_size))
+        raw_qty = qty_usdt / buy_price
+        info = symbol_info[symbol]
+        qty = round_step(raw_qty, info['stepSize'])
+        if place_limit_order(symbol, 'BUY', buy_price, qty):
+            log(f"Placed mandatory BUY for owned {symbol} @ {buy_price}")
+
 # ========================= ROTATE WITH SAFETY =========================
 def rotate_grids():
     update_balances()  # Refresh balance
@@ -218,15 +281,29 @@ def rotate_grids():
     for s in to_remove:
         try:
             client.cancel_open_orders(symbol=s)
-            log(f"Canceled {s}")
-        except: pass
+            log(f"Canceled orders for {s}")
+        except Exception as e:
+            log(f"Cancel failed for {s}: {e}")
+        # Sell holdings
+        place_market_sell(s)
+        # Blacklist
+        st.session_state.blacklisted[s] = time.time()
         gridded_symbols.remove(s)
 
     for s in to_add:
         if s not in symbol_info:
             continue
+        if s in st.session_state.blacklisted:
+            timestamp = st.session_state.blacklisted[s]
+            if time.time() - timestamp < COOLDOWN_SECONDS:
+                log(f"Skipping {s} due to cooldown")
+                continue
+            else:
+                del st.session_state.blacklisted[s]
         gridded_symbols.append(s)
         place_grid(s)
+
+    maintain_mandatory_buys()
 
     log(f"ROTATED +{len(to_add)} -{len(to_remove)} → {len(gridded_symbols)} GRIDS")
     send_whatsapp(f"GRID UPDATE: {len(to_add)} new grids")
@@ -263,7 +340,7 @@ def main():
     for k, v in {
         'bot_running': False, 'grid_size': 50.0, 'grid_levels': 5,
         'target_grid_count': 10, 'auto_rotate': True, 'rotation_interval': 300,
-        'logs': [], 'shutdown': False
+        'logs': [], 'shutdown': False, 'blacklisted': {}
     }.items():
         if k not in st.session_state:
             st.session_state[k] = v
