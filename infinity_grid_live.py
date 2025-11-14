@@ -594,6 +594,52 @@ def initialise_bot():
         st.session_state.init_status = f"ERROR: {e}"
         st.session_state.bot_running = False
 
+# --- SETTINGS PANEL ---
+st.subheader("Bot Settings")
+
+if "rebalance_interval" not in st.session_state:
+    st.session_state.rebalance_interval = 7200
+if "max_position_pct" not in st.session_state:
+    st.session_state.max_position_pct = 5.0
+if "min_trade_value" not in st.session_state:
+    st.session_state.min_trade_value = 5.0
+if "auto_rebalance" not in st.session_state:
+    st.session_state.auto_rebalance = True
+
+# Auto-Rebalance toggle
+st.checkbox(
+    "Auto Rebalance",
+    key="auto_rebalance"
+)
+
+# Rebalance Interval slider
+st.slider(
+    "Rebalance Interval (s)",
+    min_value=600,
+    max_value=21600,
+    value=st.session_state.rebalance_interval,
+    key="rebalance_interval"
+)
+
+# Max position % slider
+st.slider(
+    "Max % per Coin",
+    min_value=1.0,
+    max_value=20.0,
+    value=st.session_state.max_position_pct,
+    key="max_position_pct"
+)
+
+# Minimum trade size slider
+st.slider(
+    "Minimum Trade ($)",
+    min_value=1.0,
+    max_value=100.0,
+    value=st.session_state.min_trade_value,
+    key="min_trade_value"
+)
+
+
 # ========================= STREAMLIT UI =========================
 def main():
     global client
