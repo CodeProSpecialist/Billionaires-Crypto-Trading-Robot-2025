@@ -10,12 +10,13 @@ INFINITY GRID BOT 2025 — AUTO-CYCLE + HARD-CODED GRIDS
 - Balance cache (1 per 10 s)
 - Force wake-up button
 - No extra threads (all logic in main loop)
+- FIXED: Orders placed, wake-up works, no sleeping too much
 """
 
 import streamlit as st
 import os
 import time
-import threading          # <-- needed for locks
+import threading
 import json
 import requests
 import websocket
@@ -40,12 +41,6 @@ ws_instances: list = []
 user_ws = None
 listen_key: str | None = None
 listen_key_lock = threading.Lock()
-
-# ──────────────────────  ORDER BOOK STATE  ──────────────────────
-best_bid   = {}
-best_ask   = {}
-ob_lock    = threading.Lock()
-ob_active  = False
 
 # ──────────────────────  AUTO-CYCLE CONTROL  ──────────────────────
 bot_start_time = 0.0
@@ -101,7 +96,7 @@ account_balances = {}
 state_lock = threading.Lock()
 last_regrid_str = "Never"
 
-last_keepalive_time = 0.0          # <-- global
+last_keepalive_time = 0.0
 
 # ========================= RATE LIMITER =========================
 def ratelimit_api(func):
@@ -437,12 +432,11 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
 
     def _on_close(self, ws, code, reason):
         log(f"WS CLOSED ({'user' if self.is_user_stream else 'market'}) code={code} reason={reason}", "WARNING" if code in (1000, 1001) else "ERROR")
-        global ws_connected, user_ws_connected, ob_active
+        global ws_connected, user_ws_connected
         if self.is_user_stream:
             user_ws_connected = False
         else:
             ws_connected = False
-            ob_active = False
 
     def _on_pong(self, ws, *args):
         self.last_pong = time.time()
@@ -482,15 +476,6 @@ def on_market_message(ws, message):
             if price > ZERO:
                 with state_lock:
                     bid_volume[sym] = price
-        elif stream.endswith('@depth20@100ms'):
-            global ob_active
-            bids = payload.get('bids', [])
-            asks = payload.get('asks', [])
-            if bids and asks:
-                with ob_lock:
-                    best_bid[sym] = Decimal(str(bids[0][0]))
-                    best_ask[sym] = Decimal(str(asks[0][0]))
-                ob_active = True
     except Exception as e:
         log(f"on_market_message error: {e}", "ERROR")
 
@@ -504,19 +489,15 @@ def on_user_message(ws, message):
         log(f"on_user_message error: {e}", "ERROR")
 
 def start_market_websocket():
-    global ob_active
     for ws in ws_instances:
         try: ws.close()
         except: pass
     ws_instances.clear()
-    best_bid.clear()
-    best_ask.clear()
-    ob_active = False
     symbols = [s.lower() for s in all_symbols if s.endswith('USDT')]
     if not symbols:
         log("No symbols for market WS", "WARNING")
         return
-    streams = [f"{s}@ticker" for s in symbols] + [f"{s}@depth20@100ms" for s in symbols]
+    streams = [f"{s}@ticker" for s in symbols]
     chunks = [streams[i:i+MAX_STREAMS_PER_CONNECTION] for i in range(0, len(streams), MAX_STREAMS_PER_CONNECTION)]
     for chunk in chunks:
         url = f"{WS_BASE}{'/'.join(chunk)}"
@@ -524,7 +505,7 @@ def start_market_websocket():
         ws_instances.append(ws)
         threading.Thread(target=ws.run_forever, daemon=True).start()
         time.sleep(0.4)
-    log(f"Market WS started ({len(chunks)} connections)")
+    log(f"Market WS started ({len(chunks)} connections) - TICKER ONLY")
 
 def start_user_stream():
     global user_ws, listen_key
@@ -551,12 +532,7 @@ def keepalive_user_stream():
         log(f"Keep-alive error: {e}", "ERROR")
 
 def get_mid_price(symbol):
-    if ob_active:
-        with ob_lock:
-            b = best_bid.get(symbol)
-            a = best_ask.get(symbol)
-        if b and a and b > ZERO and a > ZERO:
-            return (b + a) / 2
+    # Only uses ticker price
     return bid_volume.get(symbol, ZERO)
 
 # ========================= AUTO-CYCLE LOOP =========================
@@ -594,8 +570,6 @@ def auto_rotate_loop():
         if user_ws:
             try: user_ws.close()
             except: pass
-        global ob_active
-        ob_active = False
 
         sleep_start = time.time()
         while (time.time() - sleep_start) < SLEEP_PERIOD_SECONDS:
@@ -646,7 +620,7 @@ def main():
         send_whatsapp("BOT AUTO-CYCLE STARTED")
 
     # ---- Keep-alive & dashboard -------------------------------------------------
-    global last_keepalive_time          # <-- **FIX**
+    global last_keepalive_time
     now = time.time()
     if now - last_keepalive_time > KEEPALIVE_INTERVAL:
         keepalive_user_stream()
@@ -664,13 +638,10 @@ def main():
             st.session_state.force_wakeup = True
             st.rerun()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1: st.metric("USDT", f"${usdt:.2f}")
     with c2: st.metric("Active", len(gridded_symbols))
     with c3: st.metric("Status", "RUN" if in_startup_period() else "SLEEP")
-    with c4:
-        ob_status = "ON" if ob_active else "OFF"
-        st.markdown(f"<small>OB: {ob_status}</small>", unsafe_allow_html=True)
 
     st.code("\n".join(st.session_state.logs[-10:]))
     time.sleep(1)
