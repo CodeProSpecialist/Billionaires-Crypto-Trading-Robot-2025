@@ -8,7 +8,7 @@ INFINITY GRID BOT 2025 — AUTO-CYCLE + HARD-CODED GRIDS
   TOTAL_NUMBER_OF_GRIDS = 10
 - Rate-limited API
 - Balance cache (1 per 10s)
-- Force wake-up button
+- Force wake-up button (now with Event signaling)
 - No user control
 """
 
@@ -29,9 +29,9 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 # ──────────────────────  HARD-CODED GRID SETTINGS  ──────────────────────
-USDT_PER_GRID_LINE_BUY = Decimal('10.00')      # $10 per BUY line
-NUMBER_OF_GRIDS_PER_POSITION = 2               # 2 grids per symbol
-TOTAL_NUMBER_OF_GRIDS = 10                     # Max 10 active grids
+USDT_PER_GRID_LINE_BUY = Decimal('10.00')      # $10 per BUY order
+NUMBER_OF_GRIDS_PER_POSITION = 2               # 2 BUY/SELL lines per symbol
+TOTAL_NUMBER_OF_GRIDS = 10                     # Max 10 active symbols
 
 # ──────────────────────  WEBSOCKET CORE  ──────────────────────
 ws_connected = False
@@ -49,8 +49,9 @@ ob_active  = False
 
 # ──────────────────────  AUTO-CYCLE CONTROL  ──────────────────────
 bot_start_time = 0.0
-STARTUP_PERIOD_SECONDS = 300   # 5 min run
-SLEEP_PERIOD_SECONDS = 300     # 5 min sleep
+STARTUP_PERIOD_SECONDS = 300     # 5 min run
+SLEEP_PERIOD_SECONDS = 300       # 5 min sleep
+wakeup_signal = threading.Event()  # Signal for force wake-up
 
 # ──────────────────────  RATE LIMITER  ──────────────────────
 API_CALL_TIMES = []
@@ -176,6 +177,12 @@ def in_startup_period() -> bool:
     if bot_start_time <= 0:
         return False
     return (time.time() - bot_start_time) < STARTUP_PERIOD_SECONDS
+
+# ========================= FORCE WAKE UP =========================
+def force_wakeup():
+    log("FORCE WAKE UP: Starting new 5-min run")
+    send_whatsapp("FORCE WAKE UP: Bot activated")
+    wakeup_signal.set()
 
 # ========================= RUN COUNTER =========================
 def increment_run_counter(to_add, to_remove, new_grid_count, total_positions):
@@ -560,13 +567,6 @@ def get_mid_price(symbol):
             return (b + a) / 2
     return bid_volume.get(symbol, ZERO)
 
-# ========================= FORCE WAKE UP =========================
-def force_wakeup():
-    if not in_startup_period():
-        log("FORCE WAKE UP: Starting new 5-min run")
-        send_whatsapp("FORCE WAKE UP: Bot activated")
-        st.session_state.force_wakeup = True
-
 # ========================= AUTO-CYCLE LOOP =========================
 def auto_rotate_loop():
     while not st.session_state.shutdown:
@@ -574,7 +574,6 @@ def auto_rotate_loop():
         st.session_state.bot_running = True
         global bot_start_time
         bot_start_time = time.time()
-        st.session_state.force_wakeup = False
 
         if not ws_connected:
             start_market_websocket()
@@ -585,7 +584,8 @@ def auto_rotate_loop():
 
         start = time.time()
         while (time.time() - start) < STARTUP_PERIOD_SECONDS:
-            if st.session_state.shutdown or st.session_state.force_wakeup:
+            if st.session_state.shutdown or wakeup_signal.is_set():
+                wakeup_signal.clear()
                 break
             time.sleep(30)
             if in_startup_period():
@@ -607,8 +607,9 @@ def auto_rotate_loop():
 
         sleep_start = time.time()
         while (time.time() - sleep_start) < SLEEP_PERIOD_SECONDS:
-            if st.session_state.shutdown or st.session_state.force_wakeup:
+            if st.session_state.shutdown or wakeup_signal.is_set():
                 log("SLEEP INTERRUPTED BY WAKE-UP")
+                wakeup_signal.clear()
                 break
             remaining = int(SLEEP_PERIOD_SECONDS - (time.time() - sleep_start))
             with st.empty().container():
