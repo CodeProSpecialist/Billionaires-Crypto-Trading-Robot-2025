@@ -7,16 +7,15 @@ INFINITY GRID BOT 2025 — AUTO-CYCLE + HARD-CODED GRIDS
   NUMBER_OF_GRIDS_PER_POSITION = 2
   TOTAL_NUMBER_OF_GRIDS = 10
 - Rate-limited API
-- Balance cache (1 per 10s)
+- Balance cache (1 per 10 s)
 - Force wake-up button
-- No user control
-- No extra threads: all in main loop
+- No extra threads (all logic in main loop)
 """
 
 import streamlit as st
 import os
 import time
-import threading
+import threading          # <-- needed for locks
 import json
 import requests
 import websocket
@@ -102,7 +101,7 @@ account_balances = {}
 state_lock = threading.Lock()
 last_regrid_str = "Never"
 
-last_keepalive_time = 0.0
+last_keepalive_time = 0.0          # <-- global
 
 # ========================= RATE LIMITER =========================
 def ratelimit_api(func):
@@ -110,7 +109,7 @@ def ratelimit_api(func):
         with RATE_LIMIT_LOCK:
             now = time.time()
             API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
-            if len(API_CALL_TIMES) >= MAX_CALLS_PER_MINUTE:
+            if len(API_CALL_TIMES) >= MAX_CALLS synth:
                 delay = 60 - (now - API_CALL_TIMES[0])
                 log(f"RATE LIMIT: Waiting {delay:.1f}s", "WARNING")
                 time.sleep(max(0, delay))
@@ -372,7 +371,6 @@ def rotate_grids():
             return
         top = sorted(bid_volume.items(), key=lambda x: x[1], reverse=True)[:25]
         target_symbols = [s for s, _ in top]
-        # Limit to TOTAL_NUMBER_OF_GRIDS
         target_count = min(TOTAL_NUMBER_OF_GRIDS, len(target_symbols))
         targets = target_symbols[:target_count]
         to_add = [s for s in targets if s not in gridded_symbols]
@@ -647,7 +645,8 @@ def main():
         log("AUTO-CYCLE STARTED: 5min run → 5min sleep")
         send_whatsapp("BOT AUTO-CYCLE STARTED")
 
-    # Main loop: keepalive + dashboard
+    # ---- Keep-alive & dashboard -------------------------------------------------
+    global last_keepalive_time          # <-- **FIX**
     now = time.time()
     if now - last_keepalive_time > KEEPALIVE_INTERVAL:
         keepalive_user_stream()
