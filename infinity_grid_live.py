@@ -60,7 +60,7 @@ DEFAULTS = {
 # Binance client
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
-client = Client(API_KEY, API_SECRET)
+client = Client(API_KEY, API_SECRET, tld='us')
 # client.API_URL = 'https://testnet.binance.vision/api'  # Uncomment for testnet
 
 # Global websocket managers
