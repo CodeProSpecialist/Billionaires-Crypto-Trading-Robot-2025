@@ -8,14 +8,14 @@ INFINITY GRID BOT 2025 — AUTO-CYCLE + HARD-CODED GRIDS
   TOTAL_NUMBER_OF_GRIDS = 10
 - Rate-limited API
 - Balance cache (1 per 10s)
-- Force wake-up button (now with Event signaling)
+- Force wake-up button
 - No user control
+- No extra threads: all in main loop
 """
 
 import streamlit as st
 import os
 import time
-import threading
 import json
 import requests
 import websocket
@@ -51,7 +51,6 @@ ob_active  = False
 bot_start_time = 0.0
 STARTUP_PERIOD_SECONDS = 300     # 5 min run
 SLEEP_PERIOD_SECONDS = 300       # 5 min sleep
-wakeup_signal = threading.Event()  # Signal for force wake-up
 
 # ──────────────────────  RATE LIMITER  ──────────────────────
 API_CALL_TIMES = []
@@ -101,6 +100,8 @@ symbol_info = {}
 account_balances = {}
 state_lock = threading.Lock()
 last_regrid_str = "Never"
+
+last_keepalive_time = 0.0
 
 # ========================= RATE LIMITER =========================
 def ratelimit_api(func):
@@ -177,12 +178,6 @@ def in_startup_period() -> bool:
     if bot_start_time <= 0:
         return False
     return (time.time() - bot_start_time) < STARTUP_PERIOD_SECONDS
-
-# ========================= FORCE WAKE UP =========================
-def force_wakeup():
-    log("FORCE WAKE UP: Starting new 5-min run")
-    send_whatsapp("FORCE WAKE UP: Bot activated")
-    wakeup_signal.set()
 
 # ========================= RUN COUNTER =========================
 def increment_run_counter(to_add, to_remove, new_grid_count, total_positions):
@@ -549,14 +544,12 @@ def start_user_stream():
         log(f"User stream init failed: {e}", "ERROR")
 
 def keepalive_user_stream():
-    while not st.session_state.shutdown:
-        time.sleep(KEEPALIVE_INTERVAL)
-        try:
-            with listen_key_lock:
-                if listen_key:
-                    safe_stream_keepalive(listen_key)
-        except Exception as e:
-            log(f"Keep-alive error: {e}", "ERROR")
+    try:
+        with listen_key_lock:
+            if listen_key:
+                safe_stream_keepalive(listen_key)
+    except Exception as e:
+        log(f"Keep-alive error: {e}", "ERROR")
 
 def get_mid_price(symbol):
     if ob_active:
@@ -584,8 +577,8 @@ def auto_rotate_loop():
 
         start = time.time()
         while (time.time() - start) < STARTUP_PERIOD_SECONDS:
-            if st.session_state.shutdown or wakeup_signal.is_set():
-                wakeup_signal.clear()
+            if st.session_state.shutdown or st.session_state.force_wakeup:
+                st.session_state.force_wakeup = False
                 break
             time.sleep(30)
             if in_startup_period():
@@ -607,9 +600,9 @@ def auto_rotate_loop():
 
         sleep_start = time.time()
         while (time.time() - sleep_start) < SLEEP_PERIOD_SECONDS:
-            if st.session_state.shutdown or wakeup_signal.is_set():
+            if st.session_state.shutdown or st.session_state.force_wakeup:
                 log("SLEEP INTERRUPTED BY WAKE-UP")
-                wakeup_signal.clear()
+                st.session_state.force_wakeup = False
                 break
             remaining = int(SLEEP_PERIOD_SECONDS - (time.time() - sleep_start))
             with st.empty().container():
@@ -650,9 +643,14 @@ def main():
         load_symbol_info()
         update_balances()
         threading.Thread(target=auto_rotate_loop, daemon=True).start()
-        threading.Thread(target=keepalive_user_stream, daemon=True).start()
         log("AUTO-CYCLE STARTED: 5min run → 5min sleep")
         send_whatsapp("BOT AUTO-CYCLE STARTED")
+
+    # Main loop: keepalive + dashboard
+    now = time.time()
+    if now - last_keepalive_time > KEEPALIVE_INTERVAL:
+        keepalive_user_stream()
+        last_keepalive_time = now
 
     update_balances()
     usdt = account_balances.get('USDT', ZERO)
@@ -663,7 +661,7 @@ def main():
     else:
         st.error("SLEEP PHASE")
         if st.button("FORCE WAKE UP", type="primary", use_container_width=True):
-            force_wakeup()
+            st.session_state.force_wakeup = True
             st.rerun()
 
     c1, c2, c3, c4 = st.columns(4)
