@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID BOT 2025 — AUTO-CYCLE EDITION
-- 5 MIN RUN → 5 MIN SLEEP → REPEAT FOREVER
+INFINITY GRID BOT 2025 — AUTO-CYCLE + HARD-CODED GRIDS
+- 5 MIN RUN → 5 MIN SLEEP → REPEAT
+- Hard-coded grid sizes:
+  USDT_PER_GRID_LINE_BUY = 10.00
+  NUMBER_OF_GRIDS_PER_POSITION = 2
+  TOTAL_NUMBER_OF_GRIDS = 10
+- Rate-limited API
+- Balance cache (1 per 10s)
+- Force wake-up button
 - No user control
-- Hard-coded cycle
-- Full safety + order book + error handling
 """
 
 import streamlit as st
@@ -22,6 +27,11 @@ from logging.handlers import TimedRotatingFileHandler
 import sys
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+
+# ──────────────────────  HARD-CODED GRID SETTINGS  ──────────────────────
+USDT_PER_GRID_LINE_BUY = Decimal('10.00')      # $10 per BUY line
+NUMBER_OF_GRIDS_PER_POSITION = 2               # 2 grids per symbol
+TOTAL_NUMBER_OF_GRIDS = 10                     # Max 10 active grids
 
 # ──────────────────────  WEBSOCKET CORE  ──────────────────────
 ws_connected = False
@@ -41,6 +51,15 @@ ob_active  = False
 bot_start_time = 0.0
 STARTUP_PERIOD_SECONDS = 300   # 5 min run
 SLEEP_PERIOD_SECONDS = 300     # 5 min sleep
+
+# ──────────────────────  RATE LIMITER  ──────────────────────
+API_CALL_TIMES = []
+MAX_CALLS_PER_MINUTE = 1190
+RATE_LIMIT_LOCK = threading.Lock()
+
+# ──────────────────────  BALANCE CACHE  ──────────────────────
+last_balance_update = 0.0
+BALANCE_UPDATE_INTERVAL = 10.0
 
 HEARTBEAT_INTERVAL = 25
 KEEPALIVE_INTERVAL = 1800
@@ -82,6 +101,50 @@ account_balances = {}
 state_lock = threading.Lock()
 last_regrid_str = "Never"
 
+# ========================= RATE LIMITER =========================
+def ratelimit_api(func):
+    def wrapper(*args, **kwargs):
+        with RATE_LIMIT_LOCK:
+            now = time.time()
+            API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
+            if len(API_CALL_TIMES) >= MAX_CALLS_PER_MINUTE:
+                delay = 60 - (now - API_CALL_TIMES[0])
+                log(f"RATE LIMIT: Waiting {delay:.1f}s", "WARNING")
+                time.sleep(max(0, delay))
+                now = time.time()
+                API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
+            API_CALL_TIMES.append(time.time())
+        return func(*args, **kwargs)
+    return wrapper
+
+@ratelimit_api
+def safe_get_account():
+    return client.get_account()
+
+@ratelimit_api
+def safe_get_exchange_info():
+    return client.get_exchange_info()
+
+@ratelimit_api
+def safe_create_order(**kwargs):
+    return client.create_order(**kwargs)
+
+@ratelimit_api
+def safe_cancel_open_orders(symbol):
+    return client.cancel_open_orders(symbol=symbol)
+
+@ratelimit_api
+def safe_get_open_orders(symbol):
+    return client.get_open_orders(symbol=symbol)
+
+@ratelimit_api
+def safe_stream_get_listen_key():
+    return client.stream_get_listen_key()
+
+@ratelimit_api
+def safe_stream_keepalive(listen_key):
+    return client.stream_keepalive(listen_key)
+
 # ========================= UTILS =========================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -122,19 +185,15 @@ def increment_run_counter(to_add, to_remove, new_grid_count, total_positions):
         if os.path.exists(COUNTER_FILE):
             with open(COUNTER_FILE, 'r') as f:
                 run_number = len(f.readlines()) + 1
-
         now_central = datetime.now(central_tz)
         timestamp = now_central.strftime("%B %d %Y %H:%M:%S Central Time").replace(" 0", " ").replace("  ", " ")
         summary = f"+{len(to_add)} Buy, -{len(to_remove)} Sell = {new_grid_count} Grids for {total_positions} positions"
         line = f"Run #{run_number}: {timestamp} | {summary}\n"
-
         with open(COUNTER_FILE, 'a') as f:
             f.write(line)
-
         log(f"Rebalance recorded → {summary}")
         alert_msg = f"REBALANCE #{run_number}\n{summary}\n{timestamp}"
         send_whatsapp(alert_msg)
-
         st.session_state.gridded_symbols = gridded_symbols.copy()
         st.session_state.total_positions = total_positions
         st.session_state.last_regrid_str = now_str()
@@ -143,10 +202,14 @@ def increment_run_counter(to_add, to_remove, new_grid_count, total_positions):
 
 # ========================= BALANCE & INFO =========================
 def update_balances():
-    global account_balances
+    global account_balances, last_balance_update
+    now = time.time()
+    if now - last_balance_update < BALANCE_UPDATE_INTERVAL:
+        return
     try:
-        info = client.get_account()['balances']
+        info = safe_get_account()['balances']
         account_balances = {a['asset']: Decimal(a['free']) for a in info if Decimal(a['free']) > ZERO}
+        last_balance_update = now
         log(f"Updated balances: USDT={account_balances.get('USDT', ZERO):.2f}")
     except Exception as e:
         log(f"Balance update failed: {e}", "ERROR")
@@ -154,7 +217,7 @@ def update_balances():
 def load_symbol_info():
     global symbol_info
     try:
-        info = client.get_exchange_info()['symbols']
+        info = safe_get_exchange_info()['symbols']
         for s in info:
             if s['quoteAsset'] != 'USDT' or s['status'] != 'TRADING':
                 continue
@@ -180,37 +243,21 @@ def round_step(value, step):
 def place_limit_order(symbol, side, price, quantity):
     try:
         info = symbol_info.get(symbol)
-        if not info:
-            log(f"No symbol info for {symbol}", "ERROR")
-            return False
-
+        if not info: return False
         price = round_step(price, info['tickSize'])
         quantity = round_step(quantity, info['stepSize'])
-
-        if quantity < info['minQty']:
-            log(f"Qty too small {symbol}: {quantity} < {info['minQty']}", "WARNING")
-            return False
-
+        if quantity < info['minQty']: return False
         notional = price * quantity
-        if notional < Decimal(info['minNotional']):
-            log(f"Notional too low {symbol}: {notional} < {info['minNotional']}", "WARNING")
-            return False
-
+        if notional < Decimal(info['minNotional']): return False
         if side == 'BUY':
             needed = notional * SAFETY_BUFFER
             usdt_free = account_balances.get('USDT', ZERO)
-            if needed > usdt_free:
-                log(f"NOT ENOUGH USDT for {symbol} BUY: need {needed:.2f}, have {usdt_free:.2f}", "WARNING")
-                return False
-
+            if needed > usdt_free: return False
         if side == 'SELL':
             base = symbol.replace('USDT', '')
             coin_free = account_balances.get(base, ZERO)
-            if quantity > coin_free * SAFETY_BUFFER:
-                log(f"NOT ENOUGH {base} for SELL: need {quantity}, have {coin_free}", "WARNING")
-                return False
-
-        order = client.create_order(
+            if quantity > coin_free * SAFETY_BUFFER: return False
+        order = safe_create_order(
             symbol=symbol,
             side=side,
             type='LIMIT',
@@ -222,7 +269,7 @@ def place_limit_order(symbol, side, price, quantity):
         send_whatsapp(f"{side} {symbol} {quantity}@{price}")
         return True
     except BinanceAPIException as e:
-        log(f"ORDER FAILED {symbol} {side}: {e.message} (Code: {e.code})", "ERROR")
+        log(f"ORDER FAILED {symbol} {side}: {e.message}", "ERROR")
         return False
     except Exception as e:
         log(f"ORDER ERROR {symbol}: {e}", "ERROR")
@@ -231,15 +278,12 @@ def place_limit_order(symbol, side, price, quantity):
 def place_market_sell(symbol):
     try:
         info = symbol_info.get(symbol)
-        if not info:
-            return False
+        if not info: return False
         base = symbol.replace('USDT', '')
         quantity = account_balances.get(base, ZERO) * SAFETY_BUFFER
         quantity = round_step(quantity, info['stepSize'])
-        if quantity < info['minQty']:
-            log(f"Qty too small for market sell {symbol}: {quantity}", "WARNING")
-            return False
-        order = client.create_order(
+        if quantity < info['minQty']: return False
+        order = safe_create_order(
             symbol=symbol,
             side='SELL',
             type='MARKET',
@@ -249,34 +293,30 @@ def place_market_sell(symbol):
         send_whatsapp(f"MARKET SOLD {symbol} {quantity}")
         return True
     except BinanceAPIException as e:
-        log(f"MARKET SELL FAILED {symbol}: {e.message} (Code: {e.code})", "ERROR")
+        log(f"MARKET SELL FAILED {symbol}: {e.message}", "ERROR")
         return False
     except Exception as e:
         log(f"MARKET SELL ERROR {symbol}: {e}", "ERROR")
         return False
 
-# ========================= GRID & ROTATE =========================
+# ========================= HARD-CODED GRID =========================
 def place_grid(symbol):
     try:
         price = get_mid_price(symbol)
         if price <= ZERO:
             log(f"No price for {symbol}", "WARNING")
             return
-        qty_usdt = Decimal('50')  # Hard-coded grid size
-        raw_qty = qty_usdt / price
+        raw_qty = USDT_PER_GRID_LINE_BUY / price
         info = symbol_info.get(symbol)
-        if not info:
-            return
+        if not info: return
         qty = round_step(raw_qty, info['stepSize'])
-        if qty < info['minQty']:
-            log(f"Qty too small for {symbol}", "WARNING")
-            return
-        total_buy_cost = qty * price * 5 * SAFETY_BUFFER
+        if qty < info['minQty']: return
+        total_buy_cost = qty * price * NUMBER_OF_GRIDS_PER_POSITION * SAFETY_BUFFER
         if total_buy_cost > account_balances.get('USDT', ZERO):
-            log(f"SKIPPING {symbol}: Not enough USDT for 5 buy levels", "WARNING")
+            log(f"SKIPPING {symbol}: Not enough USDT for {NUMBER_OF_GRIDS_PER_POSITION} buy lines", "WARNING")
             return
         buys = sells = 0
-        for i in range(1, 6):
+        for i in range(1, NUMBER_OF_GRIDS_PER_POSITION + 1):
             buy_price = price * (1 - Decimal('0.015') * i)
             sell_price = price * (1 + Decimal('0.015') * i) * Decimal('1.01')
             if place_limit_order(symbol, 'BUY', buy_price, qty):
@@ -285,7 +325,7 @@ def place_grid(symbol):
                 sells += 1
         global last_regrid_str
         last_regrid_str = now_str()
-        log(f"GRID {symbol} | B:{buys} S:{sells}")
+        log(f"GRID {symbol} | B:{buys} S:{sells} | ${USDT_PER_GRID_LINE_BUY} per line")
     except Exception as e:
         log(f"place_grid {symbol} error: {e}", "ERROR")
 
@@ -302,7 +342,7 @@ def maintain_mandatory_buys():
                 if time.time() - st.session_state.blacklisted[symbol] < COOLDOWN_SECONDS:
                     continue
             try:
-                open_orders = client.get_open_orders(symbol=symbol)
+                open_orders = safe_get_open_orders(symbol=symbol)
                 has_buy = any(o['side'] == 'BUY' for o in open_orders)
                 if has_buy:
                     continue
@@ -313,8 +353,7 @@ def maintain_mandatory_buys():
             if price <= ZERO:
                 continue
             buy_price = price * Decimal('0.985')
-            qty_usdt = Decimal('50')
-            raw_qty = qty_usdt / buy_price
+            raw_qty = USDT_PER_GRID_LINE_BUY / buy_price
             info = symbol_info[symbol]
             qty = round_step(raw_qty, info['stepSize'])
             if place_limit_order(symbol, 'BUY', buy_price, qty):
@@ -329,12 +368,15 @@ def rotate_grids():
             log("No price data, skipping rotation")
             return
         top = sorted(bid_volume.items(), key=lambda x: x[1], reverse=True)[:25]
-        targets = [s for s, _ in top][:10]
+        target_symbols = [s for s, _ in top]
+        # Limit to TOTAL_NUMBER_OF_GRIDS
+        target_count = min(TOTAL_NUMBER_OF_GRIDS, len(target_symbols))
+        targets = target_symbols[:target_count]
         to_add = [s for s in targets if s not in gridded_symbols]
         to_remove = [s for s in gridded_symbols if s not in targets]
         for s in to_remove:
             try:
-                client.cancel_open_orders(symbol=s)
+                safe_cancel_open_orders(s)
             except Exception as e:
                 log(f"Cancel failed for {s}: {e}", "ERROR")
             place_market_sell(s)
@@ -486,7 +528,7 @@ def start_market_websocket():
 def start_user_stream():
     global user_ws, listen_key
     try:
-        resp = client.stream_get_listen_key()
+        resp = safe_stream_get_listen_key()
         if not isinstance(resp, dict) or 'listenKey' not in resp:
             log("Invalid listenKey response", "ERROR")
             return
@@ -505,7 +547,7 @@ def keepalive_user_stream():
         try:
             with listen_key_lock:
                 if listen_key:
-                    client.stream_keepalive(listen_key)
+                    safe_stream_keepalive(listen_key)
         except Exception as e:
             log(f"Keep-alive error: {e}", "ERROR")
 
@@ -518,15 +560,21 @@ def get_mid_price(symbol):
             return (b + a) / 2
     return bid_volume.get(symbol, ZERO)
 
-# ========================= AUTO-CYCLE LOOP (REPLACED) =========================
+# ========================= FORCE WAKE UP =========================
+def force_wakeup():
+    if not in_startup_period():
+        log("FORCE WAKE UP: Starting new 5-min run")
+        send_whatsapp("FORCE WAKE UP: Bot activated")
+        st.session_state.force_wakeup = True
+
+# ========================= AUTO-CYCLE LOOP =========================
 def auto_rotate_loop():
-    """Force 5-min startup → 5-min sleep → repeat"""
     while not st.session_state.shutdown:
-        # === 5-MIN STARTUP PHASE ===
         log("=== STARTUP PHASE STARTED (5 min) ===")
         st.session_state.bot_running = True
         global bot_start_time
         bot_start_time = time.time()
+        st.session_state.force_wakeup = False
 
         if not ws_connected:
             start_market_websocket()
@@ -537,7 +585,7 @@ def auto_rotate_loop():
 
         start = time.time()
         while (time.time() - start) < STARTUP_PERIOD_SECONDS:
-            if st.session_state.shutdown:
+            if st.session_state.shutdown or st.session_state.force_wakeup:
                 break
             time.sleep(30)
             if in_startup_period():
@@ -545,7 +593,6 @@ def auto_rotate_loop():
 
         log("=== STARTUP PHASE ENDED ===")
 
-        # === 5-MIN SLEEP PHASE ===
         log("=== SLEEP PHASE STARTED (5 min) ===")
         st.session_state.bot_running = False
         for ws in ws_instances:
@@ -560,26 +607,32 @@ def auto_rotate_loop():
 
         sleep_start = time.time()
         while (time.time() - sleep_start) < SLEEP_PERIOD_SECONDS:
-            if st.session_state.shutdown:
+            if st.session_state.shutdown or st.session_state.force_wakeup:
+                log("SLEEP INTERRUPTED BY WAKE-UP")
                 break
             remaining = int(SLEEP_PERIOD_SECONDS - (time.time() - sleep_start))
             with st.empty().container():
-                st.markdown(f"<h2 style='color:orange; text-align:center;'>SLEEPING: {remaining}s</h2>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<h2 style='color:orange; text-align:center;'>"
+                    f"SLEEPING: {remaining}s<br>"
+                    f"<small>Click button to wake up</small></h2>",
+                    unsafe_allow_html=True
+                )
             time.sleep(1)
         log("=== SLEEP PHASE ENDED ===")
 
-# ========================= MAIN (START BLOCK REPLACED) =========================
+# ========================= MAIN =========================
 def main():
     for k, v in {
         'bot_running': False, 'logs': [], 'shutdown': False, 'blacklisted': {},
         'gridded_symbols': [], 'total_positions': 0, 'last_regrid_str': "Never",
-        'error_count': 0, 'last_error': None
+        'error_count': 0, 'last_error': None, 'force_wakeup': False
     }.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    st.set_page_config(page_title="Auto-Cycle Grid Bot", layout="wide")
-    st.title("INFINITY GRID BOT — AUTO-CYCLE")
+    st.set_page_config(page_title="Hard-Coded Grid Bot", layout="wide")
+    st.title("INFINITY GRID BOT — HARD-CODED")
 
     if not os.getenv('BINANCE_API_KEY'):
         st.error("Set BINANCE_API_KEY and BINANCE_API_SECRET")
@@ -588,10 +641,9 @@ def main():
     global client
     client = Client(os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET'), tld='us')
 
-    # AUTO-CYCLE START
     if 'auto_cycle_started' not in st.session_state:
         st.session_state.auto_cycle_started = True
-        info = client.get_exchange_info()['symbols']
+        info = safe_get_exchange_info()['symbols']
         global all_symbols
         all_symbols = [s['symbol'] for s in info if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
         load_symbol_info()
@@ -609,6 +661,9 @@ def main():
         st.success(f"STARTUP PHASE: {remaining}s remaining")
     else:
         st.error("SLEEP PHASE")
+        if st.button("FORCE WAKE UP", type="primary", use_container_width=True):
+            force_wakeup()
+            st.rerun()
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("USDT", f"${usdt:.2f}")
