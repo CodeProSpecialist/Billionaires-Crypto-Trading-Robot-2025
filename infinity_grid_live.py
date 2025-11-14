@@ -1,6 +1,8 @@
 import streamlit as st
 import threading
 import time
+import os
+import sys
 import logging
 from datetime import datetime
 import pandas as pd
@@ -58,8 +60,8 @@ DEFAULTS = {
 }
 
 # Binance client
-API_KEY = "YOUR_API_KEY"
-API_SECRET = "YOUR_API_SECRET"
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_API_SECRET')
 client = Client(API_KEY, API_SECRET, tld='us')
 # client.API_URL = 'https://testnet.binance.vision/api'  # Uncomment for testnet
 
