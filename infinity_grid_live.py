@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PLATINUM CRYPTO TRADER DASHBOARD 2025 — BINANCE.US EDITION
-Complete patched script — REAL trading (Binance.US). Use with caution.
+Full WebSocket + REST version — REAL trading (Binance.US). Use with caution.
 """
 import streamlit as st
 import os
@@ -31,7 +31,6 @@ getcontext().prec = 28
 ZERO = Decimal('0')
 ONE = Decimal('1')
 SAFETY_BUFFER = Decimal('0.95')
-# global max position % (bot uses symbol_info & session slider to adapt)
 MAX_POSITION_PCT = Decimal('0.05')
 MIN_TRADE_VALUE = Decimal('5.0')
 ENTRY_PCT_BELOW_ASK = Decimal('0.001')
@@ -44,12 +43,11 @@ RECONNECT_BASE_DELAY = 5
 MAX_RECONNECT_DELAY = 300
 
 # USER CHOICE: REAL trading
-USE_PAPER_TRADING = False  # <-- USER CHOSE REAL (B). If you want paper, set True.
+USE_PAPER_TRADING = False  # True for paper trading
 
 CST = pytz.timezone('America/Chicago')
 TRADING_START_HOUR = 4
 TRADING_END_HOUR = 16
-
 LOG_FILE = os.path.expanduser("~/platinum_crypto_dashboard.log")
 
 # ========================= LOGGING =========================
@@ -86,7 +84,7 @@ listen_key_lock = threading.Lock()
 last_rebalance_str = "Never"
 
 # -----------------------------------------------------------------
-# Session-state defaults (kept module-level as fallback)
+# Session-state defaults
 # -----------------------------------------------------------------
 DEFAULTS = {
     'logs': [], 'shutdown': False, 'auto_rebalance': True,
@@ -100,7 +98,6 @@ def now_cst():
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
 
 def log(msg):
-    """Log to file/console and append to Streamlit session logs if available."""
     line = f"{now_cst()} - {msg}"
     print(line)
     logger.info(msg)
@@ -134,7 +131,6 @@ def is_trading_hours():
 
 # ========================= BALANCE & INFO =========================
 def update_balances():
-    """Fetch account balances and store free balances > 0."""
     global account_balances
     try:
         info = client.get_account()['balances']
@@ -146,7 +142,6 @@ def update_balances():
         log(f"Balance update error: {e}")
 
 def get_total_portfolio_value():
-    """Return portfolio value in USDT (cash + assets priced in live_prices)."""
     total = account_balances.get('USDT', ZERO)
     for asset, qty in account_balances.items():
         if asset == 'USDT':
@@ -164,7 +159,6 @@ def _safe_decimal(v, fallback='0'):
         return Decimal(fallback)
 
 def load_symbol_info():
-    """Load exchange info and parse step/tick/minQty/minNotional for USDT pairs."""
     global symbol_info
     try:
         info = client.get_exchange_info().get('symbols', [])
@@ -188,12 +182,10 @@ def load_symbol_info():
     except Exception as e:
         log(f"Symbol info error: {e}")
 
+
 # ========================= SAFE ORDER =========================
 def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
-    """
-    Round DOWN 'value' to nearest multiple of 'step'.
-    Uses Decimal.quantize when possible; otherwise falls back to floor multiplication.
-    """
+    """Round DOWN 'value' to nearest multiple of 'step'."""
     try:
         if step <= 0:
             return value
@@ -206,23 +198,25 @@ def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
             return value
 
 def format_decimal_for_order(d: Decimal) -> str:
-    """Format a Decimal for order API: remove extraneous trailing zeros."""
+    """Format Decimal for order API, remove trailing zeros."""
     s = format(d.normalize(), 'f')
     if '.' in s:
         s = s.rstrip('0').rstrip('.')
     return s
 
 def _mock_place_limit_order(symbol, side, price, quantity):
-    """Mock order used for paper trading."""
+    """Mock order for paper trading."""
     order = {
-        'symbol': symbol, 'side': side, 'price': format_decimal_for_order(price),
-        'quantity': format_decimal_for_order(quantity), 'status': 'TEST'
+        'symbol': symbol, 'side': side,
+        'price': format_decimal_for_order(price),
+        'quantity': format_decimal_for_order(quantity),
+        'status': 'TEST'
     }
     log(f"[PAPER] PLACED {side} {symbol} {quantity} @ {price}")
     return order
 
 def place_limit_order(symbol, side, price, quantity):
-    """Place a limit order with safety checks and step/tick rounding."""
+    """Place limit order with safety checks and rounding."""
     if USE_PAPER_TRADING:
         return _mock_place_limit_order(symbol, side, price, quantity)
 
@@ -275,7 +269,7 @@ def place_limit_order(symbol, side, price, quantity):
 
 # ========================= HEARTBEAT WS =========================
 class HeartbeatWebSocket(websocket.WebSocketApp):
-    """WebSocketApp subclass that tracks last pong and runs a heartbeat thread."""
+    """WebSocketApp subclass that tracks last pong and has heartbeat."""
     def __init__(self, url, **kwargs):
         super().__init__(url, **kwargs)
         self.last_pong = time.time()
@@ -338,7 +332,6 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
 
 # ========================= WS HANDLERS =========================
 def on_market_message(ws, message):
-    """Parse combined stream messages from Binance.US stream endpoints."""
     try:
         data = json.loads(message)
         stream = data.get('stream', '')
@@ -353,8 +346,8 @@ def on_market_message(ws, message):
                 with price_lock:
                     live_prices[sym] = price
         elif stream.endswith(f'@depth{DEPTH_LEVELS}'):
-            bids = [( _safe_decimal(p), _safe_decimal(q)) for p, q in payload.get('bids', [])[:DEPTH_LEVELS]]
-            asks = [( _safe_decimal(p), _safe_decimal(q)) for p, q in payload.get('asks', [])[:DEPTH_LEVELS]]
+            bids = [(_safe_decimal(p), _safe_decimal(q)) for p, q in payload.get('bids', [])[:DEPTH_LEVELS]]
+            asks = [(_safe_decimal(p), _safe_decimal(q)) for p, q in payload.get('asks', [])[:DEPTH_LEVELS]]
             with book_lock:
                 live_bids[sym] = bids
                 live_asks[sym] = asks
@@ -362,7 +355,6 @@ def on_market_message(ws, message):
         log(f"Market WS parse error: {e}")
 
 def on_user_message(ws, message):
-    """Handle user execution reports (orders/fills)."""
     try:
         data = json.loads(message)
         if data.get('e') != 'executionReport':
@@ -390,6 +382,7 @@ def on_ws_close(ws, code, msg):
         log(f"WS closed ({getattr(ws, 'url', 'unknown')}) – {code}: {msg}")
     except Exception:
         log(f"WS closed – {code}: {msg}")
+
 
 # ========================= WS STARTERS =========================
 def start_market_websockets(symbols):
@@ -468,7 +461,7 @@ def get_top_volume_symbols():
     log(f"Top {len(top_volume_symbols)} volume symbols refreshed")
 
 def rebalance_portfolio():
-    """Core rebalancing: sells excess and buys up to MAX_BUY_COINS from top_volume_symbols."""
+    """Core rebalancing: sell excess, buy up to MAX_BUY_COINS from top_volume_symbols."""
     global last_rebalance_str
     try:
         if not is_trading_hours():
@@ -480,7 +473,6 @@ def rebalance_portfolio():
 
         update_balances()
         total = get_total_portfolio_value()
-        # Use slider percentage if present
         try:
             pct = Decimal(str(st.session_state.get('max_position_pct', 5.0))) / Decimal('100')
         except Exception:
@@ -553,6 +545,7 @@ def rebalance_portfolio():
         log(f"REBALANCE | Buys:{buys} | Targets:{buy_targets[:MAX_BUY_COINS]}")
     except Exception as e:
         log(f"Rebalance error: {e}")
+
 
 # ========================= BACKGROUND INITIALISER =========================
 def initialise_bot():
@@ -697,11 +690,9 @@ def main():
 
         # auto-refresh once per second while not running
         time.sleep(1)
-        # trigger a re-run to reflect background thread progress
         try:
             st.experimental_rerun()
         except Exception:
-            # if experimental_rerun not available, just return
             return
 
     # -----------------------------------------------------------------
