@@ -109,7 +109,7 @@ def ratelimit_api(func):
         with RATE_LIMIT_LOCK:
             now = time.time()
             API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
-            if len(API_CALL_TIMES) >= MAX_CALLS synth:
+            if len(API_CALL_TIMES) >= MAX_CALLS_PER_MINUTE:
                 delay = 60 - (now - API_CALL_TIMES[0])
                 log(f"RATE LIMIT: Waiting {delay:.1f}s", "WARNING")
                 time.sleep(max(0, delay))
