@@ -314,7 +314,7 @@ def update_trailing_grid(symbol):
 
 def check_trailing_grid_tp(symbol):
     """Check and execute trailing grid take-profit."""
-    if symbol not in st.session_state[KEYS["grid_settings"]:
+    if symbol not in st.session_state[KEYS["grid_settings"]]:
         return
 
     grid = st.session_state[KEYS["grid_settings"]][symbol]
