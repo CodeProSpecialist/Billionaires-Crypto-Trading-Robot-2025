@@ -629,7 +629,7 @@ def run_streamlit():
 
     # Live Metrics
     update_balances()
-    total = get_total_port from get_total_portfolio_value()
+    total = get_total_portfolio_value()
     usdt = account_balances.get('USDT', ZERO)
     in_hours = is_trading_hours()
 
