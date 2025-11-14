@@ -90,7 +90,7 @@ DEFAULTS = {
     'logs': [], 'shutdown': False, 'auto_rebalance': True,
     'rebalance_interval': 7200, 'min_trade_value': 5.0,
     'max_position_pct': 5.0, 'entry_pct_below_ask': 0.1,
-    'bot_running': False, 'init_status': ''
+    'bot_running': False, 'init_status': '', 'init_thread_running': False
 }
 
 # ========================= UTILS =========================
@@ -105,7 +105,7 @@ def log(msg):
     try:
         if ctx is not None:
             if 'logs' not in st.session_state:
-                st.session_state['logs'] = []
+                st.session_state.logs = []
             st.session_state.logs.append(line)
             if len(st.session_state.logs) > 500:
                 st.session_state.logs = st.session_state.logs[-500:]
@@ -181,7 +181,6 @@ def load_symbol_info():
         log(f"Loaded {len(symbol_info)} symbols")
     except Exception as e:
         log(f"Symbol info error: {e}")
-
 
 # ========================= SAFE ORDER =========================
 def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
@@ -383,7 +382,6 @@ def on_ws_close(ws, code, msg):
     except Exception:
         log(f"WS closed – {code}: {msg}")
 
-
 # ========================= WS STARTERS =========================
 def start_market_websockets(symbols):
     """Start websocket connections for price and depth streams (chunked)."""
@@ -431,7 +429,7 @@ def start_user_stream():
 
 def keepalive_user_stream():
     """Periodically ping Binance to keep listenKey alive."""
-    while st.session_state.bot_running:
+    while st.session_state.get('bot_running', False):
         time.sleep(1800)  # 30 minutes
         try:
             with listen_key_lock:
@@ -546,7 +544,6 @@ def rebalance_portfolio():
     except Exception as e:
         log(f"Rebalance error: {e}")
 
-
 # ========================= BACKGROUND INITIALISER =========================
 def initialise_bot():
     """Runs in a background thread – sets bot_running when ready."""
@@ -558,8 +555,12 @@ def initialise_bot():
         update_balances()
 
         all_syms = list(symbol_info.keys())
+        if not all_syms:
+            st.session_state.init_status = "No symbols loaded"
+            st.session_state.bot_running = False
+            return
+
         st.session_state.init_status = f"Starting {len(all_syms)} WS streams..."
-        # avoid starting huge number of streams at once
         start_list = all_syms[:1000] if len(all_syms) > 1000 else all_syms
         start_market_websockets(start_list)
 
@@ -580,58 +581,14 @@ def initialise_bot():
 
         st.session_state.bot_running = True
         st.session_state.init_status = "READY"
+        st.session_state.init_thread_running = False
         log("PLATINUM TRADER STARTED")
         send_whatsapp("PLATINUM TRADER STARTED")
     except Exception as e:
         log(f"Initialise bot error: {e}")
         st.session_state.init_status = f"ERROR: {e}"
         st.session_state.bot_running = False
-
-# --- SETTINGS PANEL ---
-st.subheader("Bot Settings")
-
-if "rebalance_interval" not in st.session_state:
-    st.session_state.rebalance_interval = 7200
-if "max_position_pct" not in st.session_state:
-    st.session_state.max_position_pct = 5.0
-if "min_trade_value" not in st.session_state:
-    st.session_state.min_trade_value = 5.0
-if "auto_rebalance" not in st.session_state:
-    st.session_state.auto_rebalance = True
-
-# Auto-Rebalance toggle
-st.checkbox(
-    "Auto Rebalance",
-    key="auto_rebalance"
-)
-
-# Rebalance Interval slider
-st.slider(
-    "Rebalance Interval (s)",
-    min_value=600,
-    max_value=21600,
-    value=st.session_state.rebalance_interval,
-    key="rebalance_interval"
-)
-
-# Max position % slider
-st.slider(
-    "Max % per Coin",
-    min_value=1.0,
-    max_value=20.0,
-    value=st.session_state.max_position_pct,
-    key="max_position_pct"
-)
-
-# Minimum trade size slider
-st.slider(
-    "Minimum Trade ($)",
-    min_value=1.0,
-    max_value=100.0,
-    value=st.session_state.min_trade_value,
-    key="min_trade_value"
-)
-
+        st.session_state.init_thread_running = False
 
 # ========================= STREAMLIT UI =========================
 def main():
@@ -640,40 +597,28 @@ def main():
     st.title("PLATINUM CRYPTO TRADER DASHBOARD")
     st.markdown("**4 AM – 4 PM CST | Top 25 volume → Top 2 buys | 5 % max per coin**")
 
-    # --- ENSURE REQUIRED SESSION STATE KEYS EXIST (fix for AttributeError) ---
-    required_keys = {
-        'logs': [], 'shutdown': False, 'auto_rebalance': True,
-        'rebalance_interval': 7200, 'min_trade_value': 5.0,
-        'max_position_pct': 5.0, 'entry_pct_below_ask': 0.1,
-        'bot_running': False, 'init_status': ''
-    }
-    for k, v in required_keys.items():
+    # --- ENSURE ALL SESSION STATE KEYS EXIST ---
+    for k, v in DEFAULTS.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # -----------------------------------------------------------------
-    # API key check
-    # -----------------------------------------------------------------
+    # --- API KEY CHECK ---
     if not os.getenv('BINANCE_API_KEY') or not os.getenv('BINANCE_API_SECRET'):
         st.error("Set `BINANCE_API_KEY` and `BINANCE_API_SECRET` env vars")
         st.stop()
 
-    # create client (Binance.US uses tld='us')
+    # --- CREATE CLIENT ---
     try:
         client = Client(os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET'), tld='us')
     except Exception as e:
         st.error(f"Failed to create Binance client: {e}")
         st.stop()
 
-    # -----------------------------------------------------------------
-    # START / STATUS UI (non-blocking auto-refresh to show init progress)
-    # -----------------------------------------------------------------
+    # --- START / STATUS UI ---
     if not st.session_state.bot_running:
         col_btn, col_status = st.columns([1, 3])
         with col_btn:
-            # START button triggers background initialization
             if st.button("START TRADER (REAL)"):
-                # ensure previous thread not running
                 if not st.session_state.get('init_thread_running', False):
                     st.session_state.init_thread_running = True
                     st.session_state.init_status = "Initialising..."
@@ -682,22 +627,20 @@ def main():
         with col_status:
             st.write("**Status:**", st.session_state.init_status or "Press START")
             st.write("Note: This page auto-refreshes while initializing.")
-        # show recent logs
         st.markdown("---")
         st.subheader("Log (live)")
         for line in st.session_state.logs[-20:]:
             st.code(line)
 
-        # auto-refresh once per second while not running
+        # Auto-refresh while initializing
         time.sleep(1)
         try:
-            st.experimental_rerun()
+            st.rerun()
         except Exception:
-            return
+            pass
+        return
 
-    # -----------------------------------------------------------------
-    # BOT IS RUNNING → live dashboard
-    # -----------------------------------------------------------------
+    # --- BOT RUNNING: LIVE DASHBOARD ---
     update_balances()
     total = get_total_portfolio_value()
     usdt = account_balances.get('USDT', ZERO)
@@ -710,9 +653,7 @@ def main():
     c4.metric("Trading Window", "YES" if in_hours else "NO")
 
     st.metric("Last Rebalance", last_rebalance_str)
-
-    # top-volume preview
-    st.write("**Top 10 volume coins:** " + " | ".join(top_volume_symbols[:10]))
+    st.write("**Top 10 volume coins:** " + " | ".join(top_volume_symbols[:10]) if top_volume_symbols else "**No volume data**")
 
     colA, colB = st.columns([1, 2])
     with colA:
@@ -741,16 +682,13 @@ def main():
     for line in st.session_state.logs[-50:]:
         st.code(line)
 
-    # -----------------------------------------------------------------
-    # Auto-rebalance loop (non-blocking; triggers per interval)
-    # -----------------------------------------------------------------
+    # --- AUTO-REBALANCE LOOP ---
     if st.session_state.auto_rebalance and in_hours:
         if 'last_auto' not in st.session_state:
             st.session_state.last_auto = time.time()
         if time.time() - st.session_state.last_auto > st.session_state.rebalance_interval:
             threading.Thread(target=rebalance_portfolio, daemon=True).start()
             st.session_state.last_auto = time.time()
-        # refresh top-volume
         get_top_volume_symbols()
 
     st.success("SAFE • SMART • PLATINUM-GRADE (REAL TRADING ENABLED)")
