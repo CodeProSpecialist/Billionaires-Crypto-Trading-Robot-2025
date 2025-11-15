@@ -79,7 +79,6 @@ Tired of bots that regrid every 30 minutes — burning API calls and missing rea
 
 ## **Setup in 60 Seconds**
 
-```bash
 pip install python-binance websocket-client requests
 ```
 
