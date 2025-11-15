@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID BOT 2025 — BINANCE.US + P&L Tracker
-Real-time Profit & Loss (Realized + Unrealized)
+900x700 Full-Screen Dashboard (Dark Theme)
 """
 
 import os, sys, time, threading, json, requests
@@ -26,8 +26,6 @@ CONSERVATIVE_USE_TAKER = True
 FEE_CACHE_TTL = 60*30
 EXCLUDED_COINS = {"USD","USDT","BTC","BCH","ETH","SOL"}
 CST = pytz.timezone("America/Chicago")
-
-# P&L Persistence
 PNL_FILE = "grid_pnl.json"
 
 # -------------------- BINANCE CLIENT --------------------
@@ -52,8 +50,7 @@ pnl_data = {
     'total_realized': ZERO,
     'daily_realized': ZERO,
     'last_reset_date': str(date.today()),
-    'cost_basis': {},  # symbol -> (qty, cost_usdt)
-    'unrealized': ZERO
+    'cost_basis': {}
 }
 
 def load_pnl():
@@ -65,9 +62,7 @@ def load_pnl():
                 pnl_data['total_realized'] = Decimal(data.get('total_realized', '0'))
                 pnl_data['daily_realized'] = Decimal(data.get('daily_realized', '0'))
                 pnl_data['last_reset_date'] = data.get('last_reset_date', str(date.today()))
-                pnl_data['cost_basis'] = {
-                    k: (Decimal(v[0]), Decimal(v[1])) for k, v in data.get('cost_basis', {}).items()
-                }
+                pnl_data['cost_basis'] = {k: (Decimal(v[0]), Decimal(v[1])) for k, v in data.get('cost_basis', {}).items()}
         except Exception as e:
             terminal_insert(f"[{now_cst()}] P&L load error: {e}")
 
@@ -81,8 +76,7 @@ def save_pnl():
         }
         with open(PNL_FILE, 'w') as f:
             json.dump(data, f)
-    except Exception as e:
-        terminal_insert(f"[{now_cst()}] P&L save error: {e}")
+    except: pass
 
 def reset_daily_pnl():
     today = str(date.today())
@@ -90,14 +84,12 @@ def reset_daily_pnl():
         pnl_data['daily_realized'] = ZERO
         pnl_data['last_reset_date'] = today
         save_pnl()
-        terminal_insert(f"[{now_cst()}] Daily P&L reset")
 
 def update_unrealized_pnl():
     unrealized = ZERO
     for asset, (qty, cost) in pnl_data['cost_basis'].items():
         symbol = f"{asset}USDT"
-        if symbol not in live_prices or qty <= ZERO:
-            continue
+        if symbol not in live_prices or qty <= ZERO: continue
         market_value = qty * live_prices[symbol]
         unrealized += market_value - cost
     pnl_data['unrealized'] = unrealized
@@ -111,106 +103,91 @@ def record_fill(symbol, side, qty, price, fee_usdt):
     notional = qty * price
 
     if side == 'BUY':
-        if base not in pnl_data['cost_basis']:
-            pnl_data['cost_basis'][base] = (ZERO, ZERO)
-        old_qty, old_cost = pnl_data['cost_basis'][base]
+        old_qty, old_cost = pnl_data['cost_basis'].get(base, (ZERO, ZERO))
         new_qty = old_qty + qty
         new_cost = old_cost + notional + fee_usdt
         pnl_data['cost_basis'][base] = (new_qty, new_cost)
     elif side == 'SELL':
-        if base not in pnl_data['cost_basis']:
-            return
+        if base not in pnl_data['cost_basis']: return
         old_qty, old_cost = pnl_data['cost_basis'][base]
         if qty >= old_qty:
-            # Full sell
             realized = (notional - fee_usdt) - old_cost
             pnl_data['total_realized'] += realized
             pnl_data['daily_realized'] += realized
             del pnl_data['cost_basis'][base]
         else:
-            # Partial sell
-            avg_cost_per_unit = old_cost / old_qty
-            cost_sold = avg_cost_per_unit * qty
+            avg_cost = old_cost / old_qty
+            cost_sold = avg_cost * qty
             realized = (notional - fee_usdt) - cost_sold
             pnl_data['total_realized'] += realized
             pnl_data['daily_realized'] += realized
             pnl_data['cost_basis'][base] = (old_qty - qty, old_cost - cost_sold)
     save_pnl()
 
-# -------------------- GUI --------------------
+# -------------------- TKINTER GUI (900x700) --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025")
-root.geometry("800x600")
-root.configure(bg="#000000")
+root.geometry("900x700")
+root.configure(bg="#111111")
 root.resizable(False, False)
 
-title_font = tkfont.Font(family="Helvetica", size=16, weight="bold")
-label_font = tkfont.Font(family="Helvetica", size=11)
-btn_font   = tkfont.Font(family="Helvetica", size=12, weight="bold")
-term_font  = tkfont.Font(family="Courier", size=14)
+title_font = tkfont.Font(family="Helvetica", size=18, weight="bold")
+button_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
+label_font = tkfont.Font(family="Helvetica", size=12)
+term_font = tkfont.Font(family="Courier", size=14)  # +2 size
 
-# Stats Bar
-stats_frame = tk.Frame(root, bg="#000000", height=80)
-stats_frame.pack(fill="x", padx=8, pady=(8, 4))
-stats_frame.pack_propagate(False)
+# Scrollable Frame Utility
+def create_scrollable_frame(parent, bg="#222222"):
+    canvas = tk.Canvas(parent, borderwidth=0, background=bg, highlightthickness=0)
+    frame = tk.Frame(canvas, background=bg)
+    scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    canvas.create_window((0,0), window=frame, anchor="nw")
+    def on_frame_configure(event):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    frame.bind("<Configure>", on_frame_configure)
+    return frame, canvas
 
-# USDT
-tk.Label(stats_frame, text="USDT:", fg="lime", bg="#000000", font=label_font).pack(side="left", padx=5)
-usdt_label = tk.Label(stats_frame, text="0.00", fg="cyan", bg="#000000", font=label_font, width=12, anchor="w")
-usdt_label.pack(side="left", padx=5)
+# -------------------- LAYOUT --------------------
+# Title
+tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font, fg="white", bg="#111111").pack(pady=10)
 
-# Active Coins
-tk.Label(stats_frame, text="Active:", fg="lime", bg="#000000", font=label_font).pack(side="left", padx=(20,5))
-active_coins_label = tk.Label(stats_frame, text="0", fg="cyan", bg="#000000", font=label_font, width=4, anchor="w")
-active_coins_label.pack(side="left")
+# Stats Frame
+stats_outer_frame = tk.Frame(root, bg="#111111", height=150)
+stats_outer_frame.pack(fill="x", padx=10, pady=5)
+stats_outer_frame.pack_propagate(False)
+stats_scroll_frame, _ = create_scrollable_frame(stats_outer_frame, bg="#111111")
 
-# P&L Labels
-tk.Label(stats_frame, text="P&L:", fg="lime", bg="#000000", font=label_font).pack(side="left", padx=(30,5))
-pnl_total_label = tk.Label(stats_frame, text="$0.00", fg="white", bg="#000000", font=label_font, width=10, anchor="w")
-pnl_total_label.pack(side="left")
-pnl_daily_label = tk.Label(stats_frame, text="(Today: $0.00)", fg="gray", bg="#000000", font=label_font, anchor="w")
-pnl_daily_label.pack(side="left", padx=5)
+usdt_label = tk.Label(stats_scroll_frame, text="USDT Balance: 0.00", fg="lime", bg="#111111", font=label_font, anchor="w")
+usdt_label.pack(fill="x", pady=2)
+active_coins_label = tk.Label(stats_scroll_frame, text="Active Coins: 0", fg="lime", bg="#111111", font=label_font, anchor="w")
+active_coins_label.pack(fill="x", pady=2)
+pnl_label = tk.Label(stats_scroll_frame, text="P&L: $0.00 (Today: $0.00)", fg="lime", bg="#111111", font=label_font, anchor="w")
+pnl_label.pack(fill="x", pady=2)
+top_coins_label = tk.Label(stats_scroll_frame, text="Top Coins: Loading...", fg="lime", bg="#111111", font=label_font, anchor="w", justify="left", wraplength=860)
+top_coins_label.pack(fill="x", pady=2)
 
-# Status
-status_label = tk.Label(stats_frame, text="Status: Stopped", fg="red", bg="#000000", font=label_font)
-status_label.pack(side="right", padx=10)
-
-# Top Coins
-top_coins_frame = tk.Frame(stats_frame, bg="#000000")
-top_coins_frame.pack(fill="x", pady=2)
-tk.Label(top_coins_frame, text="Top Coins:", fg="lime", bg="#000000", font=label_font).pack(side="left")
-top_coins_label = tk.Label(top_coins_frame, text="Loading...", fg="yellow", bg="#000000", font=label_font, anchor="w", justify="left")
-top_coins_label.pack(side="left", fill="x", expand=True)
-
-# Terminal
-term_outer = tk.Frame(root, bg="#000000")
-term_outer.pack(fill="both", expand=True, padx=8, pady=4)
-
-term_canvas = tk.Canvas(term_outer, bg="black", highlightthickness=0)
-term_scrollbar = tk.Scrollbar(term_outer, orient="vertical", command=term_canvas.yview)
-term_frame = tk.Frame(term_canvas, bg="black")
-
-term_canvas.configure(yscrollcommand=term_scrollbar.set)
-term_scrollbar.pack(side="right", fill="y")
-term_canvas.pack(side="left", fill="both", expand=True)
-term_canvas.create_window((0,0), window=term_frame, anchor="nw")
-
-term_text = tk.Text(term_frame, bg="black", fg="lime", font=term_font, wrap="word", spacing1=2, spacing3=2)
-term_text.pack(fill="both", expand=True)
-
-def on_frame_configure(event):
-    term_canvas.configure(scrollregion=term_canvas.bbox("all"))
-term_frame.bind("<Configure>", on_frame_configure)
+# Terminal Frame
+terminal_outer_frame = tk.Frame(root, bg="#111111")
+terminal_outer_frame.pack(fill="both", expand=True, padx=10, pady=5)
+terminal_scroll_frame, _ = create_scrollable_frame(terminal_outer_frame, bg="#000000")
+terminal_text = tk.Text(terminal_scroll_frame, wrap=tk.WORD, bg="black", fg="lime", font=term_font, spacing1=2, spacing3=2)
+terminal_text.pack(fill="both", expand=True)
 
 def terminal_insert(msg):
-    term_text.insert(tk.END, f"{msg}\n")
-    term_text.see(tk.END)
+    terminal_text.insert(tk.END, f"{msg}\n")
+    terminal_text.see(tk.END)
 
-# Buttons
-btn_frame = tk.Frame(root, bg="#000000")
-btn_frame.pack(fill="x", padx=8, pady=(4, 8))
-tk.Button(btn_frame, text="START", command=lambda: start_trading(), bg="#00aa00", fg="white", font=btn_font, width=12).pack(side="left", padx=10)
-tk.Button(btn_frame, text="STOP",  command=lambda: stop_trading(),  bg="#aa0000", fg="white", font=btn_font, width=12).pack(side="left", padx=10)
+# Buttons + Status
+button_frame = tk.Frame(root, bg="#111111")
+button_frame.pack(pady=10)
+status_label = tk.Label(button_frame, text="Status: Stopped", fg="red", bg="#111111", font=label_font)
+status_label.pack(side="left", padx=10)
+
+tk.Button(button_frame, text="START", command=lambda: start_trading(), bg="#00aa00", fg="white", font=button_font, width=12).pack(side="right", padx=10)
+tk.Button(button_frame, text="STOP",  command=lambda: stop_trading(),  bg="#aa0000", fg="white", font=button_font, width=12).pack(side="right", padx=5)
 
 # -------------------- UTILS --------------------
 def now_cst():
@@ -240,10 +217,7 @@ def load_symbol_info():
             min_qty = _safe_decimal(f.get('LOT_SIZE', {}).get('minQty', '0'))
             min_not = _safe_decimal(f.get('MIN_NOTIONAL', {}).get('minNotional', '10'))
             if step == ZERO or tick == ZERO: continue
-            symbol_info[s['symbol']] = {
-                'stepSize': step, 'tickSize': tick,
-                'minQty': min_qty, 'minNotional': min_not
-            }
+            symbol_info[s['symbol']] = {'stepSize': step, 'tickSize': tick, 'minQty': min_qty, 'minNotional': min_not}
         terminal_insert(f"[{now_cst()}] Loaded {len(symbol_info)} symbols")
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Symbol load error: {e}")
@@ -260,34 +234,24 @@ def update_balances():
 
 def update_stats_labels():
     usdt = account_balances.get('USDT', ZERO)
-    usdt_label.config(text=f"{usdt:.2f}")
+    usdt_label.config(text=f"USDT Balance: {usdt:.2f}")
 
     active = len([a for a in account_balances if a != 'USDT' and account_balances[a] > ZERO])
-    active_coins_label.config(text=str(active))
+    active_coins_label.config(text=f"Active Coins: {active}")
 
-    # Update P&L
     reset_daily_pnl()
     unrealized = update_unrealized_pnl()
     total_pnl = pnl_data['total_realized'] + unrealized
     daily_pnl = pnl_data['daily_realized'] + unrealized
 
-    # Color coding
-    def color(val):
-        return "lime" if val > 0 else "red" if val < 0 else "white"
+    color = "lime" if total_pnl >= 0 else "red"
+    pnl_label.config(text=f"P&L: ${total_pnl:+.2f} (Today: ${daily_pnl:+.2f})", fg=color)
 
-    pnl_total_label.config(text=f"${total_pnl:.2f}", fg=color(total_pnl))
-    pnl_daily_label.config(text=f"(Today: ${daily_pnl:.2f})", fg=color(daily_pnl))
+    status_label.config(text="Status: Running" if running else "Status: Stopped", fg="lime" if running else "red")
 
-    status_label.config(text="Status: Running" if running else "Status: Stopped",
-                        fg="lime" if running else "red")
+    root.after(3000, update_stats_labels)
 
-    root.after(3000, update_stats_labels)  # Faster refresh for P&L
-
-# -------------------- FEES --------------------
-def get_fee_for_side(symbol, side):
-    fees = fetch_trade_fees_for_symbol(symbol)
-    return fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
-
+# -------------------- FEES & TOP COINS --------------------
 def fetch_trade_fees_for_symbol(symbol):
     now = int(time.time())
     if symbol in _fee_cache and now - _fee_cache[symbol]['ts'] < FEE_CACHE_TTL:
@@ -300,7 +264,15 @@ def fetch_trade_fees_for_symbol(symbol):
         return _fee_cache[symbol]
     except: return {'maker': Decimal('0.001'), 'taker': Decimal('0.001')}
 
-# -------------------- TOP COINS --------------------
+def compute_required_sell_pct(symbol):
+    fees = fetch_trade_fees_for_symbol(symbol)
+    buy_fee = fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
+    sell_fee = fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
+    try:
+        pct = (ONE + TARGET_PROFIT_PCT) * (ONE + buy_fee) / (ONE - sell_fee) - ONE
+        return max(pct, MIN_SELL_PCT)
+    except: return MIN_SELL_PCT
+
 def fetch_top_coins():
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -308,50 +280,39 @@ def fetch_top_coins():
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         coins = [c['symbol'].upper() for c in r.json() if c['symbol'].upper() not in EXCLUDED_COINS]
-        top_coins_label.config(text=", ".join(coins[:25]))
+        top_coins_label.config(text="Top Coins: " + ", ".join(coins[:25]))
         return coins[:25]
     except:
-        top_coins_label.config(text="Error")
+        top_coins_label.config(text="Top Coins: Error")
         return []
 
-# -------------------- ORDER PLACEMENT --------------------
+# -------------------- ORDER & GRID --------------------
 def place_limit_order(symbol, side, price, qty, track=True):
     info = symbol_info.get(symbol)
     if not info: return None
     price = round_down(Decimal(price), info['tickSize'])
     qty = round_down(Decimal(qty), info['stepSize'])
-    if qty <= info['minQty']: return None
-    notional = price * qty
-    if notional < info['minNotional']: return None
+    if qty <= info['minQty'] or price * qty < info['minNotional']: return None
 
-    if side == 'BUY':
-        need = notional * SAFETY_BUFFER
-        have = account_balances.get('USDT', ZERO)
-        if need > have:
-            terminal_insert(f"[{now_cst()}] NOT ENOUGH USDT: Need {need:.2f}")
-            return None
-    elif side == 'SELL':
+    if side == 'BUY' and price * qty * SAFETY_BUFFER > account_balances.get('USDT', ZERO):
+        terminal_insert(f"[{now_cst()}] NOT ENOUGH USDT")
+        return None
+    if side == 'SELL':
         base = symbol.replace('USDT', '')
-        have = account_balances.get(base, ZERO)
-        if qty > have:
+        if qty > account_balances.get(base, ZERO):
             terminal_insert(f"[{now_cst()}] NOT ENOUGH {base}")
             return None
 
     try:
-        order = client.create_order(
-            symbol=symbol, side=side, type='LIMIT',
-            timeInForce='GTC', price=format_decimal(price),
-            quantity=format_decimal(qty)
-        )
+        order = client.create_order(symbol=symbol, side=side, type='LIMIT', timeInForce='GTC',
+                                    price=format_decimal(price), quantity=format_decimal(qty))
         terminal_insert(f"[{now_cst()}] {side} {symbol} {qty} @ {price}")
-        if track:
-            active_grid_orders.setdefault(symbol, []).append(order['orderId'])
+        if track: active_grid_orders.setdefault(symbol, []).append(order['orderId'])
         return order
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Order error: {e}")
         return None
 
-# -------------------- GRID LOGIC --------------------
 def cancel_symbol_orders(symbol):
     try:
         for o in client.get_open_orders(symbol=symbol):
@@ -376,35 +337,51 @@ def regrid_on_fill(symbol):
     place_single_grid(symbol, 'BUY')
     place_single_grid(symbol, 'SELL')
 
-def compute_required_sell_pct(symbol):
-    fees = fetch_trade_fees_for_symbol(symbol)
-    buy_fee = fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
-    sell_fee = fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
-    try:
-        pct = (ONE + TARGET_PROFIT_PCT) * (ONE + buy_fee) / (ONE - sell_fee) - ONE
-        return max(pct, MIN_SELL_PCT)
-    except:
-        return MIN_SELL_PCT
-
-# -------------------- WEBSOCKET FILL HANDLER --------------------
+# -------------------- WEBSOCKETS --------------------
 def on_user_message(ws, msg):
     try:
         d = json.loads(msg)
-        if d.get('e') != 'executionReport' or d.get('X') != 'FILLED':
-            return
+        if d.get('e') != 'executionReport' or d.get('X') != 'FILLED': return
         symbol = d['s']
         side = d['S']
         qty = d['q']
         price = d['p']
-        fee = d.get('n', '0')  # Fee in USDT
+        fee = d.get('n', '0')
         fee_asset = d.get('N', 'USDT')
         fee_usdt = Decimal(fee) if fee_asset == 'USDT' else Decimal(fee) * Decimal(price)
-
-        terminal_insert(f"[{now_cst()}] FILLED {side} {symbol} {qty}@{price} (Fee: {fee_usdt:.4f} USDT)")
         record_fill(symbol, side, qty, price, fee_usdt)
         threading.Thread(target=regrid_on_fill, args=(symbol,), daemon=True).start()
-    except Exception as e:
-        terminal_insert(f"[{now_cst()}] WS Error: {e}")
+    except: pass
+
+class WS(websocket.WebSocketApp):
+    def __init__(self, url, on_msg):
+        super().__init__(url, on_message=on_msg)
+        self._stop = False
+    def run_forever(self, **kw):
+        while not self._stop:
+            try: super().run_forever(ping_interval=25, **kw)
+            except: time.sleep(5)
+    def stop(self): self._stop = True; self.close()
+
+def start_user_stream():
+    try:
+        key = client.stream_get_listen_key()['listenKey']
+        WS(f"wss://stream.binance.us:9443/ws/{key}", on_user_message).run_forever()
+    except: pass
+
+def start_price_ws():
+    streams = [f"{s.lower()}@ticker" for s in list(symbol_info.keys())[:500]]
+    if streams:
+        def on_price(ws, m):
+            try:
+                data = json.loads(m)['data']
+                sym = data['s']
+                price = Decimal(data['c'])
+                if price > ZERO:
+                    with price_lock:
+                        live_prices[sym] = price
+            except: pass
+        WS(f"wss://stream.binance.us:9443/stream?streams={'/'.join(streams)}", on_price).run_forever()
 
 # -------------------- THREADS --------------------
 def auto_buy_top_coins():
@@ -440,7 +417,6 @@ def grid_cycle():
             terminal_insert(f"[{now_cst()}] Cycle error: {e}")
             time.sleep(15)
 
-# -------------------- CONTROL --------------------
 def start_trading():
     global running
     if not running:
@@ -454,39 +430,6 @@ def stop_trading():
     running = False
     for s in list(active_grid_orders): cancel_symbol_orders(s)
     terminal_insert(f"[{now_cst()}] BOT STOPPED")
-
-# -------------------- WEBSOCKETS --------------------
-class WS(websocket.WebSocketApp):
-    def __init__(self, url, on_msg):
-        super().__init__(url, on_message=on_msg)
-        self._stop = False
-    def run_forever(self, **kw):
-        while not self._stop:
-            try: super().run_forever(ping_interval=25, **kw)
-            except: time.sleep(5)
-    def stop(self): self._stop = True; self.close()
-
-def start_user_stream():
-    try:
-        key = client.stream_get_listen_key()['listenKey']
-        url = f"wss://stream.binance.us:9443/ws/{key}"
-        WS(url, on_user_message).run_forever()
-    except: pass
-
-def start_price_ws():
-    streams = [f"{s.lower()}@ticker" for s in list(symbol_info.keys())[:500]]
-    if streams:
-        def on_price(ws, m):
-            try:
-                data = json.loads(m)['data']
-                sym = data['s']
-                price = Decimal(data['c'])
-                if price > ZERO:
-                    with price_lock:
-                        live_prices[sym] = price
-            except: pass
-        url = f"wss://stream.binance.us:9443/stream?streams={'/'.join(streams)}"
-        WS(url, on_price).run_forever()
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
