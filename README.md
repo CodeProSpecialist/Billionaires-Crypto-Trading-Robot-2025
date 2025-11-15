@@ -1,162 +1,64 @@
-# 🚀 24 HOUR INFINITY GRID BOT 
-      for Binance.US Edition 🚀
+# Infinity Grid Bot 2025 — Binance.US Automated Trading Bot
 
-**Skyrocketing Wealth Creation with Precision Automation**  
+## Overview
+**Infinity Grid Bot 2025** is a fully automated cryptocurrency trading bot for **Binance.US**.  
+It combines **dynamic grid trading**, **fee-aware limit orders**, and **top market coin selection** to automate buying and selling while maintaining a target net profit.  
 
-*****
-Update to the newest version 
-for the best working 
-trading robot python code. 
-Newest Python code 
-updates were on 11-15-2025. 
+The bot features:  
 
-*****
-
-( Note: delete the file named 
-binance_trades.db when restarting the program if there might be any configuration changes. 
-This also fixes any program startup errors. )
-
-Instructions for the Compact Infinity Grid Bot:
-
-1. Start the INFINITY GRID BOT and relax while the infinity grid bot handles the buying and selling during any future price changes. 
-
-
-It works with this command: 
-python3 infinity_grid_live.py
-
-
-```markdown
-# **INFINITY GRID BOT 2025**  
-### **Fill-Only Regrid · Binance.US · Pure Profit Engine**
-
-> **Every Fill = New Grid. No Timers. No Noise. Just Infinite Profit.**
+- Automatic fetching of top coins by **market cap**, **trading volume**, and **recent price gains** (14-day and 5-day performance) from **CoinGecko** and **Coinbase**.
+- Avoids **stablecoins**, **Bitcoin**, **Ethereum**, **Solana**, and other excluded coins.
+- Fully automated **limit buy/sell orders** with **fee calculation** to guarantee net profit ≥ 1.8%.
+- **Grid rebalancing** triggered immediately upon order fills.
+- **USDT reserve management**: 33% reserved for future buys.
+- **Customizable Tkinter GUI** with **scrollable live terminal** and **status monitoring**.
 
 ---
 
-## **The Ultimate Hands-Off Grid Trading Bot**
+## Features
 
-Tired of bots that regrid every 30 minutes — burning API calls and missing real opportunities?
+### Grid Trading
+- Places limit **buy/sell grids** on owned positions.
+- Automatically **cancels old grid orders** before creating new ones.
+- Dynamic **sell percentage** calculation based on **maker/taker fees**.
 
-**INFINITY GRID BOT 2025** only acts **when it matters**: **on every order fill**.
+### Top Coin Selection
+- Fetches top 25 coins from **CoinGecko** and **Coinbase**:
+  - Sorted by **market cap**
+  - Sorted by **24h volume**
+  - Sorted by **price growth over last 5 and 14 days**
+- Filters to exclude stablecoins, BTC, ETH, BNB, SOL, etc.
 
----
+### Risk Management
+- Maintains **33% of USDT** for additional purchases.
+- Calculates required sell price to ensure net profit after fees ≥ 1.8%.
+- Applies **safety buffer** to avoid overspending USDT.
 
-### **How It Works**
+### User Interface
+- Large **Tkinter GUI** (800x800)
+- **Scrollable terminal** for live logs
+- Status labels updated every second
+- Start/Stop buttons for bot control
 
-| **Event**               | **Action**                                                                 |
-|-------------------------|---------------------------------------------------------------------------|
-| **Bot Starts**          | Places **1 BUY @ -1%** and **1 SELL @ +1.8%** for every coin in your portfolio |
-| **BUY or SELL Fills**   | → Instantly cancels old grids<br>→ Places **new BUY @ -1%** and **SELL @ +1.8%** from **current price** |
-| **No Fill?**            | → **Zero action**. No polling. No wasted API weight. |
-
-**Infinite grid. Zero maintenance.**
-
----
-
-## **Key Features**
-
-- **Fill-Triggered Regrid** — Only acts when a trade executes
-- **Works on Every Coin** — ETH, LTC, DOGE, CHZ, etc. (all USDT pairs)
-- **Real-Time Detection** — Binance User Data Stream (WebSocket)
-- **Smart Order Sizing** — `$5 USDT per grid` (configurable)
-- **Safety Checks** — Min notional, step size, balance guard
-- **Rate Limit Smart** — Auto-backoff, weight tracking
-- **Paper Trading Mode** — Test risk-free
-- **WhatsApp Alerts** (optional) — Instant fill notifications
-- **Clean GUI** — Start / Stop with one click
+### Automation
+- Continuous background **grid cycle every 3 minutes** to minimize API usage.
+- Auto regrid on **order fills** using Binance.US **user data streams**.
+- Live **price WebSocket** updates.
 
 ---
 
-## **Perfect For**
+## Setup
 
-- Long-term holders who want **passive income**
-- Traders tired of **timer-based bots**
-- Anyone running **multiple altcoins**
-- **Binance.US users** (fully compliant)
-
----
-
-## **Setup in 60 Seconds**
-
-pip install python-binance websocket-client requests
-```
-
+### Environment Variables
 ```bash
-export BINANCE_API_KEY="your_key"
-export BINANCE_API_SECRET="your_secret"
-```
+export BINANCE_API_KEY="your_api_key"
+export BINANCE_API_SECRET="your_api_secret"
+export CALLMEBOT_PHONE="your_whatsapp_number"  # optional for alerts
+export CALLMEBOT_API_KEY="your_callmebot_key" # optional for alerts
 
-```bash
-python3 infinity_grid.py
-```
-
-> **Optional**: Set `CALLMEBOT_PHONE` + `CALLMEBOT_API_KEY` for WhatsApp alerts
-
----
-
-## **Why This Bot Wins**
-
-| Traditional Grid Bots | **INFINITY GRID 2025** |
-|-----------------------|-------------------------|
-| Regrid every 30 min   | Only on **real fills** |
-| High API usage        | **Minimal weight**     |
-| Misses momentum       | **Captures every move**|
-| Complex config        | **One-click start**    |
-
----
-
-## **Live Example**
-
-```
-2025-11-15 08:27:12 INFO - FILLED BUY ETHUSDT 0.00156 @ 3199.09
-2025-11-15 08:27:13 INFO - FILL → REGRIDDING ETHUSDT
-2025-11-15 08:27:13 INFO - Canceled 2 orders for ETHUSDT
-2025-11-15 08:27:14 INFO - NEW GRID BUY ETHUSDT 0.00156 @ 3167.10
-2025-11-15 08:27:14 INFO - NEW GRID SELL ETHUSDT 0.00154 @ 3256.52
-```
-
-**Every fill spawns a new profit opportunity.**
-
----
-
-
-## **Start Earning on Autopilot**
-
-> **No more watching charts.**  
-> **No more manual regrids.**  
-> **Just set it, forget it, and collect.**
-
----
-
-**INFINITY GRID BOT 2025**  
-*Built for the future of passive crypto income.*
-
----
-```
-
-
-> **"Trade like a billionaire."**
-
-### **Setup Requirements**
-
-# Environment Variables
-export BINANCE_API_KEY="..."
-export BINANCE_API_SECRET="..."
-export CALLMEBOT_API_KEY="..."   # optional
-export CALLMEBOT_PHONE="..."     # optional
-```
-
-```bash
-pip install python-binance websocket-client pytz
-```
-
----
-
-
-**Professional. Fast. Precise. Fee-Aware. Visual.**  
-*Built for serious traders who want automation without compromise.*
-
-Unleash the power of automated crypto trading with the SMART COIN TRADING BOT, a cutting-edge bot crafted for Binance.US. Target 0.8% net profits per trade on USDT pairs using advanced mean-reversion with comprehensive momentum, oscillator, and trend filters. **Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
+ 
+ 
+**Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
 ### Legal Disclaimers
 
