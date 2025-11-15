@@ -1,65 +1,110 @@
 #!/usr/bin/env python3
 """
-Infinity Grid Bot 2025 — Binance.US
-Fully automated end-to-end
+INFINITY GRID BOT 2025 — BINANCE.US + Top Coin Fetching
+Full automated trading with Tkinter dashboard
 """
-import os, sys, time, json, threading, logging, requests, pytz
-from datetime import datetime
+
+import os, sys, time, threading, json, requests
+from datetime import datetime, timedelta
 from decimal import Decimal, getcontext, ROUND_DOWN
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-import websocket
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
+import pytz, websocket
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
-# ----------------------------------------------------------------------
-# ========================= CONFIG & GLOBALS =========================
-# ----------------------------------------------------------------------
+# -------------------- DECIMAL CONTEXT --------------------
 getcontext().prec = 28
 ZERO = Decimal('0')
 ONE  = Decimal('1')
 SAFETY_BUFFER = Decimal('0.95')
-TARGET_PROFIT_PCT = Decimal('0.018')  # 1.8% net profit target
-GRID_BUY_PCT = Decimal('0.01')        # 1% below current price
-CASH_USDT_PER_GRID_ORDER = Decimal('8.00')  # USDT per buy order
-REGRID_ON_FILL = True
-EXCLUDED_COINS = {'BTC', 'ETH', 'SOL', 'USDT', 'USD', 'BCH', 'BNB'}  # avoid buying
+CASH_USDT_PER_GRID_ORDER = Decimal('8.0')  # Reserve $8 per grid order
+GRID_BUY_PCT  = Decimal('0.01')   # 1% below
+MIN_SELL_PCT  = Decimal('0.018')  # minimum 1.8%
+TARGET_PROFIT_PCT = Decimal('0.018')  # net profit target after fees
 
-# Fee cache: {symbol: {'maker': Decimal, 'taker': Decimal, 'ts': epoch}}
-FEE_CACHE_TTL = 1800  # 30 min
-_fee_cache = {}
+CONSERVATIVE_USE_TAKER = True
+FEE_CACHE_TTL = 60*30  # 30 minutes
 
-CST = pytz.timezone('America/Chicago')
-account_balances = {}
-symbol_info = {}
-live_prices = {}
-price_lock = threading.Lock()
-ws_instances = []
-ws_threads = []
-listen_key = None
-listen_key_lock = threading.Lock()
+EXCLUDED_COINS = {"USD","USDT","BTC","BCH","ETH","SOL"}
+
+CST = pytz.timezone("America/Chicago")
+
+# -------------------- BINANCE CLIENT --------------------
+api_key    = os.getenv('BINANCE_API_KEY')
+api_secret = os.getenv('BINANCE_API_SECRET')
+if not api_key or not api_secret:
+    messagebox.showerror("API Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET")
+    sys.exit(1)
+client = Client(api_key, api_secret, tld='us')
+
+# -------------------- GLOBAL STATE --------------------
+symbol_info = {}        # symbol -> info dict
+account_balances = {}   # asset -> Decimal balance
+active_grid_orders = {} # symbol -> [orderId,...]
+_fee_cache = {}         # symbol -> {'maker': Decimal,'taker':Decimal,'ts':epoch}
+live_prices = {}        # symbol -> Decimal
 running = False
-active_grid_orders = {}  # {symbol: [orderId,...]}
 
-# Logging
-LOG_FILE = os.path.expanduser("~/infinity_grid.log")
-os.makedirs("logs", exist_ok=True)
-logger = logging.getLogger("infinity_grid")
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    fh = logging.FileHandler(LOG_FILE)
-    fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
-    logger.addHandler(fh); logger.addHandler(ch)
+# -------------------- TKINTER GUI --------------------
+root = tk.Tk()
+root.title("INFINITY GRID BOT 2025")
+root.geometry("1024x768")
+root.configure(bg="#111111")
 
-log_info = logger.info
-log_error = logger.error
-log_debug = logger.debug
+title_font = tkfont.Font(size=18, weight="bold")
+button_font = tkfont.Font(size=14, weight="bold")
+label_font = tkfont.Font(size=12)
 
-# ----------------------------------------------------------------------
-# ========================= UTILITY FUNCTIONS =========================
-# ----------------------------------------------------------------------
+# Scrollable frame utility
+def create_scrollable_frame(parent, bg="#222222"):
+    canvas = tk.Canvas(parent, borderwidth=0, background=bg)
+    frame = tk.Frame(canvas, background=bg)
+    scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    canvas.create_window((0,0), window=frame, anchor="nw")
+    
+    def on_frame_configure(event):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    frame.bind("<Configure>", on_frame_configure)
+    return frame, canvas
+
+# -------------------- GUI LAYOUT --------------------
+tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font, fg="white", bg="#111111").pack(pady=10)
+
+# Stats Frame
+stats_outer_frame = tk.Frame(root, bg="#111111", height=150)
+stats_outer_frame.pack(fill="x", padx=10, pady=5)
+stats_scroll_frame, stats_canvas = create_scrollable_frame(stats_outer_frame, bg="#111111")
+
+usdt_label = tk.Label(stats_scroll_frame, text="USDT Balance: 0.00", fg="lime", bg="#111111", font=label_font, anchor="w")
+usdt_label.pack(fill="x", pady=2)
+coins_label = tk.Label(stats_scroll_frame, text="Active Coins: 0", fg="lime", bg="#111111", font=label_font, anchor="w")
+coins_label.pack(fill="x", pady=2)
+top_coins_label = tk.Label(stats_scroll_frame, text="Top Coins: Loading...", fg="lime", bg="#111111", font=label_font, anchor="w", justify="left", wraplength=1000)
+top_coins_label.pack(fill="x", pady=2)
+
+# Terminal Frame
+terminal_outer_frame = tk.Frame(root, bg="#111111")
+terminal_outer_frame.pack(fill="both", expand=True, padx=10, pady=5)
+terminal_scroll_frame, terminal_canvas = create_scrollable_frame(terminal_outer_frame, bg="#000000")
+terminal_text = tk.Text(terminal_scroll_frame, wrap=tk.WORD, bg="black", fg="lime", font=("Courier",12))
+terminal_text.pack(fill="both", expand=True)
+
+def terminal_insert(msg):
+    terminal_text.insert(tk.END, f"{msg}\n")
+    terminal_text.see(tk.END)
+
+# Buttons
+button_frame = tk.Frame(root, bg="#111111")
+button_frame.pack(pady=10)
+status_label = tk.Label(button_frame, text="Status: Stopped", fg="red", bg="#111111", font=label_font)
+status_label.pack(side="left", padx=5)
+
+
+# -------------------- UTILS --------------------
 def now_cst():
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -69,39 +114,8 @@ def _safe_decimal(val, fallback='0'):
     except:
         return Decimal(fallback)
 
-def round_down(val: Decimal, step: Decimal) -> Decimal:
-    return (val // step) * step if step > ZERO else val
-
-def format_decimal(d: Decimal) -> str:
-    s = f"{d:.8f}"
-    return s.rstrip('0').rstrip('.') if '.' in s else s
-
-def send_whatsapp(msg):
-    phone = os.getenv('CALLMEBOT_PHONE')
-    key   = os.getenv('CALLMEBOT_API_KEY')
-    if phone and key:
-        try:
-            m = requests.utils.quote(msg)
-            requests.get(f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={m}&apikey={key}", timeout=5)
-        except: pass
-
-
-# ----------------------------------------------------------------------
-# ========================= BINANCE CLIENT =========================
-# ----------------------------------------------------------------------
-api_key = os.getenv('BINANCE_API_KEY')
-api_secret = os.getenv('BINANCE_API_SECRET')
-if not api_key or not api_secret:
-    messagebox.showerror("API Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET")
-    sys.exit(1)
-
-client = Client(api_key, api_secret, tld='us')
-
-# ----------------------------------------------------------------------
-# ========================= SYMBOL INFO & BALANCES ====================
-# ----------------------------------------------------------------------
+# -------------------- BINANCE SYMBOL INFO --------------------
 def load_symbol_info():
-    """Load all USDT trading pairs and their filters from Binance.US"""
     global symbol_info
     try:
         info = client.get_exchange_info()
@@ -109,10 +123,10 @@ def load_symbol_info():
             if s.get('quoteAsset') != 'USDT' or s.get('status') != 'TRADING':
                 continue
             filters = {f['filterType']: f for f in s.get('filters', [])}
-            step = _safe_decimal(filters.get('LOT_SIZE', {}).get('stepSize', '0'))
-            tick = _safe_decimal(filters.get('PRICE_FILTER', {}).get('tickSize', '0'))
-            min_qty = _safe_decimal(filters.get('LOT_SIZE', {}).get('minQty', '0'))
-            min_notional = _safe_decimal(filters.get('MIN_NOTIONAL', {}).get('minNotional', '10'))
+            step = _safe_decimal(filters.get('LOT_SIZE', {}).get('stepSize','0'))
+            tick = _safe_decimal(filters.get('PRICE_FILTER', {}).get('tickSize','0'))
+            min_qty = _safe_decimal(filters.get('LOT_SIZE', {}).get('minQty','0'))
+            min_notional = _safe_decimal(filters.get('MIN_NOTIONAL', {}).get('minNotional','10'))
             if step == ZERO or tick == ZERO: continue
             symbol_info[s['symbol']] = {
                 'stepSize': step,
@@ -120,26 +134,23 @@ def load_symbol_info():
                 'minQty': min_qty,
                 'minNotional': min_notional
             }
-        log_info(f"Loaded {len(symbol_info)} symbols")
+        terminal_insert(f"[{now_cst()}] Loaded {len(symbol_info)} USDT trading symbols")
     except Exception as e:
-        log_error(f"Error loading symbols: {e}")
+        terminal_insert(f"[{now_cst()}] ERROR loading symbol info: {e}")
 
+# -------------------- ACCOUNT BALANCES --------------------
 def update_balances():
-    """Update account balances for all assets"""
     global account_balances
     try:
         info = client.get_account()
         account_balances = {a['asset']: _safe_decimal(a['free'])
                             for a in info['balances'] if _safe_decimal(a['free']) > ZERO}
-        log_info(f"USDT balance: {account_balances.get('USDT', ZERO):.2f}")
+        usdt_label.config(text=f"USDT Balance: {account_balances.get('USDT', ZERO):.2f}")
     except Exception as e:
-        log_error(f"Balance fetch error: {e}")
+        terminal_insert(f"[{now_cst()}] ERROR fetching balances: {e}")
 
-# ----------------------------------------------------------------------
-# ========================= FEES & PROFIT =========================
-# ----------------------------------------------------------------------
-def fetch_trade_fees(symbol):
-    """Return dict {'maker': Decimal, 'taker': Decimal} with caching"""
+# -------------------- FEE FETCHING --------------------
+def fetch_trade_fees_for_symbol(symbol):
     now_ts = int(time.time())
     cached = _fee_cache.get(symbol)
     if cached and now_ts - cached['ts'] < FEE_CACHE_TTL:
@@ -147,420 +158,301 @@ def fetch_trade_fees(symbol):
     try:
         resp = client.get_trade_fee(symbol=symbol)
         if isinstance(resp, list) and resp:
-            fee_data = resp[0]
-            maker = _safe_decimal(fee_data.get('makerCommission', 0))
-            taker = _safe_decimal(fee_data.get('takerCommission', 0))
+            maker = Decimal(resp[0].get('makerCommission', '0'))
+            taker = Decimal(resp[0].get('takerCommission', '0'))
         else:
             maker = taker = Decimal('0.001')
+        _fee_cache[symbol] = {'maker': maker, 'taker': taker, 'ts': now_ts}
+        return {'maker': maker, 'taker': taker}
     except Exception as e:
-        log_error(f"Fee fetch failed for {symbol}: {e}")
-        maker = taker = Decimal('0.001')
-    _fee_cache[symbol] = {'maker': maker, 'taker': taker, 'ts': now_ts}
-    return {'maker': maker, 'taker': taker}
+        terminal_insert(f"[{now_cst()}] Fee fetch error {symbol}: {e}")
+        return {'maker': Decimal('0.0'), 'taker': Decimal('0.001')}
 
 def compute_required_sell_pct(symbol, target=TARGET_PROFIT_PCT):
-    """Compute required sell % to achieve target net profit after fees"""
-    fees = fetch_trade_fees(symbol)
-    buy_fee = fees['taker']
-    sell_fee = fees['taker']
-    required_multiplier = (ONE + target) * (ONE + buy_fee) / (ONE - sell_fee)
-    required_pct = required_multiplier - ONE
-    if required_pct < Decimal('0.018'):
-        required_pct = Decimal('0.018')
-    return required_pct
+    fees = fetch_trade_fees_for_symbol(symbol)
+    buy_fee = fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
+    sell_fee = fees['taker'] if CONSERVATIVE_USE_TAKER else fees['maker']
+    try:
+        req_multiplier = (ONE + target) * (ONE + buy_fee) / (ONE - sell_fee)
+        req_pct = req_multiplier - ONE
+        if req_pct < MIN_SELL_PCT:
+            req_pct = MIN_SELL_PCT
+        return req_pct
+    except:
+        return MIN_SELL_PCT
 
-# ----------------------------------------------------------------------
-# ========================= ORDER PLACEMENT =========================
-# ----------------------------------------------------------------------
-def place_limit_order(symbol, side, price, qty):
-    """Place a limit order (live)"""
+# -------------------- COIN FETCHING --------------------
+coingecko_cache = {'top_coins': [], 'ts': datetime.min}
+
+def fetch_top_coins():
+    """Fetch top 25 coins by market cap, volume, 24h and 5-day % gain from CoinGecko + Coinbase"""
+    now_time = datetime.utcnow()
+    if (now_time - coingecko_cache['ts']).total_seconds() < 180:  # 3 minutes cache
+        return coingecko_cache['top_coins']
+    try:
+        # CoinGecko
+        cg_url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {"vs_currency":"usd","order":"market_cap_desc","per_page":100,"page":1,"sparkline":"false","price_change_percentage":"24h,5d,14d"}
+        resp = requests.get(cg_url, params=params, timeout=10)
+        coins = resp.json()
+        # Sort by combined metric: top market cap + volume + 24h gain + 5d gain
+        coins_sorted = sorted(coins, key=lambda x: (
+            _safe_decimal(x.get('market_cap',0)),
+            _safe_decimal(x.get('total_volume',0)),
+            _safe_decimal(x.get('price_change_percentage_24h',0)),
+            _safe_decimal(x.get('price_change_percentage_5d',0))
+        ), reverse=True)
+        top_coins = [c['symbol'].upper() for c in coins_sorted if c['symbol'].upper() not in EXCLUDED_COINS][:25]
+        coingecko_cache['top_coins'] = top_coins
+        coingecko_cache['ts'] = now_time
+        top_coins_label.config(text="Top Coins: " + ", ".join(top_coins))
+        terminal_insert(f"[{now_cst()}] Fetched top coins: {top_coins}")
+        return top_coins
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] ERROR fetching top coins: {e}")
+        return coingecko_cache.get('top_coins', [])
+
+# -------------------- HELPER FUNCTIONS --------------------
+def round_down(val: Decimal, step: Decimal) -> Decimal:
+    return (val // step) * step if step > ZERO else val
+
+def format_decimal(d: Decimal) -> str:
+    s = f"{d:.8f}"
+    return s.rstrip('0').rstrip('.') if '.' in s else s
+
+
+# -------------------- ORDER PLACEMENT --------------------
+def place_limit_order(symbol, side, price, qty, track=True):
     info = symbol_info.get(symbol)
-    if not info:
-        log_error(f"No symbol info for {symbol}")
+    if not info: 
+        terminal_insert(f"[{now_cst()}] ERROR: No symbol info for {symbol}")
         return None
+
     price = round_down(Decimal(price), info['tickSize'])
-    qty = round_down(Decimal(qty), info['stepSize'])
+    qty   = round_down(Decimal(qty), info['stepSize'])
+
     if qty <= info['minQty']:
-        log_error(f"Order qty too low {qty} <= {info['minQty']}")
+        terminal_insert(f"[{now_cst()}] ERROR: QTY {qty} too small for {symbol}")
         return None
     notional = price * qty
     if notional < info['minNotional']:
-        log_error(f"Order notional too low {notional} < {info['minNotional']}")
+        terminal_insert(f"[{now_cst()}] ERROR: NOTIONAL {notional} < minNotional for {symbol}")
         return None
 
-    if side == 'BUY' and notional * SAFETY_BUFFER > account_balances.get('USDT', ZERO):
-        log_error(f"Insufficient USDT for buy {notional}")
+    if side == 'BUY' and notional > account_balances.get('USDT', ZERO):
+        terminal_insert(f"[{now_cst()}] ERROR: Not enough USDT to buy {symbol}")
         return None
-    elif side == 'SELL':
-        base = symbol.replace('USDT', '')
-        if qty > account_balances.get(base, ZERO) * SAFETY_BUFFER:
-            log_error(f"Insufficient {base} for sell {qty}")
+    if side == 'SELL':
+        base = symbol.replace('USDT','')
+        if qty > account_balances.get(base, ZERO):
+            terminal_insert(f"[{now_cst()}] ERROR: Not enough {base} to sell {symbol}")
             return None
 
     try:
         order = client.create_order(
-            symbol=symbol, side=side, type='LIMIT', timeInForce='GTC',
-            quantity=format_decimal(qty), price=format_decimal(price)
+            symbol=symbol,
+            side=side,
+            type='LIMIT',
+            timeInForce='GTC',
+            price=format_decimal(price),
+            quantity=format_decimal(qty)
         )
-        log_info(f"Placed {side} {symbol} {qty} @ {price}")
-        active_grid_orders.setdefault(symbol, []).append(order['orderId'])
+        terminal_insert(f"[{now_cst()}] ORDER PLACED: {side} {symbol} {qty}@{price}")
+        if track: active_grid_orders.setdefault(symbol, []).append(order['orderId'])
         return order
     except BinanceAPIException as e:
-        log_error(f"Binance API error {e}")
+        terminal_insert(f"[{now_cst()}] API ERROR placing {side} {symbol}: {e}")
     except Exception as e:
-        log_error(f"Order failed {symbol}: {e}")
+        terminal_insert(f"[{now_cst()}] ERROR placing {side} {symbol}: {e}")
     return None
 
-# ----------------------------------------------------------------------
-# ========================= CANCEL ORDERS =========================
-# ----------------------------------------------------------------------
+# -------------------- GRID LOGIC --------------------
 def cancel_symbol_orders(symbol):
-    """Cancel all open orders for a symbol"""
     try:
-        open_orders = client.get_open_orders(symbol=symbol)
-        canceled = 0
-        for o in open_orders:
-            try:
-                client.cancel_order(symbol=o['symbol'], orderId=o['orderId'])
-                canceled += 1
-            except: pass
-        if canceled: log_info(f"Canceled {canceled} open orders for {symbol}")
+        orders = client.get_open_orders(symbol=symbol)
+        for o in orders:
+            client.cancel_order(symbol=o['symbol'], orderId=o['orderId'])
         active_grid_orders[symbol] = []
+        terminal_insert(f"[{now_cst()}] CANCELED {len(orders)} orders for {symbol}")
     except Exception as e:
-        log_error(f"Cancel failed {symbol}: {e}")
-
-
-# ----------------------------------------------------------------------
-# ========================= TOP COINS FETCHING =========================
-# ----------------------------------------------------------------------
-def fetch_top_coingecko_coins():
-    """Fetch top coins by market cap, 24h volume, and 5/14-day gains"""
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 100,
-            "page": 1,
-            "sparkline": False,
-            "price_change_percentage": "5d,14d"
-        }
-        resp = requests.get(url, params=params, timeout=10).json()
-        coins = []
-        for coin in resp:
-            coins.append({
-                "symbol": coin['symbol'].upper(),
-                "market_cap": coin['market_cap'],
-                "volume": coin['total_volume'],
-                "pct_5d": coin.get('price_change_percentage_5d_in_currency', 0),
-                "pct_14d": coin.get('price_change_percentage_14d_in_currency', 0)
-            })
-        log_info(f"Fetched {len(coins)} coins from CoinGecko")
-        return coins
-    except Exception as e:
-        log_error(f"CoinGecko fetch failed: {e}")
-        return []
-
-def fetch_top_coinbase_coins():
-    """Fetch top coins by volume from Coinbase"""
-    try:
-        url = "https://api.pro.coinbase.com/products"
-        resp = requests.get(url, timeout=10).json()
-        coins = [p['base_currency'].upper() for p in resp if p['quote_currency'] == 'USD']
-        log_info(f"Fetched {len(coins)} coins from Coinbase")
-        return coins
-    except Exception as e:
-        log_error(f"Coinbase fetch failed: {e}")
-        return []
-
-# ----------------------------------------------------------------------
-# ========================= DETERMINE ELIGIBLE COINS ==================
-# ----------------------------------------------------------------------
-EXCLUDE_COINS = {'USDT', 'USD', 'BTC', 'ETH', 'BCH', 'BNB', 'SOL'}
-
-def filter_top_coins():
-    """Combine top lists, exclude stablecoins/major coins, and select top 25"""
-    cg = fetch_top_coingecko_coins()
-    cb = fetch_top_coinbase_coins()
-
-    combined = {}
-    for coin in cg:
-        symbol = coin['symbol']
-        if symbol in EXCLUDE_COINS: continue
-        combined[symbol] = coin
-
-    for symbol in cb:
-        if symbol in EXCLUDE_COINS: continue
-        if symbol not in combined:
-            combined[symbol] = {"symbol": symbol, "market_cap": 0, "volume": 0, "pct_5d": 0, "pct_14d": 0}
-
-    # Rank top by market_cap + volume + 5d/14d pct sum
-    def rank_key(c): return (
-        c.get('market_cap', 0),
-        c.get('volume', 0),
-        c.get('pct_5d', 0),
-        c.get('pct_14d', 0)
-    )
-    sorted_coins = sorted(combined.values(), key=rank_key, reverse=True)
-    top25 = sorted_coins[:25]
-
-    # Save to file
-    with open("coins-to-buy-today.txt", "w") as f:
-        for c in top25:
-            f.write(f"{c['symbol']}\n")
-    log_info("Saved top 25 eligible coins to coins-to-buy-today.txt")
-    return [c['symbol'] for c in top25]
-
-# ----------------------------------------------------------------------
-# ========================= GRID PLACEMENT =========================
-# ----------------------------------------------------------------------
-CASH_USDT_PER_GRID_ORDER = Decimal('8.00')  # reserve 33% buying power per order
+        terminal_insert(f"[{now_cst()}] ERROR canceling orders {symbol}: {e}")
 
 def place_single_grid(symbol, side):
-    """Place a single grid order, either BUY or SELL"""
-    cancel_symbol_orders(symbol)  # cancel old grid orders first
     try:
-        ticker = client.get_symbol_ticker(symbol=f"{symbol}USDT")
-        price = Decimal(ticker['price'])
+        ticker = client.get_symbol_ticker(symbol=symbol)
+        cur_price = Decimal(ticker['price'])
     except Exception as e:
-        log_error(f"Price fetch failed for {symbol}: {e}")
+        terminal_insert(f"[{now_cst()}] ERROR fetching price for {symbol}: {e}")
         return
 
-    info = symbol_info.get(f"{symbol}USDT")
+    info = symbol_info.get(symbol)
     if not info: return
 
     if side == 'BUY':
-        grid_price = price * (ONE - GRID_BUY_PCT)
-        qty = CASH_USDT_PER_GRID_ORDER / grid_price
-    else:  # SELL
-        required_pct = compute_required_sell_pct(f"{symbol}USDT")
-        grid_price = price * (ONE + required_pct)
-        qty = account_balances.get(symbol, ZERO)
+        price = cur_price * (ONE - GRID_BUY_PCT)
+    else:
+        req_pct = compute_required_sell_pct(symbol)
+        price = cur_price * (ONE + req_pct)
 
-    grid_price = round_down(grid_price, info['tickSize'])
+    price = round_down(price, info['tickSize'])
+    qty = CASH_USDT_PER_GRID_ORDER / price
     qty = round_down(qty, info['stepSize'])
     if qty <= ZERO: return
 
-    place_limit_order(f"{symbol}USDT", side, grid_price, qty)
-
-
-# ----------------------------------------------------------------------
-# ========================= LIVE DATA WEBSOCKETS ======================
-# ----------------------------------------------------------------------
-class HeartbeatWebSocket(websocket.WebSocketApp):
-    """WebSocket wrapper with heartbeat and reconnect logic"""
-    def __init__(self, url, **kwargs):
-        super().__init__(url, **kwargs)
-        self._stop = False
-
-    def on_open(self, ws):
-        log_info(f"WS OPEN: {ws.url.split('?')[0]}")
-
-    def run_forever(self, **kwargs):
-        while not self._stop:
-            try:
-                super().run_forever(ping_interval=25, **kwargs)
-            except Exception as e:
-                log_error(f"WS CRASH: {e}")
-            time.sleep(5)
-
-    def stop(self):
-        self._stop = True
-        self.close()
-
-
-def on_price_message(ws, message):
-    """Parse live price ticker message"""
-    try:
-        data = json.loads(message)
-        stream = data.get('stream', '')
-        payload = data.get('data', {})
-        sym = stream.split('@')[0].upper()
-        if stream.endswith('@ticker') and payload:
-            price = _safe_decimal(payload.get('c', '0'))
-            if price > ZERO:
-                with price_lock:
-                    live_prices[sym] = price
-    except Exception as e:
-        log_debug(f"Price WS parse: {e}")
-
-
-def start_price_ws(symbols):
-    """Start WebSocket for live price updates"""
-    streams = [f"{s.lower()}@ticker" for s in symbols[:500]]
-    url = f"wss://stream.binance.us:9443/stream?streams={'/'.join(streams)}"
-    ws = HeartbeatWebSocket(url, on_message=on_price_message)
-    ws_instances.append(ws)
-    t = threading.Thread(target=ws.run_forever, daemon=True)
-    t.start()
-    ws_threads.append(t)
-
-
-# ----------------------------------------------------------------------
-# ========================= USER DATA STREAM ===========================
-# ----------------------------------------------------------------------
-def on_user_message(ws, message):
-    """Detect order fills and trigger regrid"""
-    try:
-        data = json.loads(message)
-        if data.get('e') != 'executionReport': return
-        if data.get('X') != 'FILLED': return
-
-        symbol = data.get('s')
-        side   = data.get('S')
-        qty    = _safe_decimal(data.get('q', '0'))
-        price  = _safe_decimal(data.get('p', '0'))
-        if qty <= ZERO: return
-
-        log_info(f"FILLED {side} {symbol} {qty} @ {price}")
-        send_whatsapp(f"FILLED {side} {symbol} {qty}@{price}")
-
-        threading.Thread(target=regrid_on_fill, args=(symbol,), daemon=True).start()
-    except Exception as e:
-        log_debug(f"User WS parse error: {e}")
-
-
-def start_user_data_stream():
-    """Start user data stream to detect fills"""
-    global listen_key
-    try:
-        res = client.stream_get_listen_key()
-        listen_key = res.get('listenKey') if isinstance(res, dict) else str(res)
-        if not listen_key: raise ValueError("No listenKey")
-        url = f"wss://stream.binance.us:9443/ws/{listen_key}"
-        ws = HeartbeatWebSocket(url, on_message=on_user_message)
-        ws_instances.append(ws)
-        t = threading.Thread(target=ws.run_forever, daemon=True)
-        t.start()
-        ws_threads.append(t)
-        threading.Thread(target=keep_alive_listen_key, daemon=True).start()
-        log_info("User Data Stream STARTED")
-    except Exception as e:
-        log_error(f"User stream failed: {e}")
-
-
-def keep_alive_listen_key():
-    """Send keepalive ping for user stream"""
-    global listen_key
-    while running:
-        if listen_key:
-            try:
-                client.stream_keepalive(listen_key)
-            except: pass
-        time.sleep(1800)
-
+    place_limit_order(symbol, side, price, qty, track=True)
 
 def regrid_on_fill(symbol):
-    """Cancel old orders and place new grid orders after a fill"""
-    log_info(f"FILL DETECTED → REGRIDDING {symbol}")
     cancel_symbol_orders(symbol)
-    place_single_grid(symbol.replace('USDT',''), 'BUY')
-    place_single_grid(symbol.replace('USDT',''), 'SELL')
+    place_single_grid(symbol, 'BUY')
+    place_single_grid(symbol, 'SELL')
+
+# -------------------- INITIAL GRID --------------------
+def place_initial_grids():
+    owned_symbols = [asset+'USDT' for asset in account_balances.keys() if asset != 'USDT' and asset+'USDT' in symbol_info]
+    terminal_insert(f"[{now_cst()}] Placing initial grids for {len(owned_symbols)} symbols: {owned_symbols}")
+    for sym in owned_symbols:
+        cancel_symbol_orders(sym)
+        place_single_grid(sym, 'BUY')
+        place_single_grid(sym, 'SELL')
+
+# -------------------- AUTOMATED BUY --------------------
+def auto_buy_top_coins():
+    usdt_available = account_balances.get('USDT', ZERO) * Decimal('0.33')  # 33% reserved
+    top_coins = fetch_top_coins()
+    for sym in top_coins:
+        symbol = sym+'USDT'
+        if symbol not in symbol_info: continue
+        price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+        if price <= ZERO or price > usdt_available: continue
+        qty = round_down(usdt_available / price, symbol_info[symbol]['stepSize'])
+        if qty <= ZERO: continue
+        place_limit_order(symbol, 'BUY', price, qty)
 
 
-# ----------------------------------------------------------------------
-# ========================= GUI SETUP (1024x768) ======================
-# ----------------------------------------------------------------------
+# -------------------- TKINTER GUI & TERMINAL --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025")
-root.geometry("1024x768")
+root.geometry("1024x768")  # large window
 root.resizable(True, True)
 
-tk.Label(root, text="INFINITY GRID BOT", font=tkfont.Font(size=24, weight="bold")).pack(pady=20)
+# -------------------- TERMINAL FRAME --------------------
+terminal_frame = tk.Frame(root)
+terminal_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-status_label = tk.Label(root, text="Status: Stopped", font=tkfont.Font(size=18), fg="red")
-status_label.pack(pady=10)
+scrollbar = tk.Scrollbar(terminal_frame)
+scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+terminal_text = tk.Text(terminal_frame, yscrollcommand=scrollbar.set, wrap=tk.NONE)
+terminal_text.pack(fill=tk.BOTH, expand=True)
+scrollbar.config(command=terminal_text.yview)
+
+def terminal_insert(msg):
+    terminal_text.insert(tk.END, msg + '\n')
+    terminal_text.see(tk.END)
+
+# -------------------- STATS FRAME --------------------
+stats_frame = tk.Frame(root)
+stats_frame.pack(fill=tk.X, padx=10, pady=5)
+
+status_label = tk.Label(stats_frame, text="Status: Stopped", fg="red", font=("Helvetica", 12))
+status_label.pack(side=tk.LEFT, padx=5)
+
+usdt_label = tk.Label(stats_frame, text="USDT Balance: 0.00", fg="blue", font=("Helvetica", 12))
+usdt_label.pack(side=tk.LEFT, padx=20)
+
+def update_stats_labels():
+    usdt_balance = account_balances.get('USDT', ZERO)
+    usdt_label.config(text=f"USDT Balance: {usdt_balance:.8f}")
+    status_label.config(text="Status: Running" if running else "Status: Stopped",
+                        fg="green" if running else "red")
+    root.after(5000, update_stats_labels)
+
+update_stats_labels()
+
+# -------------------- CONTROL BUTTONS --------------------
+control_frame = tk.Frame(root)
+control_frame.pack(fill=tk.X, padx=10, pady=5)
 
 def start_trading():
     global running
     if not running:
         running = True
-        log_info("START PRESSED")
-        threading.Thread(target=initialise_bot, daemon=True).start()
+        terminal_insert(f"[{now_cst()}] GRID BOT STARTED")
         threading.Thread(target=grid_cycle, daemon=True).start()
-        status_label.config(text="Status: Running", fg="green")
+        threading.Thread(target=auto_buy_top_coins, daemon=True).start()
 
 def stop_trading():
     global running
     running = False
-    log_info("STOP PRESSED")
     for sym in list(active_grid_orders.keys()): cancel_symbol_orders(sym)
-    for ws in ws_instances: ws.stop()
-    status_label.config(text="Status: Stopped", fg="red")
+    terminal_insert(f"[{now_cst()}] GRID BOT STOPPED")
 
-tk.Button(root, text="Start", command=start_trading, bg="green", fg="white",
-          font=tkfont.Font(size=16, weight="bold"), width=20).pack(pady=10)
-tk.Button(root, text="Stop",  command=stop_trading, bg="red", fg="white",
-          font=tkfont.Font(size=16, weight="bold"), width=20).pack(pady=5)
+tk.Button(control_frame, text="Start", command=start_trading, bg="green", fg="white", font=("Helvetica", 14)).pack(side=tk.LEFT, padx=10)
+tk.Button(control_frame, text="Stop",  command=stop_trading,  bg="red",   fg="white", font=("Helvetica", 14)).pack(side=tk.LEFT, padx=10)
 
-def update_status():
-    status_label.config(text="Status: Running" if running else "Status: Stopped",
-                        fg="green" if running else "red")
-    root.after(1000, update_status)
-update_status()
+# -------------------- WEBSOCKET HANDLERS --------------------
+def on_user_message(ws, message):
+    data = json.loads(message)
+    if data.get('e') != 'executionReport' or data.get('X') != 'FILLED': return
+    symbol = data.get('s')
+    side   = data.get('S')
+    qty    = Decimal(data.get('q', '0'))
+    price  = Decimal(data.get('p', '0'))
+    terminal_insert(f"[{now_cst()}] FILLED {side} {symbol} {qty}@{price}")
+    threading.Thread(target=regrid_on_fill, args=(symbol,), daemon=True).start()
 
+class HeartbeatWebSocket(websocket.WebSocketApp):
+    def __init__(self, url, **kwargs):
+        super().__init__(url, **kwargs)
+        self._stop = False
+    def run_forever(self, **kwargs):
+        while not self._stop:
+            try: super().run_forever(ping_interval=25, **kwargs)
+            except Exception as e: terminal_insert(f"[{now_cst()}] WS CRASH: {e}")
+            time.sleep(5)
+    def stop(self):
+        self._stop = True
+        self.close()
 
-# ----------------------------------------------------------------------
-# ========================= INITIALISATION & MAIN =====================
-# ----------------------------------------------------------------------
-def initialise_bot():
-    """Load symbols, balances, and start websockets"""
-    try:
-        log_info("INITIALISING GRID BOT...")
-        load_symbol_info()
-        update_balances()
-        start_price_ws(list(symbol_info.keys()))
-        start_user_data_stream()
-        log_info("GRID BOT READY")
-        send_whatsapp("GRID BOT STARTED (FILL-ONLY MODE)")
-    except Exception as e:
-        log_error(f"Init failed: {e}")
+def start_user_data_stream():
+    global listen_key
+    res = client.stream_get_listen_key()
+    listen_key = res.get('listenKey') if isinstance(res, dict) else str(res)
+    url = f"wss://stream.binance.us:9443/ws/{listen_key}"
+    ws = HeartbeatWebSocket(url, on_message=on_user_message)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+    terminal_insert(f"[{now_cst()}] User Data Stream Started")
 
+def start_price_ws(symbols):
+    streams = [f"{s.lower()}@ticker" for s in symbols[:500]]
+    url = f"wss://stream.binance.us:9443/stream?streams={'/'.join(streams)}"
+    ws = HeartbeatWebSocket(url, on_message=lambda ws,msg: update_live_prices(msg))
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+    terminal_insert(f"[{now_cst()}] Price WS Started for {len(symbols)} symbols")
 
-def grid_cycle():
-    """Main grid loop: place initial grids and update balances every 3 minutes"""
-    while running:
-        try:
-            update_balances()
-            usdt_balance = account_balances.get('USDT', ZERO)
-            if usdt_balance <= ZERO:
-                log_error("No USDT balance. Waiting 30s...")
-                time.sleep(30)
-                continue
+def update_live_prices(message):
+    data = json.loads(message)
+    payload = data.get('data', {})
+    sym = payload.get('s','').upper()
+    price = Decimal(payload.get('c', '0'))
+    if price > ZERO:
+        with price_lock:
+            live_prices[sym] = price
 
-            # Place initial grids for owned coins
-            place_initial_grids()
-
-            log_info("INITIAL GRID PLACED. Waiting for fills...")
-            # Sleep 3 minutes before next balance + grid check
-            sleep_time = 180
-            while running and sleep_time > 0:
-                time.sleep(1)
-                sleep_time -= 1
-                update_balances()  # keep balances fresh every 3 min
-
-        except Exception as e:
-            log_error(f"GRID CYCLE CRASH: {e}. Restarting in 15s...")
-            time.sleep(15)
-
-
-def start_main():
-    """Start the Tkinter GUI and bot"""
-    api_key = os.getenv('BINANCE_API_KEY')
+# -------------------- MAIN LOOP --------------------
+if __name__ == "__main__":
+    api_key    = os.getenv('BINANCE_API_KEY')
     api_secret = os.getenv('BINANCE_API_SECRET')
     if not api_key or not api_secret:
         messagebox.showerror("API Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET")
         sys.exit(1)
-
-    global client
     client = Client(api_key, api_secret, tld='us')
 
-    log_info("Starting INFINITY GRID BOT GUI...")
+    load_symbol_info()      # Load symbol filters / tick sizes
+    update_balances()       # Load account balances
+    start_user_data_stream()
+    start_price_ws(list(symbol_info.keys()))
+
+    terminal_insert(f"[{now_cst()}] GRID BOT READY")
+
     root.mainloop()
-
-
-# ----------------------------------------------------------------------
-# ========================= ENTRY POINT =================================
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    start_main()
