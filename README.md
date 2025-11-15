@@ -135,19 +135,7 @@ python3 infinity_grid.py
 ---
 ```
 
----
 
-
-```
-
-```
- 
-
-
-
---- 
-
-**Tagline:**  
 > **"Trade like a billionaire."**
 
 ### **Setup Requirements**
