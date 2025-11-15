@@ -17,47 +17,134 @@ binance_trades.db when restarting the program if there might be any configuratio
 This also fixes any program startup errors. )
 
 Instructions for the Compact Infinity Grid Bot:
-1. Download and run my other python bot called Digital-Coin-Portfolio-Rebalancer Bot for a professionally balanced coin portfolio or just simply place some buy orders manually. 
+1. Download and run my other python bot called Digital-Coin-Portfolio-Rebalancer Bot for a professionally balanced coin portfolio and just simply place some buy orders manually. 
 2. After your portfolio is rebalanced and ready proceed to next step. 
 3. Start the INFINITY GRID BOT and relax while the infinity grid bot handles the buying and selling during any future price changes. 
 
 
-> **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book**
-
----
-
-
-
-Get It Now
-Ready-to-run. No config files. Just set API keys and go.
-
-Built for traders who demand precision. Powered by real-time depth, not hype.
-
-
-```bash
-# 1. Install
-
-pip install python-binance websocket-client requests
-
-
-# 2. Set env
-export BINANCE_API_KEY="your_key"
-export BINANCE_API_SECRET="your_secret"
-export CALLMEBOT_API_KEY="123456"
-export CALLMEBOT_PHONE="15551234567"
-
-# 3. Run
+It works with this command: 
 python3 infinity_grid_live.py
 
 
-```
- 
-**NO SUBSCRIPTION • NO CLOUD • FULL CONTROL**
+```markdown
+# **INFINITY GRID BOT 2025**  
+### **Fill-Only Regrid · Binance.US · Pure Profit Engine**
+
+> **Every Fill = New Grid. No Timers. No Noise. Just Infinite Profit.**
 
 ---
 
-**BILLIONAIRES CRYPTO TRADING ROBOT 2025**  
-*Built for speed. Built for profit. Built for you.*
+## **The Ultimate Hands-Off Grid Trading Bot**
+
+Tired of bots that regrid every 30 minutes — burning API calls and missing real opportunities?
+
+**INFINITY GRID BOT 2025** only acts **when it matters**: **on every order fill**.
+
+---
+
+### **How It Works**
+
+| **Event**               | **Action**                                                                 |
+|-------------------------|---------------------------------------------------------------------------|
+| **Bot Starts**          | Places **1 BUY @ -1%** and **1 SELL @ +1.8%** for every coin in your portfolio |
+| **BUY or SELL Fills**   | → Instantly cancels old grids<br>→ Places **new BUY @ -1%** and **SELL @ +1.8%** from **current price** |
+| **No Fill?**            | → **Zero action**. No polling. No wasted API weight. |
+
+**Infinite grid. Zero maintenance.**
+
+---
+
+## **Key Features**
+
+- **Fill-Triggered Regrid** — Only acts when a trade executes
+- **Works on Every Coin** — ETH, LTC, DOGE, CHZ, etc. (all USDT pairs)
+- **Real-Time Detection** — Binance User Data Stream (WebSocket)
+- **Smart Order Sizing** — `$5 USDT per grid` (configurable)
+- **Safety Checks** — Min notional, step size, balance guard
+- **Rate Limit Smart** — Auto-backoff, weight tracking
+- **Paper Trading Mode** — Test risk-free
+- **WhatsApp Alerts** (optional) — Instant fill notifications
+- **Clean GUI** — Start / Stop with one click
+
+---
+
+## **Perfect For**
+
+- Long-term holders who want **passive income**
+- Traders tired of **timer-based bots**
+- Anyone running **multiple altcoins**
+- **Binance.US users** (fully compliant)
+
+---
+
+## **Setup in 60 Seconds**
+
+```bash
+pip install python-binance websocket-client requests
+```
+
+```bash
+export BINANCE_API_KEY="your_key"
+export BINANCE_API_SECRET="your_secret"
+```
+
+```bash
+python3 infinity_grid.py
+```
+
+> **Optional**: Set `CALLMEBOT_PHONE` + `CALLMEBOT_API_KEY` for WhatsApp alerts
+
+---
+
+## **Why This Bot Wins**
+
+| Traditional Grid Bots | **INFINITY GRID 2025** |
+|-----------------------|-------------------------|
+| Regrid every 30 min   | Only on **real fills** |
+| High API usage        | **Minimal weight**     |
+| Misses momentum       | **Captures every move**|
+| Complex config        | **One-click start**    |
+
+---
+
+## **Live Example**
+
+```
+2025-11-15 08:27:12 INFO - FILLED BUY ETHUSDT 0.00156 @ 3199.09
+2025-11-15 08:27:13 INFO - FILL → REGRIDDING ETHUSDT
+2025-11-15 08:27:13 INFO - Canceled 2 orders for ETHUSDT
+2025-11-15 08:27:14 INFO - NEW GRID BUY ETHUSDT 0.00156 @ 3167.10
+2025-11-15 08:27:14 INFO - NEW GRID SELL ETHUSDT 0.00154 @ 3256.52
+```
+
+**Every fill spawns a new profit opportunity.**
+
+---
+
+
+## **Start Earning on Autopilot**
+
+> **No more watching charts.**  
+> **No more manual regrids.**  
+> **Just set it, forget it, and collect.**
+
+---
+
+**INFINITY GRID BOT 2025**  
+*Built for the future of passive crypto income.*
+
+---
+```
+
+---
+
+
+```
+
+```
+ 
+
+
 
 --- 
 
