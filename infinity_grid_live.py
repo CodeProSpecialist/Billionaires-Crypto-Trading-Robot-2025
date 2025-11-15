@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PLATINUM CRYPTO TRADER + GRID BOT 2025 — BINANCE.US EDITION
-Tkinter GUI + WebSocket + REST + Grid Trading
-Rate-limited, backoff on 429/418/503, IP ban protection
+PLATINUM CRYPTO TRADER + INFINITY GRID BOT 2025 — BINANCE.US EDITION
+Tkinter GUI | WebSocket + REST | Grid Trading | Rate-Limited | IP Ban Safe
+FIXED: All 'dict' object has no attribute 'response' errors
 """
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
@@ -20,7 +20,6 @@ import websocket
 from decimal import Decimal, getcontext, ROUND_DOWN, InvalidOperation
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-import ssl
 
 # ----------------------------------------------------------------------
 # ========================= CONFIG & GLOBALS =========================
@@ -29,7 +28,7 @@ getcontext().prec = 28
 ZERO = Decimal('0')
 ONE = Decimal('1')
 SAFETY_BUFFER = Decimal('0.95')
-MAX_POSITION_PCT = Decimal('0.05')
+MAX_POSITION_PCT = Decimal('0.05')          # 5% of total per coin
 MIN_TRADE_VALUE = Decimal('5.0')
 ENTRY_PCT_BELOW_ASK = Decimal('0.001')
 TOP_N_VOLUME = 25
@@ -40,20 +39,20 @@ MAX_STREAMS_PER_CONNECTION = 100
 RECONNECT_BASE_DELAY = 5
 MAX_RECONNECT_DELAY = 300
 
-# GRID SETTINGS
-CASH_USDT_PER_GRID_ORDER = Decimal('5.00')
-BUY_GRIDS_PER_POSITION = 1
-SELL_GRIDS_PER_POSITION = 1
-GRID_BUY_PCT = Decimal('0.01')      # 1% below
-GRID_SELL_PCT = Decimal('0.018')    # 1.8% above
-REGRID_INTERVAL = 1800              # 30 minutes
-PROFIT_PER_GRID_INCREASE = Decimal('150')
+# === GRID SETTINGS (COMPLETED) ===
+CASH_USDT_PER_GRID_ORDER = Decimal('5.00')   # $5 per grid level
+BUY_GRIDS_PER_POSITION = 1                   # Auto-scaled
+SELL_GRIDS_PER_POSITION = 1                  # Auto-scaled
+GRID_BUY_PCT = Decimal('0.01')               # 1.0% below current price
+GRID_SELL_PCT = Decimal('0.018')             # 1.8% above current price
+REGRID_INTERVAL = 1800                       # 30 minutes
+PROFIT_PER_GRID_INCREASE = Decimal('150')    # +1 grid per $150 profit
 
-# RATE LIMITING
+# === RATE LIMITING ===
 API_WEIGHT_MAX = 1200
 API_WEIGHT_CURRENT = 0
 API_WEIGHT_LOCK = threading.Lock()
-REQUEST_DELAY = 0.1  # Base delay between REST calls
+REQUEST_DELAY = 0.1
 CURRENT_DELAY = REQUEST_DELAY
 BACKOFF_MULTIPLIER = 2
 MAX_DELAY = 30.0
@@ -66,8 +65,10 @@ LOG_FILE = os.path.expanduser("~/platinum_crypto_dashboard.log")
 os.makedirs("logs", exist_ok=True)
 
 # Filters
-DISALLOWED_COINS = {'BTCUSDT', 'BCHUSDT', 'ETHUSDT', 'ETCUSDT',
-                    'USDTUSDT', 'USDCUSDT', 'USDUSDT'}
+DISALLOWED_COINS = {
+    'BTCUSDT', 'BCHUSDT', 'ETHUSDT', 'ETCUSDT',
+    'USDTUSDT', 'USDCUSDT', 'USDUSDT'
+}
 MIN_PRICE = Decimal('15')
 MAX_PRICE = Decimal('1000')
 MIN_VOLUME = Decimal('150000')
@@ -141,12 +142,12 @@ def wait_for_rate_limit():
 def handle_rate_limit_error(e):
     global CURRENT_DELAY
     code = getattr(e, 'code', 0)
-    msg = getattr(e, 'message', '')
+    msg = str(getattr(e, 'message', ''))
     if code in (429, 418, -1003):
         ban_sec = 60
-        if 'retry after' in str(msg).lower():
+        if 'retry after' in msg.lower():
             try:
-                ban_sec = int(str(msg).split()[-1])
+                ban_sec = int([x for x in msg.split() if x.isdigit()][-1])
             except:
                 pass
         log_error(f"RATE LIMITED! Banned for {ban_sec}s. Backing off...")
@@ -170,7 +171,8 @@ def send_whatsapp(msg):
             m = requests.utils.quote(msg)
             requests.get(
                 f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={m}&apikey={key}",
-                timeout=5)
+                timeout=5
+            )
         except Exception:
             pass
 
@@ -188,7 +190,7 @@ def update_balances():
     try:
         wait_for_rate_limit()
         info = client.get_account()
-        update_api_weight(info.response.headers)
+        # FIXED: info is dict, no .response
         account_balances = {
             a['asset']: Decimal(a['free']) for a in info['balances'] if Decimal(a['free']) > ZERO
         }
@@ -214,7 +216,7 @@ def load_symbol_info():
     try:
         wait_for_rate_limit()
         info = client.get_exchange_info()
-        update_api_weight(info.response.headers)
+        # FIXED: info is dict
         for s in info.get('symbols', []):
             if s.get('quoteAsset') != 'USDT' or s.get('status') != 'TRADING':
                 continue
@@ -309,7 +311,7 @@ def place_limit_order(symbol, side, price, quantity):
             quantity=format_decimal_for_order(quantity),
             price=format_decimal_for_order(price)
         )
-        update_api_weight(order.response.headers)
+        # FIXED: order is dict, no .response
         log_info(f"PLACED {side} {symbol} {quantity} @ {price}")
         send_whatsapp(f"{side} {symbol} {quantity}@{price}")
         return order
@@ -344,7 +346,7 @@ def cancel_all_pending_orders():
     try:
         wait_for_rate_limit()
         open_orders = client.get_open_orders()
-        update_api_weight(open_orders.response.headers)
+        # FIXED: open_orders is list
         log_info(f"Cancelling {len(open_orders)} pending orders...")
         for o in open_orders:
             try:
@@ -381,9 +383,9 @@ def place_grid_orders(asset):
     for i in range(1, BUY_GRIDS_PER_POSITION + 1):
         try:
             buy_price = cur_price * (ONE - GRID_BUY_PCT * Decimal(i))
-            buy_price = buy_price.quantize(price_step)
+            buy_price = round_down_to_step(buy_price, price_step)
             qty = CASH_USDT_PER_GRID_ORDER / buy_price
-            qty = (qty // qty_step) * qty_step
+            qty = round_down_to_step(qty, qty_step)
             if qty > ZERO:
                 place_limit_order(symbol, 'BUY', buy_price, qty)
         except Exception as e:
@@ -394,9 +396,9 @@ def place_grid_orders(asset):
     for i in range(1, SELL_GRIDS_PER_POSITION + 1):
         try:
             sell_price = cur_price * (ONE + GRID_SELL_PCT * Decimal(i))
-            sell_price = sell_price.quantize(price_step)
+            sell_price = round_down_to_step(sell_price, price_step)
             qty = CASH_USDT_PER_GRID_ORDER / sell_price
-            qty = (qty // qty_step) * qty_step
+            qty = round_down_to_step(qty, qty_step)
             if qty > ZERO and qty <= free_asset:
                 place_limit_order(symbol, 'SELL', sell_price, qty)
             elif qty > free_asset:
@@ -408,6 +410,7 @@ def grid_cycle():
     global initial_total_usdt, BUY_GRIDS_PER_POSITION, SELL_GRIDS_PER_POSITION
     while running:
         try:
+            update_balances()
             initial_total_usdt = get_total_portfolio_value()
             if initial_total_usdt == 0:
                 log_error("Failed to get initial balance. Retrying in 30s...")
@@ -449,7 +452,7 @@ def grid_cycle():
             time.sleep(15)
 
 # ----------------------------------------------------------------------
-# ========================= WEBSOCKET WITH BACKOFF =========================
+# ========================= WEBSOCKET =========================
 # ----------------------------------------------------------------------
 class HeartbeatWebSocket(websocket.WebSocketApp):
     def __init__(self, url, **kwargs):
@@ -502,7 +505,7 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
             pass
 
 # ----------------------------------------------------------------------
-# ========================= WS HANDLERS =========================
+# ========================= WS HANDLERS & STARTERS =========================
 # ----------------------------------------------------------------------
 def on_market_message(ws, message):
     try:
@@ -549,9 +552,6 @@ def on_ws_error(ws, err):
 def on_ws_close(ws, code, msg):
     log_info(f"WS closed ({getattr(ws, 'url', 'unknown')}) to {code}: {msg}")
 
-# ----------------------------------------------------------------------
-# ========================= WS STARTERS =========================
-# ----------------------------------------------------------------------
 def start_market_websockets(symbols):
     global ws_instances, ws_threads
     ticker = [f"{s.lower()}@ticker" for s in symbols]
@@ -572,7 +572,7 @@ def start_market_websockets(symbols):
         t = threading.Thread(target=ws.run_forever, daemon=True)
         t.start()
         ws_threads.append(t)
-        time.sleep(0.5)  # Prevent WS flood
+        time.sleep(0.5)
 
 def start_user_stream():
     global user_ws, listen_key
@@ -611,7 +611,7 @@ def keepalive_user_stream():
             pass
 
 # ----------------------------------------------------------------------
-# ========================= VOLUME & REBALANCE =========================
+# ========================= REBALANCE =========================
 # ----------------------------------------------------------------------
 def get_top_volume_symbols():
     global top_volume_symbols
@@ -636,7 +636,6 @@ def rebalance_portfolio():
     try:
         if not top_volume_symbols:
             return
-
         update_balances()
         total = get_total_portfolio_value()
         target = total * MAX_POSITION_PCT
@@ -668,7 +667,7 @@ def rebalance_portfolio():
                     if bid > ZERO:
                         place_limit_order(sym, 'SELL', bid, qty)
 
-        # Buy top targets
+        # Buy targets
         buy_targets = []
         for s in top_volume_symbols:
             if s in active_positions or s in DISALLOWED_COINS:
@@ -713,7 +712,7 @@ def rebalance_portfolio():
         log_error(f"Rebalance error: {e}")
 
 # ----------------------------------------------------------------------
-# ========================= INITIALIZE & MAIN LOOP =========================
+# ========================= MAIN LOOP =========================
 # ----------------------------------------------------------------------
 def initialise_bot():
     try:
@@ -744,7 +743,7 @@ def main_trading_loop():
         try:
             get_top_volume_symbols()
             rebalance_portfolio()
-            time.sleep(7200)  # Rebalance every 2 hours
+            time.sleep(7200)
         except Exception as e:
             log_error(f"MAIN LOOP CRASH: {e}. Restarting in 20s...")
             time.sleep(20)
@@ -776,7 +775,7 @@ def stop_trading():
 
 # GUI
 root = tk.Tk()
-root.title("PLATINUM CRYPTO TRADER + GRID BOT")
+root.title("PLATINUM + INFINITY GRID BOT 2025")
 root.geometry("460x180")
 root.resizable(False, False)
 
@@ -812,7 +811,7 @@ if __name__ == "__main__":
     api_key = os.getenv('BINANCE_API_KEY')
     api_secret = os.getenv('BINANCE_API_SECRET')
     if not api_key or not api_secret:
-        messagebox.showerror("API Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+        messagebox.showerror("API Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET")
         sys.exit(1)
     client = Client(api_key, api_secret, tld='us')
 
