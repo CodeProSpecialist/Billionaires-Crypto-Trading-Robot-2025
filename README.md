@@ -22,38 +22,11 @@ Instructions for the Compact Infinity Grid Bot:
 3. Start the INFINITY GRID BOT and relax while the infinity grid bot handles the buying and selling during any future price changes. 
 
 
-> **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book Intelligence, and Institutional-Grade Risk Controls**
+> **Advanced Crypto Trading Automation for Binance.US – Fully Threaded, Real-Time Order Book**
 
 ---
 
-## Features at a Glance
 
-| Feature | Description |
-|--------|-------------|
-
-| **Professional Dashboard** | Real-time P&L, positions, market overview, and buy signals |
-| **SQLite Trade & Position DB** | auto-import of existing holdings |
-| **WhatsApp Alerts** | Instant execution & event notifications via CallMeBot |
-| **Dynamic Trailing Logic** | Buy on dips, sell on peaks — with stall detection & flash move triggers |
-
----
-
-## Why This Bot Stands Out
-
-```text
-Most bots trade blindly. This one *watches the market like a hawk*.
-	•	Order Book Pressure Spikes → Detects panic selling or FOMO buying
-	•	Rapid Price Moves (1.5% in <5s) → Instant market entry/exit
-	
-	•	0.8% Net Profit Target → Disciplined exits after fees
-
-
-Safety & Compliance
-	•	Binance.US Only (tld=‘us’)
-	•	No leverage, no futures
-	•	Rate limits respected (weight + order count)
-	•	All trades logged to SQLite
-	•	No external dependencies beyond Binance
 
 Get It Now
 Ready-to-run. No config files. Just set API keys and go.
@@ -64,7 +37,7 @@ Built for traders who demand precision. Powered by real-time depth, not hype.
 ```bash
 # 1. Install
 
-pip install streamlit python-binance websocket-client sqlalchemy pytz
+pip install python-binance websocket-client pytz
 
 
 # 2. Set env
@@ -74,13 +47,8 @@ export CALLMEBOT_API_KEY="123456"
 export CALLMEBOT_PHONE="15551234567"
 
 # 3. Run
-streamlit run infinity_grid_live.py
+python3 infinity_grid_live.py
 
-open web browser on the computer that
-is running this python program and go to the web page address. 
-You can now view your Streamlit app in your browser.
-
-  Local URL: http://localhost:8501
 
 ```
  
@@ -107,27 +75,11 @@ export CALLMEBOT_PHONE="..."     # optional
 ```
 
 ```bash
-pip install streamlit python-binance websocket-client sqlalchemy pytz
+pip install python-binance websocket-client pytz
 ```
 
 ---
 
-### **Summary: How It Works (Step-by-Step)**
-
-1. **Start** → Load API keys, init DB, fetch valid USDT pairs  
-2. **Spawn 1 thread for buy orders and 1 thread for sell orders. ** → each runs forever  
-3. **Every 1 second**:  
-   - Pull klines → price data.  
-   - Pull order book → compute bid/ask pressure  
-   - Check 24h low & volume  
-4. **If BUY signal** → place limit buy @ best bid (adjusted)  
-5. **If SELL signal** → place limit sell @ next tick above ask  
-6. **Main loop (every 15s)**:  
-   - Check filled orders → update DB  
-   - Print **live dashboard** with P&L  
-7. **Repeat 24/7** → fully automated
-
----
 
 **Professional. Fast. Precise. Fee-Aware. Visual.**  
 *Built for serious traders who want automation without compromise.*
