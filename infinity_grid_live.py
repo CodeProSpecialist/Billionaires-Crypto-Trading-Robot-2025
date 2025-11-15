@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID BOT 2025 — BINANCE.US + P&L Tracker
-900x700 Full-Screen Dashboard (Dark Theme)
+800x800 Full-Screen Dashboard (Dark Theme)
 """
 
 import os, sys, time, threading, json, requests
