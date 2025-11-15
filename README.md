@@ -37,7 +37,7 @@ Built for traders who demand precision. Powered by real-time depth, not hype.
 ```bash
 # 1. Install
 
-pip install python-binance websocket-client pytz
+pip install python-binance websocket-client requests
 
 
 # 2. Set env
