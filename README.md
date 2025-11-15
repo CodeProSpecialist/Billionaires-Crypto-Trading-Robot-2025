@@ -161,7 +161,8 @@ Click Save or Confirm to apply.
 The Anaconda installer automatically adds Conda initialization to `~/.bashrc` (e.g., export PATH and conda setup block). For the bot's environment variables (used via `os.getenv`), add these exports at the end of `~/.bashrc` (replace placeholders with your actual values):
 
 ```bash
-# Environment variables for Billionaires Crypto Trading Robot
+# Environment variables for This Crypto Trading Robot
+
 export BINANCE_API_KEY="your_binance_api_key_here"
 export BINANCE_API_SECRET="your_binance_api_secret_here"
 export CALLMEBOT_API_KEY="your_callmebot_api_key_here"
@@ -172,10 +173,12 @@ Run Program:
 
 ```bash
 conda activate 
-python3 24-hour-infinity-grid-bot.py
+python3 infinity_grid_live.py
 ```
 
-**Note**: Ensure the bot script is saved as `2025-coin-trading-bot.py`. Monitor logs in `crypto_trading_bot.log` for issues and the console dashboard for status. This setup is for educational use; live trading carries significant risks, including the potential to **lose all or part of your investment**, as outlined in the disclaimers. 
+**Note**: Ensure the bot script is saved as `infinity_grid_live.py`.  
+
+This setup is for educational use; live trading carries significant risks, including the potential to **lose all or part of your investment**, as outlined in the disclaimers. 
 
 To set up CallMeBot for WhatsApp, visit https://www.callmebot.com/ and follow the instructions to get your API key and configure the service. Then, use `curl` or Python to send messages via the API.
 
