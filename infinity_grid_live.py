@@ -329,6 +329,40 @@ def auto_buy_top_coins():
         place_limit_order(symbol, 'BUY', price, qty)
 
 
+def grid_cycle():
+    """
+    Main loop that continuously updates balances and places grids for owned coins.
+    Runs in a separate thread from the Tkinter mainloop.
+    """
+    while running:
+        try:
+            # 1. Update balances (USDT + owned coins)
+            update_balances()
+
+            # 2. Cancel old grid orders for owned coins
+            for asset in list(account_balances.keys()):
+                if asset == "USDT" or account_balances[asset] <= ZERO:
+                    continue
+                symbol = f"{asset}USDT"
+                if symbol in symbol_info:
+                    cancel_symbol_orders(symbol)
+
+            # 3. Place grids on owned positions
+            owned_assets = [a for a in account_balances.keys() if a != "USDT" and account_balances[a] > ZERO]
+            terminal_insert(f"[{now_cst()}] Placing initial grids for owned coins: {owned_assets}")
+            for asset in owned_assets:
+                symbol = f"{asset}USDT"
+                place_single_grid(symbol, 'BUY')
+                place_single_grid(symbol, 'SELL')
+
+            # 4. Wait before next update (obeys rate limit / reduces API weight)
+            time.sleep(180)  # 3 minutes
+
+        except Exception as e:
+            terminal_insert(f"[{now_cst()}] GRID CYCLE ERROR: {e}")
+            time.sleep(15)
+
+
 # -------------------- TKINTER GUI & TERMINAL --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025")
