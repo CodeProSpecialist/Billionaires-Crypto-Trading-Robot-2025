@@ -95,7 +95,7 @@ DEFAULTS = {
     'rebalance_interval': 7200, 'min_trade_value': 5.0,
     'max_position_pct': 5.0, 'entry_pct_below_ask': 0.1,
     'bot_running': False, 'init_status': '', 'init_thread_running': False,
-    'sample_limit': 25, 'balance_history': []  # Added for 24h P/L
+    'sample_limit': 25
 }
 
 # ========================= UTILS =========================
@@ -505,7 +505,17 @@ def rebalance_portfolio():
                 log(f"Error selling {sym}: {e}")
 
         # buy top targets (top 2 by default)
-        buy_targets = [s for s in top_volume_symbols[:MAX_BUY_COINS] if s not in active_positions and s not in DISALLOWED_COINS and live_prices.get(s) and MIN_PRICE <= live_prices[s] <= MAX_PRICE]
+        buy_targets = []
+        for s in top_volume_symbols:
+            if s in active_positions or s in DISALLOWED_COINS:
+                continue
+            price = live_prices.get(s)
+            if price and MIN_PRICE <= price <= MAX_PRICE:
+                vol = sum((p * q) for p, q in live_bids.get(s, [])) + sum((p * q) for p, q in live_asks.get(s, []))
+                if vol >= MIN_VOLUME:
+                    buy_targets.append(s)
+            if len(buy_targets) == MAX_BUY_COINS:
+                break
         buys = 0
         for sym in buy_targets:
             if buys >= MAX_BUY_COINS:
@@ -539,6 +549,7 @@ def rebalance_portfolio():
         log(f"REBALANCE | Buys:{buys} | Targets:{buy_targets[:MAX_BUY_COINS]}")
     except Exception as e:
         log(f"Rebalance error: {e}")
+
 
 # ========================= BACKGROUND INITIALISER =========================
 def initialise_bot():
@@ -584,7 +595,7 @@ def initialise_bot():
 def main():
     global client
     st.set_page_config(page_title="Platinum Crypto Trader", layout="wide")
-    st.title("PLATINUM CRYPTO TRADER DASHBOARD")
+    st.title("PLATINUM CRYPTO TRADER DASHBOARD 2025")
 
     # --- ENSURE REQUIRED SESSION STATE KEYS EXIST (fix for AttributeError) ---
     required_keys = {
@@ -592,7 +603,7 @@ def main():
         'rebalance_interval': 7200, 'min_trade_value': 5.0,
         'max_position_pct': 5.0, 'entry_pct_below_ask': 0.1,
         'bot_running': False, 'init_status': '', 'init_thread_running': False,
-        'sample_limit': 25, 'balance_history': [], 'last_balance_update': 0
+        'sample_limit': 25
     }
     for k, v in required_keys.items():
         if k not in st.session_state:
@@ -611,44 +622,57 @@ def main():
         st.stop()
 
     # --- START / STOP BUTTONS ---
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("START BOT"):
-            if not st.session_state.init_thread_running:
+    col_btn, col_status = st.columns([1, 3])
+    with col_btn:
+        # START button triggers background initialization
+        if st.button("START TRADER (REAL)", key="start_button", disabled=st.session_state.bot_running):
+            # ensure previous thread not running
+            if not st.session_state.get('init_thread_running', False):
                 st.session_state.init_thread_running = True
                 st.session_state.init_status = "Initialising..."
                 t = threading.Thread(target=initialise_bot, daemon=True)
                 t.start()
-    with col2:
-        if st.button("STOP BOT"):
+        if st.button("STOP BOT", key="stop_button", disabled=not st.session_state.bot_running):
             st.session_state.bot_running = False
             st.session_state.init_status = "STOPPED"
 
-    # --- ACCOUNT BALANCE AND 24H P/L ---
-    current_balance = get_total_portfolio_value()
-    if time.time() - st.session_state.last_balance_update > 3600:  # Update hourly
-        st.session_state.balance_history.append((time.time(), current_balance))
-        st.session_state.balance_history = st.session_state.balance_history[-24:]  # Keep last 24 hours
-        st.session_state.last_balance_update = time.time()
-
-    if len(st.session_state.balance_history) > 1:
-        prev_balance = st.session_state.balance_history[0][1]
-        pl_change = current_balance - prev_balance
-        pl_pct = (pl_change / prev_balance * 100) if prev_balance > 0 else 0
-        st.metric("Current Balance", f"${current_balance:.2f}")
-        st.metric("24h P/L", f"${pl_change:.2f} ({pl_pct:.2f}%)", delta=pl_change)
+    # Custom CSS for button colors
+    st.markdown("""
+    <style>
+        div.stButton > button:first-child {
+            background-color: rgb(255, 75, 75);  /* red */
+        }
+        div.stButton > button:disabled {
+            background-color: rgb(49, 51, 63);  /* gray */
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    if st.session_state.bot_running:
+        st.markdown("""
+        <style>
+            div.stButton > button[key="start_button"] {
+                background-color: rgb(0, 255, 0);  /* green */
+            }
+        </style>
+        """, unsafe_allow_html=True)
     else:
-        st.metric("Current Balance", f"${current_balance:.2f}")
-        st.metric("24h P/L", "N/A (less than 24h data)")
+        st.markdown("""
+        <style>
+            div.stButton > button[key="start_button"] {
+                background-color: rgb(255, 0, 0);  /* red */
+            }
+        </style>
+        """, unsafe_allow_html=True)
 
     # --- LOGS ---
-    st.subheader("Logs")
+    st.markdown("---")
+    st.subheader("Log (live)")
     for line in st.session_state.logs[-50:]:
-        st.text(line)
+        st.code(line)
 
-    if st.session_state.bot_running:
-        time.sleep(1)
-        st.rerun()
+    # Auto-refresh
+    time.sleep(1)
+    st.rerun()
 
 if __name__ == "__main__":
     main()
