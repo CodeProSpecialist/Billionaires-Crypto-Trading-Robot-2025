@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 PLATINUM CRYPTO TRADER + GRID BOT 2025 — BINANCE.US EDITION
-Tkinter GUI (Green Start, Red Stop) + WebSocket + REST + Grid Trading
-Full logging, fault-tolerant, auto-restart, dynamic grids.
+Tkinter GUI + WebSocket + REST + Grid Trading
+Rate-limited, backoff on 429/418/503, IP ban protection
 """
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
@@ -18,9 +18,9 @@ import pytz
 import requests
 import websocket
 from decimal import Decimal, getcontext, ROUND_DOWN, InvalidOperation
-
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+import ssl
 
 # ----------------------------------------------------------------------
 # ========================= CONFIG & GLOBALS =========================
@@ -48,6 +48,15 @@ GRID_BUY_PCT = Decimal('0.01')      # 1% below
 GRID_SELL_PCT = Decimal('0.018')    # 1.8% above
 REGRID_INTERVAL = 1800              # 30 minutes
 PROFIT_PER_GRID_INCREASE = Decimal('150')
+
+# RATE LIMITING
+API_WEIGHT_MAX = 1200
+API_WEIGHT_CURRENT = 0
+API_WEIGHT_LOCK = threading.Lock()
+REQUEST_DELAY = 0.1  # Base delay between REST calls
+CURRENT_DELAY = REQUEST_DELAY
+BACKOFF_MULTIPLIER = 2
+MAX_DELAY = 30.0
 
 # USER CHOICE
 USE_PAPER_TRADING = False
@@ -108,6 +117,46 @@ def log_info(msg):   logger.info(msg)
 def log_error(msg):  logger.error(msg)
 
 # ----------------------------------------------------------------------
+# ========================= RATE LIMITING =========================
+# ----------------------------------------------------------------------
+def update_api_weight(headers):
+    global API_WEIGHT_CURRENT
+    try:
+        used = int(headers.get('x-mbx-used-weight-1m', 0))
+        with API_WEIGHT_LOCK:
+            API_WEIGHT_CURRENT = max(API_WEIGHT_CURRENT, used)
+    except:
+        pass
+
+def wait_for_rate_limit():
+    global CURRENT_DELAY
+    with API_WEIGHT_LOCK:
+        if API_WEIGHT_CURRENT > API_WEIGHT_MAX * 0.8:
+            log_info(f"High API weight {API_WEIGHT_CURRENT}, slowing down...")
+            CURRENT_DELAY = min(MAX_DELAY, CURRENT_DELAY * BACKOFF_MULTIPLIER)
+        else:
+            CURRENT_DELAY = max(REQUEST_DELAY, CURRENT_DELAY / 1.5)
+    time.sleep(CURRENT_DELAY)
+
+def handle_rate_limit_error(e):
+    global CURRENT_DELAY
+    code = getattr(e, 'code', 0)
+    msg = getattr(e, 'message', '')
+    if code in (429, 418, -1003):
+        ban_sec = 60
+        if 'retry after' in str(msg).lower():
+            try:
+                ban_sec = int(str(msg).split()[-1])
+            except:
+                pass
+        log_error(f"RATE LIMITED! Banned for {ban_sec}s. Backing off...")
+        CURRENT_DELAY = min(MAX_DELAY, CURRENT_DELAY * BACKOFF_MULTIPLIER)
+        time.sleep(ban_sec + 5)
+    elif code >= 500:
+        log_error(f"Server error {code}, retrying...")
+        time.sleep(10)
+
+# ----------------------------------------------------------------------
 # ========================= UTILS =========================
 # ----------------------------------------------------------------------
 def now_cst():
@@ -137,11 +186,15 @@ def _safe_decimal(v, fallback='0'):
 def update_balances():
     global account_balances
     try:
-        info = client.get_account()['balances']
+        wait_for_rate_limit()
+        info = client.get_account()
+        update_api_weight(info.response.headers)
         account_balances = {
-            a['asset']: Decimal(a['free']) for a in info if Decimal(a['free']) > ZERO
+            a['asset']: Decimal(a['free']) for a in info['balances'] if Decimal(a['free']) > ZERO
         }
         log_info(f"USDT free: {account_balances.get('USDT', ZERO):.2f}")
+    except BinanceAPIException as e:
+        handle_rate_limit_error(e)
     except Exception as e:
         log_error(f"Balance update error: {e}")
 
@@ -159,8 +212,10 @@ def get_total_portfolio_value():
 def load_symbol_info():
     global symbol_info
     try:
-        info = client.get_exchange_info().get('symbols', [])
-        for s in info:
+        wait_for_rate_limit()
+        info = client.get_exchange_info()
+        update_api_weight(info.response.headers)
+        for s in info.get('symbols', []):
             if s.get('quoteAsset') != 'USDT' or s.get('status') != 'TRADING':
                 continue
             filters = {f['filterType']: f for f in s.get('filters', [])}
@@ -177,6 +232,8 @@ def load_symbol_info():
                 'minNotional': minNotional
             }
         log_info(f"Loaded {len(symbol_info)} symbols")
+    except BinanceAPIException as e:
+        handle_rate_limit_error(e)
     except Exception as e:
         log_error(f"Symbol info error: {e}")
 
@@ -243,6 +300,7 @@ def place_limit_order(symbol, side, price, quantity):
             return None
 
     try:
+        wait_for_rate_limit()
         order = client.create_order(
             symbol=symbol,
             side=side,
@@ -251,12 +309,12 @@ def place_limit_order(symbol, side, price, quantity):
             quantity=format_decimal_for_order(quantity),
             price=format_decimal_for_order(price)
         )
+        update_api_weight(order.response.headers)
         log_info(f"PLACED {side} {symbol} {quantity} @ {price}")
         send_whatsapp(f"{side} {symbol} {quantity}@{price}")
         return order
     except BinanceAPIException as e:
-        msg = getattr(e, 'message', str(e))
-        log_error(f"ORDER FAILED {symbol} {side}: {msg}")
+        handle_rate_limit_error(e)
         return None
     except Exception as e:
         log_error(f"ORDER ERROR {symbol}: {e}")
@@ -272,31 +330,45 @@ def get_owned_assets():
             continue
         symbol = asset + 'USDT'
         try:
+            wait_for_rate_limit()
             price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
             if free * price >= Decimal('1'):
                 owned.append(asset)
+        except BinanceAPIException as e:
+            handle_rate_limit_error(e)
         except Exception as e:
             log_error(f"Failed to get price for {symbol}: {e}")
     return owned
 
 def cancel_all_pending_orders():
     try:
+        wait_for_rate_limit()
         open_orders = client.get_open_orders()
+        update_api_weight(open_orders.response.headers)
         log_info(f"Cancelling {len(open_orders)} pending orders...")
         for o in open_orders:
             try:
+                wait_for_rate_limit()
                 client.cancel_order(symbol=o['symbol'], orderId=o['orderId'])
                 log_info(f"Cancelled {o['orderId']} {o['symbol']}")
+            except BinanceAPIException as e:
+                handle_rate_limit_error(e)
             except Exception as e:
                 log_error(f"Cancel error {o['orderId']}: {e}")
+    except BinanceAPIException as e:
+        handle_rate_limit_error(e)
     except Exception as e:
         log_error(f"Failed to fetch open orders: {e}")
 
 def place_grid_orders(asset):
     symbol = asset + 'USDT'
     try:
+        wait_for_rate_limit()
         cur_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
         log_info(f"Grid price {symbol}: {cur_price}")
+    except BinanceAPIException as e:
+        handle_rate_limit_error(e)
+        return
     except Exception as e:
         log_error(f"Cannot get price for {symbol}: {e}")
         return
@@ -360,7 +432,7 @@ def grid_cycle():
                 increase = int((current_total - initial_total_usdt) / PROFIT_PER_GRID_INCREASE)
                 new_grids = max(1, 1 + increase)
                 if new_grids != BUY_GRIDS_PER_POSITION:
-                    log_info(f"Profit ${current_total - initial_total_usdt:.2f} → grids → {new_grids}")
+                    log_info(f"Profit ${current_total - initial_total_usdt:.2f} to grids to {new_grids}")
                     BUY_GRIDS_PER_POSITION = new_grids
                     SELL_GRIDS_PER_POSITION = new_grids
 
@@ -377,7 +449,7 @@ def grid_cycle():
             time.sleep(15)
 
 # ----------------------------------------------------------------------
-# ========================= WEBSOCKET HEARTBEAT =========================
+# ========================= WEBSOCKET WITH BACKOFF =========================
 # ----------------------------------------------------------------------
 class HeartbeatWebSocket(websocket.WebSocketApp):
     def __init__(self, url, **kwargs):
@@ -400,8 +472,8 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
 
     def _heartbeat(self):
         while not self._stop and getattr(self, 'sock', None) and getattr(self.sock, 'connected', False):
-            if time.time() - self.last_pong > HEARTBEAT_INTERVAL + 5:
-                log_error("No pong → closing WS")
+            if time.time() - self.last_pong > HEARTBEAT_INTERVAL + 10:
+                log_error("No pong to closing WS")
                 self.close()
                 break
             try:
@@ -419,7 +491,7 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
                 log_error(f"WS crash: {e}")
             self.reconnect += 1
             delay = min(MAX_RECONNECT_DELAY, RECONNECT_BASE_DELAY * (2 ** (self.reconnect - 1)))
-            log_info(f"Reconnect in {delay}s")
+            log_info(f"WS Reconnect in {delay}s")
             time.sleep(delay)
 
     def stop(self):
@@ -475,7 +547,7 @@ def on_ws_error(ws, err):
     log_error(f"WS error ({getattr(ws, 'url', 'unknown')}): {err}")
 
 def on_ws_close(ws, code, msg):
-    log_info(f"WS closed ({getattr(ws, 'url', 'unknown')}) – {code}: {msg}")
+    log_info(f"WS closed ({getattr(ws, 'url', 'unknown')}) to {code}: {msg}")
 
 # ----------------------------------------------------------------------
 # ========================= WS STARTERS =========================
@@ -500,11 +572,12 @@ def start_market_websockets(symbols):
         t = threading.Thread(target=ws.run_forever, daemon=True)
         t.start()
         ws_threads.append(t)
-        time.sleep(0.4)
+        time.sleep(0.5)  # Prevent WS flood
 
 def start_user_stream():
     global user_ws, listen_key
     try:
+        wait_for_rate_limit()
         with listen_key_lock:
             listen_key = client.stream_get_listen_key()
         url = f"wss://stream.binance.us:9443/ws/{listen_key}"
@@ -519,6 +592,8 @@ def start_user_stream():
         t.start()
         ws_threads.append(t)
         log_info("User stream started")
+    except BinanceAPIException as e:
+        handle_rate_limit_error(e)
     except Exception as e:
         log_error(f"User stream failed: {e}")
 
@@ -526,9 +601,12 @@ def keepalive_user_stream():
     while running:
         time.sleep(1800)
         try:
+            wait_for_rate_limit()
             with listen_key_lock:
                 if listen_key:
                     client.stream_keepalive(listen_key)
+        except BinanceAPIException as e:
+            handle_rate_limit_error(e)
         except Exception:
             pass
 
