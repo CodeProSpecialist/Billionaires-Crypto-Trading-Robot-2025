@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
-PLATINUM CRYPTO TRADER DASHBOARD 2025 — BINANCE.US EDITION
-Full WebSocket + REST version — REAL trading (Binance.US). Use with caution.
+PLATINUM CRYPTO TRADER + GRID BOT 2025 — BINANCE.US EDITION
+Tkinter GUI (Green Start, Red Stop) + WebSocket + REST + Grid Trading
+Full logging, fault-tolerant, auto-restart, dynamic grids.
 """
-import streamlit as st
-import os
-import time
+import tkinter as tk
+from tkinter import font as tkfont, messagebox
 import threading
+import time
 import json
+import os
+import sys
+import logging
+from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime
+import pytz
 import requests
 import websocket
 from decimal import Decimal, getcontext, ROUND_DOWN, InvalidOperation
-from datetime import datetime
-import pytz
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-import logging
-from logging.handlers import TimedRotatingFileHandler
-import sys
 
-# optional run context import (Streamlit versions vary)
-try:
-    from streamlit.runtime.scriptrunner import get_script_run_ctx
-except Exception:
-    def get_script_run_ctx():
-        return None
-
-# ========================= CONFIG =========================
+# ----------------------------------------------------------------------
+# ========================= CONFIG & GLOBALS =========================
+# ----------------------------------------------------------------------
 getcontext().prec = 28
 ZERO = Decimal('0')
 ONE = Decimal('1')
@@ -42,34 +40,30 @@ MAX_STREAMS_PER_CONNECTION = 100
 RECONNECT_BASE_DELAY = 5
 MAX_RECONNECT_DELAY = 300
 
-# USER CHOICE: REAL trading
-USE_PAPER_TRADING = False  # True for paper trading
+# GRID SETTINGS
+CASH_USDT_PER_GRID_ORDER = Decimal('5.00')
+BUY_GRIDS_PER_POSITION = 1
+SELL_GRIDS_PER_POSITION = 1
+GRID_BUY_PCT = Decimal('0.01')      # 1% below
+GRID_SELL_PCT = Decimal('0.018')    # 1.8% above
+REGRID_INTERVAL = 1800              # 30 minutes
+PROFIT_PER_GRID_INCREASE = Decimal('150')
+
+# USER CHOICE
+USE_PAPER_TRADING = False
 
 CST = pytz.timezone('America/Chicago')
 LOG_FILE = os.path.expanduser("~/platinum_crypto_dashboard.log")
+os.makedirs("logs", exist_ok=True)
 
-# Disallowed coins and price range
-DISALLOWED_COINS = {'BTCUSDT', 'BCHUSDT', 'ETHUSDT', 'ETCUSDT', 'USDTUSDT', 'USDCUSDT', 'USDUSDT'}
+# Filters
+DISALLOWED_COINS = {'BTCUSDT', 'BCHUSDT', 'ETHUSDT', 'ETCUSDT',
+                    'USDTUSDT', 'USDCUSDT', 'USDUSDT'}
 MIN_PRICE = Decimal('15')
 MAX_PRICE = Decimal('1000')
 MIN_VOLUME = Decimal('150000')
 
-# ========================= LOGGING =========================
-def setup_logging():
-    logger = logging.getLogger("platinum_bot")
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        fh = TimedRotatingFileHandler(LOG_FILE, when='midnight', backupCount=14)
-        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
-        logger.addHandler(fh)
-        logger.addHandler(ch)
-    return logger
-
-logger = setup_logging()
-
-# ========================= GLOBALS =========================
+# Global state
 client = None
 symbol_info = {}
 account_balances = {}
@@ -86,36 +80,38 @@ user_ws = None
 listen_key = None
 listen_key_lock = threading.Lock()
 last_rebalance_str = "Never"
+initial_total_usdt = ZERO
+running = False
 
-# -----------------------------------------------------------------
-# Session-state defaults
-# -----------------------------------------------------------------
-DEFAULTS = {
-    'logs': [], 'shutdown': False, 'auto_rebalance': True,
-    'rebalance_interval': 7200, 'min_trade_value': 5.0,
-    'max_position_pct': 5.0, 'entry_pct_below_ask': 0.1,
-    'bot_running': False, 'init_status': '', 'init_thread_running': False,
-    'sample_limit': 25
-}
+# ----------------------------------------------------------------------
+# ========================= LOGGING =========================
+# ----------------------------------------------------------------------
+def setup_logging():
+    logger = logging.getLogger("platinum_bot")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = TimedRotatingFileHandler(LOG_FILE, when='midnight', backupCount=14)
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
+        grid_fh = logging.FileHandler(
+            f"logs/trading_bot_{datetime.now().strftime('%Y%m%d')}.log")
+        grid_fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
+        logger.addHandler(fh)
+        logger.addHandler(ch)
+        logger.addHandler(grid_fh)
+    return logger
 
+logger = setup_logging()
+
+def log_info(msg):   logger.info(msg)
+def log_error(msg):  logger.error(msg)
+
+# ----------------------------------------------------------------------
 # ========================= UTILS =========================
+# ----------------------------------------------------------------------
 def now_cst():
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-
-def log(msg):
-    line = f"{now_cst()} - {msg}"
-    print(line)
-    logger.info(msg)
-    ctx = get_script_run_ctx()
-    try:
-        if ctx is not None:
-            if 'logs' not in st.session_state:
-                st.session_state['logs'] = []
-            st.session_state.logs.append(line)
-            if len(st.session_state.logs) > 500:
-                st.session_state.logs = st.session_state.logs[-500:]
-    except Exception:
-        pass
 
 def send_whatsapp(msg):
     phone = os.getenv('CALLMEBOT_PHONE')
@@ -125,12 +121,19 @@ def send_whatsapp(msg):
             m = requests.utils.quote(msg)
             requests.get(
                 f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={m}&apikey={key}",
-                timeout=5
-            )
+                timeout=5)
         except Exception:
             pass
 
-# ========================= BALANCE & INFO =========================
+def _safe_decimal(v, fallback='0'):
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(fallback)
+
+# ----------------------------------------------------------------------
+# ========================= BALANCE & SYMBOL INFO =========================
+# ----------------------------------------------------------------------
 def update_balances():
     global account_balances
     try:
@@ -138,9 +141,9 @@ def update_balances():
         account_balances = {
             a['asset']: Decimal(a['free']) for a in info if Decimal(a['free']) > ZERO
         }
-        log(f"USDT free: {account_balances.get('USDT', ZERO):.2f}")
+        log_info(f"USDT free: {account_balances.get('USDT', ZERO):.2f}")
     except Exception as e:
-        log(f"Balance update error: {e}")
+        log_error(f"Balance update error: {e}")
 
 def get_total_portfolio_value():
     total = account_balances.get('USDT', ZERO)
@@ -152,12 +155,6 @@ def get_total_portfolio_value():
         if price:
             total += qty * price
     return total
-
-def _safe_decimal(v, fallback='0'):
-    try:
-        return Decimal(str(v))
-    except (InvalidOperation, TypeError, ValueError):
-        return Decimal(fallback)
 
 def load_symbol_info():
     global symbol_info
@@ -179,13 +176,14 @@ def load_symbol_info():
                 'minQty': minQty,
                 'minNotional': minNotional
             }
-        log(f"Loaded {len(symbol_info)} symbols")
+        log_info(f"Loaded {len(symbol_info)} symbols")
     except Exception as e:
-        log(f"Symbol info error: {e}")
+        log_error(f"Symbol info error: {e}")
 
+# ----------------------------------------------------------------------
 # ========================= SAFE ORDER =========================
+# ----------------------------------------------------------------------
 def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
-    """Round DOWN 'value' to nearest multiple of 'step'."""
     try:
         if step <= 0:
             return value
@@ -198,53 +196,50 @@ def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
             return value
 
 def format_decimal_for_order(d: Decimal) -> str:
-    """Format Decimal for order API, remove trailing zeros."""
     s = format(d.normalize(), 'f')
     if '.' in s:
         s = s.rstrip('0').rstrip('.')
     return s
 
 def _mock_place_limit_order(symbol, side, price, quantity):
-    """Mock order for paper trading."""
     order = {
         'symbol': symbol, 'side': side,
         'price': format_decimal_for_order(price),
         'quantity': format_decimal_for_order(quantity),
         'status': 'TEST'
     }
-    log(f"[PAPER] PLACED {side} {symbol} {quantity} @ {price}")
+    log_info(f"[PAPER] PLACED {side} {symbol} {quantity} @ {price}")
     return order
 
 def place_limit_order(symbol, side, price, quantity):
-    """Place limit order with safety checks and rounding."""
     if USE_PAPER_TRADING:
         return _mock_place_limit_order(symbol, side, price, quantity)
 
     info = symbol_info.get(symbol)
     if not info:
-        log(f"No info for {symbol}")
+        log_error(f"No symbol info for {symbol}")
         return None
 
     price = round_down_to_step(Decimal(price), info['tickSize'])
     quantity = round_down_to_step(Decimal(quantity), info['stepSize'])
 
     if quantity <= info['minQty']:
-        log(f"Qty too small {symbol} qty({quantity}) <= minQty({info['minQty']})")
+        log_error(f"Qty too small {symbol} {quantity} <= {info['minQty']}")
         return None
     notional = price * quantity
     if notional < info['minNotional']:
-        log(f"Notional too low for {symbol}: {notional} < {info['minNotional']}")
+        log_error(f"Notional too low {symbol}: {notional} < {info['minNotional']}")
         return None
 
     if side == 'BUY':
         needed = notional * SAFETY_BUFFER
         if needed > account_balances.get('USDT', ZERO):
-            log(f"Not enough USDT for BUY {symbol} needed:{needed} have:{account_balances.get('USDT', ZERO)}")
+            log_error(f"Not enough USDT for BUY {symbol}")
             return None
     else:
         base = symbol.replace('USDT', '')
         if quantity > account_balances.get(base, ZERO) * SAFETY_BUFFER:
-            log(f"Not enough {base} for SELL")
+            log_error(f"Not enough {base} for SELL")
             return None
 
     try:
@@ -256,20 +251,135 @@ def place_limit_order(symbol, side, price, quantity):
             quantity=format_decimal_for_order(quantity),
             price=format_decimal_for_order(price)
         )
-        log(f"PLACED {side} {symbol} {quantity} @ {price}")
+        log_info(f"PLACED {side} {symbol} {quantity} @ {price}")
         send_whatsapp(f"{side} {symbol} {quantity}@{price}")
         return order
     except BinanceAPIException as e:
         msg = getattr(e, 'message', str(e))
-        log(f"ORDER FAILED {symbol} {side}: {msg}")
+        log_error(f"ORDER FAILED {symbol} {side}: {msg}")
         return None
     except Exception as e:
-        log(f"ORDER ERROR {symbol}: {e}")
+        log_error(f"ORDER ERROR {symbol}: {e}")
         return None
 
-# ========================= HEARTBEAT WS =========================
+# ----------------------------------------------------------------------
+# ========================= GRID TRADING =========================
+# ----------------------------------------------------------------------
+def get_owned_assets():
+    owned = []
+    for asset, free in account_balances.items():
+        if asset == 'USDT' or free <= Decimal('0.0001'):
+            continue
+        symbol = asset + 'USDT'
+        try:
+            price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+            if free * price >= Decimal('1'):
+                owned.append(asset)
+        except Exception as e:
+            log_error(f"Failed to get price for {symbol}: {e}")
+    return owned
+
+def cancel_all_pending_orders():
+    try:
+        open_orders = client.get_open_orders()
+        log_info(f"Cancelling {len(open_orders)} pending orders...")
+        for o in open_orders:
+            try:
+                client.cancel_order(symbol=o['symbol'], orderId=o['orderId'])
+                log_info(f"Cancelled {o['orderId']} {o['symbol']}")
+            except Exception as e:
+                log_error(f"Cancel error {o['orderId']}: {e}")
+    except Exception as e:
+        log_error(f"Failed to fetch open orders: {e}")
+
+def place_grid_orders(asset):
+    symbol = asset + 'USDT'
+    try:
+        cur_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+        log_info(f"Grid price {symbol}: {cur_price}")
+    except Exception as e:
+        log_error(f"Cannot get price for {symbol}: {e}")
+        return
+
+    info = symbol_info.get(symbol, {})
+    qty_step = info.get('stepSize', Decimal('1'))
+    price_step = info.get('tickSize', Decimal('0.01'))
+
+    # BUY GRIDS
+    for i in range(1, BUY_GRIDS_PER_POSITION + 1):
+        try:
+            buy_price = cur_price * (ONE - GRID_BUY_PCT * Decimal(i))
+            buy_price = buy_price.quantize(price_step)
+            qty = CASH_USDT_PER_GRID_ORDER / buy_price
+            qty = (qty // qty_step) * qty_step
+            if qty > ZERO:
+                place_limit_order(symbol, 'BUY', buy_price, qty)
+        except Exception as e:
+            log_error(f"Buy grid error {symbol} level {i}: {e}")
+
+    # SELL GRIDS
+    free_asset = account_balances.get(asset, ZERO)
+    for i in range(1, SELL_GRIDS_PER_POSITION + 1):
+        try:
+            sell_price = cur_price * (ONE + GRID_SELL_PCT * Decimal(i))
+            sell_price = sell_price.quantize(price_step)
+            qty = CASH_USDT_PER_GRID_ORDER / sell_price
+            qty = (qty // qty_step) * qty_step
+            if qty > ZERO and qty <= free_asset:
+                place_limit_order(symbol, 'SELL', sell_price, qty)
+            elif qty > free_asset:
+                log_error(f"Insufficient {asset} for sell grid level {i}")
+        except Exception as e:
+            log_error(f"Sell grid error {symbol} level {i}: {e}")
+
+def grid_cycle():
+    global initial_total_usdt, BUY_GRIDS_PER_POSITION, SELL_GRIDS_PER_POSITION
+    while running:
+        try:
+            initial_total_usdt = get_total_portfolio_value()
+            if initial_total_usdt == 0:
+                log_error("Failed to get initial balance. Retrying in 30s...")
+                time.sleep(30)
+                continue
+
+            cancel_all_pending_orders()
+            owned = get_owned_assets()
+            log_info(f"Placing grid for {len(owned)} assets")
+            for a in owned:
+                place_grid_orders(a)
+
+            last_regrid = time.time()
+            log_info(f"Initial grid placed. Portfolio: ${initial_total_usdt:.2f}")
+
+            while running:
+                time.sleep(60)
+                current_total = get_total_portfolio_value()
+                if current_total == 0:
+                    continue
+
+                increase = int((current_total - initial_total_usdt) / PROFIT_PER_GRID_INCREASE)
+                new_grids = max(1, 1 + increase)
+                if new_grids != BUY_GRIDS_PER_POSITION:
+                    log_info(f"Profit ${current_total - initial_total_usdt:.2f} → grids → {new_grids}")
+                    BUY_GRIDS_PER_POSITION = new_grids
+                    SELL_GRIDS_PER_POSITION = new_grids
+
+                if time.time() - last_regrid > REGRID_INTERVAL:
+                    log_info("30-minute re-grid")
+                    cancel_all_pending_orders()
+                    owned = get_owned_assets()
+                    for a in owned:
+                        place_grid_orders(a)
+                    last_regrid = time.time()
+
+        except Exception as e:
+            log_error(f"GRID CYCLE CRASH: {e}. Restarting in 15s...")
+            time.sleep(15)
+
+# ----------------------------------------------------------------------
+# ========================= WEBSOCKET HEARTBEAT =========================
+# ----------------------------------------------------------------------
 class HeartbeatWebSocket(websocket.WebSocketApp):
-    """WebSocketApp subclass that tracks last pong and has heartbeat."""
     def __init__(self, url, **kwargs):
         super().__init__(url, **kwargs)
         self.last_pong = time.time()
@@ -278,49 +388,38 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
         self._stop = False
 
     def on_open(self, ws):
-        try:
-            log(f"WS OPEN {ws.url.split('?')[0]}")
-            self.last_pong = time.time()
-            self.reconnect = 0
-            if not self.hb_thread or not self.hb_thread.is_alive():
-                self.hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
-                self.hb_thread.start()
-        except Exception as e:
-            log(f"on_open error: {e}")
+        log_info(f"WS OPEN {ws.url.split('?')[0]}")
+        self.last_pong = time.time()
+        self.reconnect = 0
+        if not self.hb_thread or not self.hb_thread.is_alive():
+            self.hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self.hb_thread.start()
 
     def on_pong(self, *args):
         self.last_pong = time.time()
 
     def _heartbeat(self):
-        """Send PING frames periodically and monitor pong."""
-        try:
-            while not self._stop and getattr(self, 'sock', None) and getattr(self.sock, 'connected', False):
-                if time.time() - self.last_pong > HEARTBEAT_INTERVAL + 5:
-                    log("No pong → closing WS")
-                    try:
-                        self.close()
-                    except Exception:
-                        pass
-                    break
-                try:
-                    self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
-                except Exception:
-                    pass
-                time.sleep(HEARTBEAT_INTERVAL)
-        except Exception as e:
-            log(f"Heartbeat thread error: {e}")
+        while not self._stop and getattr(self, 'sock', None) and getattr(self.sock, 'connected', False):
+            if time.time() - self.last_pong > HEARTBEAT_INTERVAL + 5:
+                log_error("No pong → closing WS")
+                self.close()
+                break
+            try:
+                self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
+            except Exception:
+                pass
+            time.sleep(HEARTBEAT_INTERVAL)
 
     def run_forever(self, **kwargs):
-        """Wrap run_forever with exponential backoff reconnects."""
         self._stop = False
         while not self._stop:
             try:
                 super().run_forever(ping_interval=None, ping_timeout=None, **kwargs)
             except Exception as e:
-                log(f"WS crash: {e}")
+                log_error(f"WS crash: {e}")
             self.reconnect += 1
             delay = min(MAX_RECONNECT_DELAY, RECONNECT_BASE_DELAY * (2 ** (self.reconnect - 1)))
-            log(f"Reconnect in {delay}s")
+            log_info(f"Reconnect in {delay}s")
             time.sleep(delay)
 
     def stop(self):
@@ -330,7 +429,9 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
         except Exception:
             pass
 
+# ----------------------------------------------------------------------
 # ========================= WS HANDLERS =========================
+# ----------------------------------------------------------------------
 def on_market_message(ws, message):
     try:
         data = json.loads(message)
@@ -339,7 +440,6 @@ def on_market_message(ws, message):
         if not payload:
             return
         sym = stream.split('@')[0].upper()
-
         if stream.endswith('@ticker'):
             price = _safe_decimal(payload.get('c', '0'))
             if price > ZERO:
@@ -352,7 +452,7 @@ def on_market_message(ws, message):
                 live_bids[sym] = bids
                 live_asks[sym] = asks
     except Exception as e:
-        log(f"Market WS parse error: {e}")
+        log_error(f"Market WS parse error: {e}")
 
 def on_user_message(ws, message):
     try:
@@ -366,27 +466,21 @@ def on_user_message(ws, message):
         price = _safe_decimal(ev.get('p', '0'))
         qty = _safe_decimal(ev.get('q', '0'))
         if status in ('FILLED', 'PARTIALLY_FILLED'):
-            log(f"FILL {side} {sym} @ {price} | {qty}")
+            log_info(f"FILL {side} {sym} @ {price} | {qty}")
             send_whatsapp(f"{side} {sym} {status} @ {price}")
     except Exception as e:
-        log(f"User WS error: {e}")
+        log_error(f"User WS error: {e}")
 
 def on_ws_error(ws, err):
-    try:
-        log(f"WS error ({getattr(ws, 'url', 'unknown')}): {err}")
-    except Exception:
-        log(f"WS error: {err}")
+    log_error(f"WS error ({getattr(ws, 'url', 'unknown')}): {err}")
 
 def on_ws_close(ws, code, msg):
-    try:
-        log(f"WS closed ({getattr(ws, 'url', 'unknown')}) – {code}: {msg}")
-    except Exception:
-        log(f"WS closed – {code}: {msg}")
+    log_info(f"WS closed ({getattr(ws, 'url', 'unknown')}) – {code}: {msg}")
 
-
+# ----------------------------------------------------------------------
 # ========================= WS STARTERS =========================
+# ----------------------------------------------------------------------
 def start_market_websockets(symbols):
-    """Start websocket connections for price and depth streams (chunked)."""
     global ws_instances, ws_threads
     ticker = [f"{s.lower()}@ticker" for s in symbols]
     depth = [f"{s.lower()}@depth{DEPTH_LEVELS}" for s in symbols]
@@ -400,7 +494,7 @@ def start_market_websockets(symbols):
             on_message=on_market_message,
             on_error=on_ws_error,
             on_close=on_ws_close,
-            on_open=lambda ws: log("Market WS open")
+            on_open=lambda ws: log_info("Market WS open")
         )
         ws_instances.append(ws)
         t = threading.Thread(target=ws.run_forever, daemon=True)
@@ -409,7 +503,6 @@ def start_market_websockets(symbols):
         time.sleep(0.4)
 
 def start_user_stream():
-    """Create a listen key and open a private user websocket for order updates."""
     global user_ws, listen_key
     try:
         with listen_key_lock:
@@ -420,19 +513,18 @@ def start_user_stream():
             on_message=on_user_message,
             on_error=on_ws_error,
             on_close=on_ws_close,
-            on_open=lambda ws: log("User WS open")
+            on_open=lambda ws: log_info("User WS open")
         )
         t = threading.Thread(target=user_ws.run_forever, daemon=True)
         t.start()
         ws_threads.append(t)
-        log("User stream started")
+        log_info("User stream started")
     except Exception as e:
-        log(f"User stream failed: {e}")
+        log_error(f"User stream failed: {e}")
 
 def keepalive_user_stream():
-    """Periodically ping Binance to keep listenKey alive."""
-    while st.session_state.get('bot_running', False):
-        time.sleep(1800)  # 30 minutes
+    while running:
+        time.sleep(1800)
         try:
             with listen_key_lock:
                 if listen_key:
@@ -440,16 +532,17 @@ def keepalive_user_stream():
         except Exception:
             pass
 
-# ========================= TRADING LOGIC =========================
+# ----------------------------------------------------------------------
+# ========================= VOLUME & REBALANCE =========================
+# ----------------------------------------------------------------------
 def get_top_volume_symbols():
-    """Calculate top symbols by 5-level bid volume and update global list."""
     global top_volume_symbols
     candidates = []
     with book_lock:
         for sym, bids in live_bids.items():
             if len(bids) < DEPTH_LEVELS:
                 continue
-            vol = sum((p * q) for p, q in bids[:DEPTH_LEVELS])
+            vol = sum(p * q for p, q in bids[:DEPTH_LEVELS])
             try:
                 volf = float(vol)
             except Exception:
@@ -458,24 +551,20 @@ def get_top_volume_symbols():
                 candidates.append((sym, volf))
     candidates.sort(key=lambda x: x[1], reverse=True)
     top_volume_symbols = [s for s, _ in candidates[:TOP_N_VOLUME]]
-    log(f"Top {len(top_volume_symbols)} volume symbols refreshed")
+    log_info(f"Top {len(top_volume_symbols)} volume symbols refreshed")
 
 def rebalance_portfolio():
-    """Core rebalancing: sell excess, buy up to MAX_BUY_COINS from top_volume_symbols."""
     global last_rebalance_str
     try:
         if not top_volume_symbols:
-            log("No volume data yet")
             return
 
         update_balances()
         total = get_total_portfolio_value()
-        pct = Decimal(str(st.session_state.get('max_position_pct', 5.0))) / Decimal('100')
-        target = total * pct
+        target = total * MAX_POSITION_PCT
         usdt_free = account_balances.get('USDT', ZERO)
         investable = usdt_free * SAFETY_BUFFER
 
-        # compute active positions in USDT value
         active_positions.clear()
         for asset, qty in account_balances.items():
             if asset == 'USDT':
@@ -484,195 +573,169 @@ def rebalance_portfolio():
             if sym in live_prices:
                 active_positions[sym] = qty * live_prices[sym]
 
-        # sell excess positions above target
+        # Sell excess
         for sym, val in list(active_positions.items()):
-            try:
-                if val > target:
-                    excess = val - target
-                    price = live_prices.get(sym, ZERO)
-                    if price <= ZERO:
-                        continue
-                    step = symbol_info.get(sym, {}).get('stepSize')
-                    if not step:
-                        continue
-                    qty = (excess / price).quantize(step, rounding=ROUND_DOWN)
-                    if qty > ZERO:
-                        with book_lock:
-                            bid = live_bids.get(sym, [(ZERO, ZERO)])[0][0]
-                        if bid > ZERO:
-                            place_limit_order(sym, 'SELL', bid, qty)
-            except Exception as e:
-                log(f"Error selling {sym}: {e}")
+            if val > target:
+                excess = val - target
+                price = live_prices.get(sym, ZERO)
+                if price <= ZERO:
+                    continue
+                step = symbol_info.get(sym, {}).get('stepSize')
+                if not step:
+                    continue
+                qty = (excess / price).quantize(step, rounding=ROUND_DOWN)
+                if qty > ZERO:
+                    with book_lock:
+                        bid = live_bids.get(sym, [(ZERO, ZERO)])[0][0]
+                    if bid > ZERO:
+                        place_limit_order(sym, 'SELL', bid, qty)
 
-        # buy top targets (top 2 by default)
+        # Buy top targets
         buy_targets = []
         for s in top_volume_symbols:
             if s in active_positions or s in DISALLOWED_COINS:
                 continue
             price = live_prices.get(s)
             if price and MIN_PRICE <= price <= MAX_PRICE:
-                vol = sum((p * q) for p, q in live_bids.get(s, [])) + sum((p * q) for p, q in live_asks.get(s, []))
+                vol = sum(p * q for p, q in live_bids.get(s, [])) + sum(p * q for p, q in live_asks.get(s, []))
                 if vol >= MIN_VOLUME:
                     buy_targets.append(s)
             if len(buy_targets) == MAX_BUY_COINS:
                 break
+
         buys = 0
         for sym in buy_targets:
             if buys >= MAX_BUY_COINS:
                 break
-            try:
-                needed = min(target, investable)
-                if needed < Decimal(st.session_state.get('min_trade_value', MIN_TRADE_VALUE)):
-                    continue
-                with book_lock:
-                    ask = live_asks.get(sym, [(ZERO, ZERO)])[0][0]
-                if ask <= ZERO:
-                    continue
-                buy_price = (ask * (ONE - ENTRY_PCT_BELOW_ASK))
-                tick = symbol_info.get(sym, {}).get('tickSize')
-                step = symbol_info.get(sym, {}).get('stepSize')
-                if not tick or not step:
-                    continue
-                buy_price = round_down_to_step(buy_price, tick)
-                qty = ((needed / buy_price)).quantize(step, rounding=ROUND_DOWN)
-                order_val = buy_price * qty
-                if order_val < Decimal(st.session_state.get('min_trade_value', MIN_TRADE_VALUE)) or order_val > investable:
-                    continue
-                order = place_limit_order(sym, 'BUY', buy_price, qty)
-                if order:
-                    buys += 1
-                    investable -= order_val
-            except Exception as e:
-                log(f"Error buying {sym}: {e}")
+            needed = min(target, investable)
+            if needed < MIN_TRADE_VALUE:
+                continue
+            with book_lock:
+                ask = live_asks.get(sym, [(ZERO, ZERO)])[0][0]
+            if ask <= ZERO:
+                continue
+            buy_price = ask * (ONE - ENTRY_PCT_BELOW_ASK)
+            tick = symbol_info.get(sym, {}).get('tickSize')
+            step = symbol_info.get(sym, {}).get('stepSize')
+            if not tick or not step:
+                continue
+            buy_price = round_down_to_step(buy_price, tick)
+            qty = (needed / buy_price).quantize(step, rounding=ROUND_DOWN)
+            order_val = buy_price * qty
+            if order_val < MIN_TRADE_VALUE or order_val > investable:
+                continue
+            order = place_limit_order(sym, 'BUY', buy_price, qty)
+            if order:
+                buys += 1
+                investable -= order_val
 
         last_rebalance_str = now_cst()
-        log(f"REBALANCE | Buys:{buys} | Targets:{buy_targets[:MAX_BUY_COINS]}")
+        log_info(f"REBALANCE | Buys:{buys} | Targets:{buy_targets[:MAX_BUY_COINS]}")
     except Exception as e:
-        log(f"Rebalance error: {e}")
+        log_error(f"Rebalance error: {e}")
 
-
-# ========================= BACKGROUND INITIALISER =========================
+# ----------------------------------------------------------------------
+# ========================= INITIALIZE & MAIN LOOP =========================
+# ----------------------------------------------------------------------
 def initialise_bot():
-    """Runs in a background thread – sets bot_running when ready."""
     try:
-        st.session_state.init_status = "Loading symbol info..."
+        log_info("=== INITIALISING PLATINUM + GRID BOT ===")
         load_symbol_info()
-
-        st.session_state.init_status = "Fetching balances..."
         update_balances()
 
         all_syms = list(symbol_info.keys())
-        st.session_state.init_status = f"Starting {len(all_syms)} WS streams..."
-        # avoid starting huge number of streams at once
-        start_list = all_syms[:1000] if len(all_syms) > 1000 else all_syms
-        start_market_websockets(start_list)
-
-        st.session_state.init_status = "Starting user stream..."
+        start_market_websockets(all_syms[:1000] if len(all_syms) > 1000 else all_syms)
         start_user_stream()
         threading.Thread(target=keepalive_user_stream, daemon=True).start()
 
-        # Wait for *some* market data (max 15 s)
-        st.session_state.init_status = "Waiting for price/book data..."
         deadline = time.time() + 15
         while time.time() < deadline:
             if live_prices or live_bids:
                 break
             time.sleep(0.5)
 
-        st.session_state.init_status = "Fetching first volume ranking..."
         get_top_volume_symbols()
-
-        st.session_state.bot_running = True
-        st.session_state.init_status = "READY"
-        log("PLATINUM TRADER STARTED")
-        send_whatsapp("PLATINUM TRADER STARTED")
+        log_info("PLATINUM BOT READY")
+        send_whatsapp("PLATINUM + GRID BOT STARTED")
     except Exception as e:
-        log(f"Initialise bot error: {e}")
-        st.session_state.init_status = f"ERROR: {e}"
-        st.session_state.bot_running = False
+        log_error(f"Initialise error: {e}")
 
-# ========================= STREAMLIT UI =========================
-def main():
-    global client
-    st.set_page_config(page_title="Platinum Crypto Trader", layout="wide")
-    st.title("PLATINUM CRYPTO TRADER DASHBOARD 2025")
+def main_trading_loop():
+    global running
+    while running:
+        try:
+            get_top_volume_symbols()
+            rebalance_portfolio()
+            time.sleep(7200)  # Rebalance every 2 hours
+        except Exception as e:
+            log_error(f"MAIN LOOP CRASH: {e}. Restarting in 20s...")
+            time.sleep(20)
 
-    # --- ENSURE REQUIRED SESSION STATE KEYS EXIST (fix for AttributeError) ---
-    required_keys = {
-        'logs': [], 'shutdown': False, 'auto_rebalance': True,
-        'rebalance_interval': 7200, 'min_trade_value': 5.0,
-        'max_position_pct': 5.0, 'entry_pct_below_ask': 0.1,
-        'bot_running': False, 'init_status': '', 'init_thread_running': False,
-        'sample_limit': 25
-    }
-    for k, v in required_keys.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-    # --- API key check ---
-    if not os.getenv('BINANCE_API_KEY') or not os.getenv('BINANCE_API_SECRET'):
-        st.error("Set `BINANCE_API_KEY` and `BINANCE_API_SECRET` env vars")
-        st.stop()
-
-    # create client (Binance.US uses tld='us')
-    try:
-        client = Client(os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET'), tld='us')
-    except Exception as e:
-        st.error(f"Failed to create Binance client: {e}")
-        st.stop()
-
-    # --- START / STOP BUTTONS ---
-    col_btn, col_status = st.columns([1, 3])
-    with col_btn:
-        # START button triggers background initialization
-        if st.button("START TRADER (REAL)", key="start_button", disabled=st.session_state.bot_running):
-            # ensure previous thread not running
-            if not st.session_state.get('init_thread_running', False):
-                st.session_state.init_thread_running = True
-                st.session_state.init_status = "Initialising..."
-                t = threading.Thread(target=initialise_bot, daemon=True)
-                t.start()
-        if st.button("STOP BOT", key="stop_button", disabled=not st.session_state.bot_running):
-            st.session_state.bot_running = False
-            st.session_state.init_status = "STOPPED"
-
-    # Custom CSS for button colors
-    st.markdown("""
-    <style>
-        div.stButton > button:first-child {
-            background-color: rgb(255, 75, 75);  /* red */
-        }
-        div.stButton > button:disabled {
-            background-color: rgb(49, 51, 63);  /* gray */
-        }
-    </style>
-    """, unsafe_allow_html=True)
-    if st.session_state.bot_running:
-        st.markdown("""
-        <style>
-            div.stButton > button[key="start_button"] {
-                background-color: rgb(0, 255, 0);  /* green */
-            }
-        </style>
-        """, unsafe_allow_html=True)
+# ----------------------------------------------------------------------
+# ========================= TKINTER GUI =========================
+# ----------------------------------------------------------------------
+def start_trading():
+    global running
+    if not running:
+        running = True
+        log_info("START button pressed – launching bot")
+        threading.Thread(target=initialise_bot, daemon=True).start()
+        threading.Thread(target=main_trading_loop, daemon=True).start()
+        threading.Thread(target=grid_cycle, daemon=True).start()
+        status_label.config(text="Status: Running", fg="green")
     else:
-        st.markdown("""
-        <style>
-            div.stButton > button[key="start_button"] {
-                background-color: rgb(255, 0, 0);  /* red */
-            }
-        </style>
-        """, unsafe_allow_html=True)
+        log_info("Bot already running")
 
-    # --- LOGS ---
-    st.markdown("---")
-    st.subheader("Log (live)")
-    for line in st.session_state.logs[-50:]:
-        st.code(line)
+def stop_trading():
+    global running
+    log_info("STOP button pressed – shutting down")
+    running = False
+    cancel_all_pending_orders()
+    for ws in ws_instances:
+        ws.stop()
+    status_label.config(text="Status: Stopped", fg="red")
+    log_info("Bot stopped")
 
-    # Auto-refresh
-    time.sleep(1)
-    st.rerun()
+# GUI
+root = tk.Tk()
+root.title("PLATINUM CRYPTO TRADER + GRID BOT")
+root.geometry("460x180")
+root.resizable(False, False)
 
+title_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
+btn_font = tkfont.Font(family="Helvetica", size=12, weight="bold")
+
+tk.Label(root, text="PLATINUM + GRID BOT 2025", font=title_font).pack(pady=10)
+
+start_btn = tk.Button(root, text="Start", command=start_trading,
+                      bg="green", fg="white", font=btn_font, width=18)
+start_btn.pack(pady=8)
+
+stop_btn = tk.Button(root, text="Stop", command=stop_trading,
+                     bg="red", fg="white", font=btn_font, width=18)
+stop_btn.pack(pady=5)
+
+status_label = tk.Label(root, text="Status: Stopped", fg="red", font=("Helvetica", 11))
+status_label.pack(pady=5)
+
+def update_status():
+    if running:
+        status_label.config(text="Status: Running", fg="green")
+    else:
+        status_label.config(text="Status: Stopped", fg="red")
+    root.after(1000, update_status)
+
+update_status()
+
+# ----------------------------------------------------------------------
+# ========================= ENTRY POINT =========================
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    api_key = os.getenv('BINANCE_API_KEY')
+    api_secret = os.getenv('BINANCE_API_SECRET')
+    if not api_key or not api_secret:
+        messagebox.showerror("API Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+        sys.exit(1)
+    client = Client(api_key, api_secret, tld='us')
+
+    root.mainloop()
