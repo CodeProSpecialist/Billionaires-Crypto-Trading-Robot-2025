@@ -2,6 +2,8 @@
 """
 INFINITY GRID BOT 2025 — BINANCE.US
 RE-GRIDS ONLY ON ORDER FILLS (NO TIMER, NO PROFIT SCALING)
+
+Updated: adds dynamic fee querying and dynamic sell % to guarantee net profit >= TARGET_PROFIT_PCT
 """
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
@@ -22,8 +24,16 @@ ONE  = Decimal('1')
 SAFETY_BUFFER = Decimal('0.95')
 
 CASH_USDT_PER_GRID_ORDER = Decimal('5.00')
-GRID_BUY_PCT  = Decimal('0.01')   # 1% below
-GRID_SELL_PCT = Decimal('0.018')  # 1.8% above
+GRID_BUY_PCT  = Decimal('0.01')   # 1% below (unchanged)
+MIN_SELL_PCT  = Decimal('0.018')  # minimum 1.8% above (keeps old behavior)
+
+# New: target net profit after ALL fees (relative to cost including buy-fee)
+TARGET_PROFIT_PCT = Decimal('0.018')  # 1.8% target net profit
+# If True, assume worst-case taker fees for both buy & sell when computing required sell %
+CONSERVATIVE_USE_TAKER = True
+
+# Fee caching (seconds)
+FEE_CACHE_TTL = 60 * 30  # 30 minutes
 
 API_WEIGHT_MAX = 1200
 API_WEIGHT_CURRENT = 0
@@ -52,6 +62,9 @@ running = False
 
 # Track our grid orders: {symbol: [orderId, ...]}
 active_grid_orders = {}
+
+# Fee cache: {symbol: {'maker': Decimal, 'taker': Decimal, 'ts': epoch}}
+_fee_cache = {}
 
 # ----------------------------------------------------------------------
 # ========================= LOGGING =========================
@@ -170,6 +183,102 @@ def load_symbol_info():
     except Exception as e: log_error(f"Symbol info error: {e}")
 
 # ----------------------------------------------------------------------
+# ========================= TRADE FEE FETCHING & CALC =========================
+# ----------------------------------------------------------------------
+def _parse_fee_response_item(item):
+    """Accepts various shapes returned by API / wrapper and returns (maker, taker) as Decimals (fractions)."""
+    try:
+        # python-binance often returns 'makerCommission' (string or number) and 'takerCommission'
+        maker = item.get('makerCommission') or item.get('maker') or item.get('makerCommissionRate') or item.get('makerCommissionRateStr')
+        taker = item.get('takerCommission') or item.get('taker') or item.get('takerCommissionRate') or item.get('takerCommissionRateStr')
+        # Some endpoints return strings like '0.001' or integers like '10' meaning 0.001? try to coerce
+        m = Decimal(str(maker)) if maker is not None and maker != '' else None
+        t = Decimal(str(taker)) if taker is not None and taker != '' else None
+        # If values look like basis points (e.g., 10 means 0.001? unlikely) — we won't attempt magical conversions.
+        if m is None: m = Decimal('0')
+        if t is None: t = Decimal('0')
+        return (m, t)
+    except Exception as e:
+        log_debug(f"Fee parse error: {e}")
+        return (Decimal('0'), Decimal('0'))
+
+def fetch_trade_fees_for_symbol(symbol):
+    """
+    Return dict {'maker': Decimal(...), 'taker': Decimal(...)}
+    Caches results for FEE_CACHE_TTL seconds.
+    """
+    now_ts = int(time.time())
+    cached = _fee_cache.get(symbol)
+    if cached and now_ts - cached['ts'] < FEE_CACHE_TTL:
+        return {'maker': cached['maker'], 'taker': cached['taker']}
+
+    try:
+        # Primary: use python-binance wrapper method
+        resp = client.get_trade_fee(symbol=symbol)
+        update_weight_from_response(resp)
+        # client.get_trade_fee usually returns a list like [{'symbol':'ETHUSDT', 'makerCommission':'0','takerCommission':'0.001'}]
+        if isinstance(resp, list) and resp:
+            maker, taker = _parse_fee_response_item(resp[0])
+        elif isinstance(resp, dict):
+            # sometimes might return dict
+            maker, taker = _parse_fee_response_item(resp)
+        else:
+            maker, taker = (Decimal('0'), Decimal('0'))
+        apply_delay_and_backoff()
+    except Exception as e:
+        log_error(f"Failed to fetch trade fee via client.get_trade_fee for {symbol}: {e}")
+        # fallback defaults (conservative small fees)
+        maker, taker = (Decimal('0.000'), Decimal('0.001'))
+    # Normalize: ensure maker/taker are fractional (0.001 means 0.1%)
+    # Some APIs return percentages as '0' or '0.001' already — we trust direct parse.
+    # Save to cache
+    _fee_cache[symbol] = {'maker': maker, 'taker': taker, 'ts': now_ts}
+    log_info(f"Fees {symbol}: maker={maker} taker={taker}")
+    return {'maker': maker, 'taker': taker}
+
+def compute_required_sell_pct(symbol, target=TARGET_PROFIT_PCT, conservative=CONSERVATIVE_USE_TAKER):
+    """
+    Compute required sell % (fraction, e.g. 0.02 == 2%) to achieve net profit >= target
+    after accounting for fees on buy and sell.
+    Formula:
+      required_multiplier = (1 + target) * (1 + buy_fee) / (1 - sell_fee)
+      required_pct = required_multiplier - 1
+    buy_fee and sell_fee chosen as maker/taker depending on conservative flag.
+    """
+    fees = fetch_trade_fees_for_symbol(symbol)
+    if conservative:
+        buy_fee = fees.get('taker', Decimal('0'))
+        sell_fee = fees.get('taker', Decimal('0'))
+    else:
+        buy_fee = fees.get('maker', Decimal('0'))
+        sell_fee = fees.get('maker', Decimal('0'))
+
+    # Safety: ensure fees are decimals >= 0 and < 1
+    if buy_fee < ZERO: buy_fee = ZERO
+    if sell_fee < ZERO: sell_fee = ZERO
+    if buy_fee >= ONE: buy_fee = buy_fee / Decimal('100')  # try to correct percent->frac mistakes
+    if sell_fee >= ONE: sell_fee = sell_fee / Decimal('100')
+
+    # required multiplier
+    try:
+        required_multiplier = (ONE + target) * (ONE + buy_fee) / (ONE - sell_fee)
+        required_pct = required_multiplier - ONE
+    except Exception as e:
+        log_error(f"Error computing required sell pct for {symbol}: {e}")
+        required_pct = MIN_SELL_PCT
+
+    # If result is NaN or negative, fallback
+    if required_pct.is_nan() or required_pct < ZERO:
+        required_pct = MIN_SELL_PCT
+
+    log_debug(f"Computed required sell pct for {symbol}: {required_pct:.6f} (buy_fee={buy_fee}, sell_fee={sell_fee}, conservative={conservative})")
+    # Ensure at least MIN_SELL_PCT
+    if required_pct < MIN_SELL_PCT:
+        log_info(f"Required sell pct {required_pct:.6%} lower than MIN {MIN_SELL_PCT:.6%} — using MIN")
+        return MIN_SELL_PCT
+    return required_pct
+
+# ----------------------------------------------------------------------
 # ========================= ORDER PLACEMENT =========================
 # ----------------------------------------------------------------------
 def round_down(val: Decimal, step: Decimal) -> Decimal:
@@ -269,7 +378,9 @@ def place_single_grid(symbol, side):
     if side == 'BUY':
         price = cur_price * (ONE - GRID_BUY_PCT)
     else:
-        price = cur_price * (ONE + GRID_SELL_PCT)
+        # compute dynamic sell pct based on fees to guarantee target net profit
+        required_sell_pct = compute_required_sell_pct(symbol, target=TARGET_PROFIT_PCT, conservative=CONSERVATIVE_USE_TAKER)
+        price = cur_price * (ONE + required_sell_pct)
 
     price = round_down(price, info['tickSize'])
     qty   = CASH_USDT_PER_GRID_ORDER / price
