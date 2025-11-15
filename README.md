@@ -140,7 +140,6 @@ python3 infinity_grid.py
 
 ### **Setup Requirements**
 
-```bash
 # Environment Variables
 export BINANCE_API_KEY="..."
 export BINANCE_API_SECRET="..."
