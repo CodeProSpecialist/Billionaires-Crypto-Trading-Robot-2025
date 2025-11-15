@@ -6,7 +6,7 @@ It combines **dynamic grid trading**, **fee-aware limit orders**, and **top mark
 
 The bot features:  
 
-- Automatic fetching of top coins by **market cap**, **trading volume**, and **recent price gains** (14-day and 5-day performance) from **CoinGecko** and **Coinbase**.
+- Automatic fetching of top coins by **market cap**, **trading volume**, and **recent price gains** (14-day and 5-day performance) from **CoinGecko**. 
 - Avoids **stablecoins**, **Bitcoin**, **Ethereum**, **Solana**, and other excluded coins.
 - Fully automated **limit buy/sell orders** with **fee calculation** to guarantee net profit ≥ 1.8%.
 - **Grid rebalancing** triggered immediately upon order fills.
@@ -23,7 +23,7 @@ The bot features:
 - Dynamic **sell percentage** calculation based on **maker/taker fees**.
 
 ### Top Coin Selection
-- Fetches top 25 coins from **CoinGecko** and **Coinbase**:
+- Fetches top 25 coins from **CoinGecko** :
   - Sorted by **market cap**
   - Sorted by **24h volume**
   - Sorted by **price growth over last 5 and 14 days**
@@ -58,7 +58,7 @@ export CALLMEBOT_API_KEY="your_callmebot_key" # optional for alerts
 
  
  
-**Not affiliated with Binance.US or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
+**Not affiliated with Binance.US, coingecko.com, or CallMeBot.** **Profits are not guaranteed; you risk losing all or part of your investment.** Always test in simulation mode (e.g., Binance.US testnet) before live trading and proceed at your own risk!
 
 ### Legal Disclaimers
 
