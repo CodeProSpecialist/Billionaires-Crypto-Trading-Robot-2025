@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PLATINUM CRYPTO TRADER + INFINITY GRID BOT 2025 — BINANCE.US EDITION
-Tkinter GUI | WebSocket + REST | Grid Trading | Rate-Limited | IP Ban Safe
-FIXED: All 'dict' object has no attribute 'response' errors
+INFINITY GRID BOT 2025 — BINANCE.US
+Places 1% BUY & 1.8% SELL grid orders for all owned coins
+Tkinter GUI | WebSocket + REST | Rate-Limited | IP Ban Safe
 """
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
@@ -28,7 +28,7 @@ getcontext().prec = 28
 ZERO = Decimal('0')
 ONE = Decimal('1')
 SAFETY_BUFFER = Decimal('0.95')
-MAX_POSITION_PCT = Decimal('0.05')          # 5% of total per coin
+MAX_POSITION_PCT = Decimal('0.05')
 MIN_TRADE_VALUE = Decimal('5.0')
 ENTRY_PCT_BELOW_ASK = Decimal('0.001')
 TOP_N_VOLUME = 25
@@ -39,7 +39,7 @@ MAX_STREAMS_PER_CONNECTION = 100
 RECONNECT_BASE_DELAY = 5
 MAX_RECONNECT_DELAY = 300
 
-# === GRID SETTINGS (COMPLETED) ===
+# === INFINITY GRID SETTINGS (COMPLETED) ===
 CASH_USDT_PER_GRID_ORDER = Decimal('5.00')   # $5 per grid level
 BUY_GRIDS_PER_POSITION = 1                   # Auto-scaled
 SELL_GRIDS_PER_POSITION = 1                  # Auto-scaled
@@ -97,7 +97,7 @@ running = False
 # ========================= LOGGING =========================
 # ----------------------------------------------------------------------
 def setup_logging():
-    logger = logging.getLogger("platinum_bot")
+    logger = logging.getLogger("infinity_grid_bot")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         fh = TimedRotatingFileHandler(LOG_FILE, when='midnight', backupCount=14)
@@ -105,7 +105,7 @@ def setup_logging():
         ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
         grid_fh = logging.FileHandler(
-            f"logs/trading_bot_{datetime.now().strftime('%Y%m%d')}.log")
+            f"logs/infinity_grid_{datetime.now().strftime('%Y%m%d')}.log")
         grid_fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s - %(message)s'))
         logger.addHandler(fh)
         logger.addHandler(ch)
@@ -113,9 +113,8 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
-
-def log_info(msg):   logger.info(msg)
-def log_error(msg):  logger.error(msg)
+log_info = logger.info
+log_error = logger.error
 
 # ----------------------------------------------------------------------
 # ========================= RATE LIMITING =========================
@@ -190,7 +189,6 @@ def update_balances():
     try:
         wait_for_rate_limit()
         info = client.get_account()
-        # FIXED: info is dict, no .response
         account_balances = {
             a['asset']: Decimal(a['free']) for a in info['balances'] if Decimal(a['free']) > ZERO
         }
@@ -216,7 +214,6 @@ def load_symbol_info():
     try:
         wait_for_rate_limit()
         info = client.get_exchange_info()
-        # FIXED: info is dict
         for s in info.get('symbols', []):
             if s.get('quoteAsset') != 'USDT' or s.get('status') != 'TRADING':
                 continue
@@ -260,19 +257,10 @@ def format_decimal_for_order(d: Decimal) -> str:
         s = s.rstrip('0').rstrip('.')
     return s
 
-def _mock_place_limit_order(symbol, side, price, quantity):
-    order = {
-        'symbol': symbol, 'side': side,
-        'price': format_decimal_for_order(price),
-        'quantity': format_decimal_for_order(quantity),
-        'status': 'TEST'
-    }
-    log_info(f"[PAPER] PLACED {side} {symbol} {quantity} @ {price}")
-    return order
-
 def place_limit_order(symbol, side, price, quantity):
     if USE_PAPER_TRADING:
-        return _mock_place_limit_order(symbol, side, price, quantity)
+        log_info(f"[PAPER] {side} {symbol} {quantity} @ {price}")
+        return {'status': 'TEST'}
 
     info = symbol_info.get(symbol)
     if not info:
@@ -311,7 +299,6 @@ def place_limit_order(symbol, side, price, quantity):
             quantity=format_decimal_for_order(quantity),
             price=format_decimal_for_order(price)
         )
-        # FIXED: order is dict, no .response
         log_info(f"PLACED {side} {symbol} {quantity} @ {price}")
         send_whatsapp(f"{side} {symbol} {quantity}@{price}")
         return order
@@ -323,7 +310,7 @@ def place_limit_order(symbol, side, price, quantity):
         return None
 
 # ----------------------------------------------------------------------
-# ========================= GRID TRADING =========================
+# ========================= INFINITY GRID CORE =========================
 # ----------------------------------------------------------------------
 def get_owned_assets():
     owned = []
@@ -346,7 +333,6 @@ def cancel_all_pending_orders():
     try:
         wait_for_rate_limit()
         open_orders = client.get_open_orders()
-        # FIXED: open_orders is list
         log_info(f"Cancelling {len(open_orders)} pending orders...")
         for o in open_orders:
             try:
@@ -367,7 +353,7 @@ def place_grid_orders(asset):
     try:
         wait_for_rate_limit()
         cur_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-        log_info(f"Grid price {symbol}: {cur_price}")
+        log_info(f"Placing grid for {symbol} @ {cur_price}")
     except BinanceAPIException as e:
         handle_rate_limit_error(e)
         return
@@ -378,8 +364,9 @@ def place_grid_orders(asset):
     info = symbol_info.get(symbol, {})
     qty_step = info.get('stepSize', Decimal('1'))
     price_step = info.get('tickSize', Decimal('0.01'))
+    free_asset = account_balances.get(asset, ZERO)
 
-    # BUY GRIDS
+    # === PLACE BUY GRIDS: 1% BELOW ===
     for i in range(1, BUY_GRIDS_PER_POSITION + 1):
         try:
             buy_price = cur_price * (ONE - GRID_BUY_PCT * Decimal(i))
@@ -391,8 +378,7 @@ def place_grid_orders(asset):
         except Exception as e:
             log_error(f"Buy grid error {symbol} level {i}: {e}")
 
-    # SELL GRIDS
-    free_asset = account_balances.get(asset, ZERO)
+    # === PLACE SELL GRIDS: 1.8% ABOVE ===
     for i in range(1, SELL_GRIDS_PER_POSITION + 1):
         try:
             sell_price = cur_price * (ONE + GRID_SELL_PCT * Decimal(i))
@@ -419,12 +405,12 @@ def grid_cycle():
 
             cancel_all_pending_orders()
             owned = get_owned_assets()
-            log_info(f"Placing grid for {len(owned)} assets")
-            for a in owned:
-                place_grid_orders(a)
+            log_info(f"Placing INFINITY GRID for {len(owned)} assets")
+            for asset in owned:
+                place_grid_orders(asset)
 
             last_regrid = time.time()
-            log_info(f"Initial grid placed. Portfolio: ${initial_total_usdt:.2f}")
+            log_info(f"Grid placed. Portfolio: ${initial_total_usdt:.2f}")
 
             while running:
                 time.sleep(60)
@@ -432,6 +418,7 @@ def grid_cycle():
                 if current_total == 0:
                     continue
 
+                # Auto-scale grid with profit
                 increase = int((current_total - initial_total_usdt) / PROFIT_PER_GRID_INCREASE)
                 new_grids = max(1, 1 + increase)
                 if new_grids != BUY_GRIDS_PER_POSITION:
@@ -439,12 +426,13 @@ def grid_cycle():
                     BUY_GRIDS_PER_POSITION = new_grids
                     SELL_GRIDS_PER_POSITION = new_grids
 
+                # Re-grid every 30 minutes
                 if time.time() - last_regrid > REGRID_INTERVAL:
                     log_info("30-minute re-grid")
                     cancel_all_pending_orders()
                     owned = get_owned_assets()
-                    for a in owned:
-                        place_grid_orders(a)
+                    for asset in owned:
+                        place_grid_orders(asset)
                     last_regrid = time.time()
 
         except Exception as e:
@@ -504,9 +492,6 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
         except Exception:
             pass
 
-# ----------------------------------------------------------------------
-# ========================= WS HANDLERS & STARTERS =========================
-# ----------------------------------------------------------------------
 def on_market_message(ws, message):
     try:
         data = json.loads(message)
@@ -520,12 +505,6 @@ def on_market_message(ws, message):
             if price > ZERO:
                 with price_lock:
                     live_prices[sym] = price
-        elif stream.endswith(f'@depth{DEPTH_LEVELS}'):
-            bids = [(_safe_decimal(p), _safe_decimal(q)) for p, q in payload.get('bids', [])[:DEPTH_LEVELS]]
-            asks = [(_safe_decimal(p), _safe_decimal(q)) for p, q in payload.get('asks', [])[:DEPTH_LEVELS]]
-            with book_lock:
-                live_bids[sym] = bids
-                live_asks[sym] = asks
     except Exception as e:
         log_error(f"Market WS parse error: {e}")
 
@@ -547,16 +526,15 @@ def on_user_message(ws, message):
         log_error(f"User WS error: {e}")
 
 def on_ws_error(ws, err):
-    log_error(f"WS error ({getattr(ws, 'url', 'unknown')}): {err}")
+    log_error(f"WS error: {err}")
 
 def on_ws_close(ws, code, msg):
-    log_info(f"WS closed ({getattr(ws, 'url', 'unknown')}) to {code}: {msg}")
+    log_info(f"WS closed to {code}: {msg}")
 
 def start_market_websockets(symbols):
     global ws_instances, ws_threads
     ticker = [f"{s.lower()}@ticker" for s in symbols]
-    depth = [f"{s.lower()}@depth{DEPTH_LEVELS}" for s in symbols]
-    streams = ticker + depth
+    streams = ticker
     chunks = [streams[i:i + MAX_STREAMS_PER_CONNECTION] for i in range(0, len(streams), MAX_STREAMS_PER_CONNECTION)]
 
     for chunk in chunks:
@@ -611,112 +589,11 @@ def keepalive_user_stream():
             pass
 
 # ----------------------------------------------------------------------
-# ========================= REBALANCE =========================
-# ----------------------------------------------------------------------
-def get_top_volume_symbols():
-    global top_volume_symbols
-    candidates = []
-    with book_lock:
-        for sym, bids in live_bids.items():
-            if len(bids) < DEPTH_LEVELS:
-                continue
-            vol = sum(p * q for p, q in bids[:DEPTH_LEVELS])
-            try:
-                volf = float(vol)
-            except Exception:
-                volf = 0.0
-            if volf > 0:
-                candidates.append((sym, volf))
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    top_volume_symbols = [s for s, _ in candidates[:TOP_N_VOLUME]]
-    log_info(f"Top {len(top_volume_symbols)} volume symbols refreshed")
-
-def rebalance_portfolio():
-    global last_rebalance_str
-    try:
-        if not top_volume_symbols:
-            return
-        update_balances()
-        total = get_total_portfolio_value()
-        target = total * MAX_POSITION_PCT
-        usdt_free = account_balances.get('USDT', ZERO)
-        investable = usdt_free * SAFETY_BUFFER
-
-        active_positions.clear()
-        for asset, qty in account_balances.items():
-            if asset == 'USDT':
-                continue
-            sym = f"{asset}USDT"
-            if sym in live_prices:
-                active_positions[sym] = qty * live_prices[sym]
-
-        # Sell excess
-        for sym, val in list(active_positions.items()):
-            if val > target:
-                excess = val - target
-                price = live_prices.get(sym, ZERO)
-                if price <= ZERO:
-                    continue
-                step = symbol_info.get(sym, {}).get('stepSize')
-                if not step:
-                    continue
-                qty = (excess / price).quantize(step, rounding=ROUND_DOWN)
-                if qty > ZERO:
-                    with book_lock:
-                        bid = live_bids.get(sym, [(ZERO, ZERO)])[0][0]
-                    if bid > ZERO:
-                        place_limit_order(sym, 'SELL', bid, qty)
-
-        # Buy targets
-        buy_targets = []
-        for s in top_volume_symbols:
-            if s in active_positions or s in DISALLOWED_COINS:
-                continue
-            price = live_prices.get(s)
-            if price and MIN_PRICE <= price <= MAX_PRICE:
-                vol = sum(p * q for p, q in live_bids.get(s, [])) + sum(p * q for p, q in live_asks.get(s, []))
-                if vol >= MIN_VOLUME:
-                    buy_targets.append(s)
-            if len(buy_targets) == MAX_BUY_COINS:
-                break
-
-        buys = 0
-        for sym in buy_targets:
-            if buys >= MAX_BUY_COINS:
-                break
-            needed = min(target, investable)
-            if needed < MIN_TRADE_VALUE:
-                continue
-            with book_lock:
-                ask = live_asks.get(sym, [(ZERO, ZERO)])[0][0]
-            if ask <= ZERO:
-                continue
-            buy_price = ask * (ONE - ENTRY_PCT_BELOW_ASK)
-            tick = symbol_info.get(sym, {}).get('tickSize')
-            step = symbol_info.get(sym, {}).get('stepSize')
-            if not tick or not step:
-                continue
-            buy_price = round_down_to_step(buy_price, tick)
-            qty = (needed / buy_price).quantize(step, rounding=ROUND_DOWN)
-            order_val = buy_price * qty
-            if order_val < MIN_TRADE_VALUE or order_val > investable:
-                continue
-            order = place_limit_order(sym, 'BUY', buy_price, qty)
-            if order:
-                buys += 1
-                investable -= order_val
-
-        last_rebalance_str = now_cst()
-        log_info(f"REBALANCE | Buys:{buys} | Targets:{buy_targets[:MAX_BUY_COINS]}")
-    except Exception as e:
-        log_error(f"Rebalance error: {e}")
-
-# ----------------------------------------------------------------------
-# ========================= MAIN LOOP =========================
+# ========================= INITIALIZE & MAIN LOOP =========================
 # ----------------------------------------------------------------------
 def initialise_bot():
     try:
-        log_info("=== INITIALISING PLATINUM + GRID BOT ===")
+        log_info("=== INITIALISING INFINITY GRID BOT ===")
         load_symbol_info()
         update_balances()
 
@@ -727,26 +604,14 @@ def initialise_bot():
 
         deadline = time.time() + 15
         while time.time() < deadline:
-            if live_prices or live_bids:
+            if live_prices:
                 break
             time.sleep(0.5)
 
-        get_top_volume_symbols()
-        log_info("PLATINUM BOT READY")
-        send_whatsapp("PLATINUM + GRID BOT STARTED")
+        log_info("INFINITY GRID BOT READY")
+        send_whatsapp("INFINITY GRID BOT STARTED")
     except Exception as e:
         log_error(f"Initialise error: {e}")
-
-def main_trading_loop():
-    global running
-    while running:
-        try:
-            get_top_volume_symbols()
-            rebalance_portfolio()
-            time.sleep(7200)
-        except Exception as e:
-            log_error(f"MAIN LOOP CRASH: {e}. Restarting in 20s...")
-            time.sleep(20)
 
 # ----------------------------------------------------------------------
 # ========================= TKINTER GUI =========================
@@ -757,7 +622,6 @@ def start_trading():
         running = True
         log_info("START button pressed – launching bot")
         threading.Thread(target=initialise_bot, daemon=True).start()
-        threading.Thread(target=main_trading_loop, daemon=True).start()
         threading.Thread(target=grid_cycle, daemon=True).start()
         status_label.config(text="Status: Running", fg="green")
     else:
@@ -775,14 +639,14 @@ def stop_trading():
 
 # GUI
 root = tk.Tk()
-root.title("PLATINUM + INFINITY GRID BOT 2025")
+root.title("INFINITY GRID BOT 2025")
 root.geometry("460x180")
 root.resizable(False, False)
 
 title_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
 btn_font = tkfont.Font(family="Helvetica", size=12, weight="bold")
 
-tk.Label(root, text="PLATINUM + GRID BOT 2025", font=title_font).pack(pady=10)
+tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font).pack(pady=10)
 
 start_btn = tk.Button(root, text="Start", command=start_trading,
                       bg="green", fg="white", font=btn_font, width=18)
