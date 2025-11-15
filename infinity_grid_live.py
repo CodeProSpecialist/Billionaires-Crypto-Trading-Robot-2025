@@ -127,7 +127,7 @@ def record_fill(symbol, side, qty, price, fee_usdt):
 # -------------------- TKINTER GUI (900x700) --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025")
-root.geometry("900x700")
+root.geometry("800x800")
 root.configure(bg="#111111")
 root.resizable(False, False)
 
