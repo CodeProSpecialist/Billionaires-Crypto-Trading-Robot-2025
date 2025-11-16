@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ALPHA BOT 2025 — ZEC/LTC/DASH EDITION
-$213 USDT → 50%–200% APY on Sideways Swings
+$210 USDT → 50%–200% APY on Sideways Swings
 Privacy Alts: No BTC Losses
 """
 
