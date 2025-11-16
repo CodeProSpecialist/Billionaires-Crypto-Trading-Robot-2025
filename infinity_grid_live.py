@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID BOT 2025 — BINANCE.US + P&L Tracker + WhatsApp Alerts
-800x800 Full-Screen Dashboard (Dark Theme)
+INFINITY GRID BOT 2025 — BINANCE.US
+WebSocket: Order Fills | REST: P&L + Sell Logic + Grid
+33% USDT Reserve | Sell if not up in 5 OR 15 days
 """
 
 import os
@@ -11,7 +12,7 @@ import threading
 import json
 import requests
 import traceback
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal, getcontext
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
@@ -42,21 +43,16 @@ CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE   = os.getenv('CALLMEBOT_PHONE')
 
 def send_whatsapp_alert(msg: str):
-    """Send WhatsApp message via CallMeBot API."""
     if not (CALLMEBOT_API_KEY and CALLMEBOT_PHONE):
         return
     try:
         requests.get(
             "https://api.callmebot.com/whatsapp.php",
-            params={
-                "phone": CALLMEBOT_PHONE,
-                "text": msg,
-                "apikey": CALLMEBOT_API_KEY
-            },
+            params={"phone": CALLMEBOT_PHONE, "text": msg, "apikey": CALLMEBOT_API_KEY},
             timeout=5
         )
-    except Exception:
-        pass  # Silent fail — never crash bot
+    except:
+        pass
 
 # -------------------- BINANCE CLIENT --------------------
 api_key    = os.getenv('BINANCE_API_KEY')
@@ -71,9 +67,7 @@ symbol_info = {}
 account_balances = {}
 active_grid_orders = {}
 _fee_cache = {}
-live_prices = {}
 running = False
-price_lock = threading.Lock()
 min_usdt_reserve = ZERO
 
 # -------------------- P&L TRACKING --------------------
@@ -98,7 +92,6 @@ def load_pnl():
                 }
         except Exception as e:
             terminal_insert(f"[{now_cst()}] P&L load error: {e}")
-    # Ensure defaults if file is missing or corrupt
     else:
         pnl_data['total_realized'] = ZERO
         pnl_data['daily_realized'] = ZERO
@@ -115,7 +108,6 @@ def save_pnl():
         }
         with open(PNL_FILE, 'w') as f:
             json.dump(data, f)
-        # Write human-readable summary
         with open(PNL_SUMMARY_FILE, 'w') as f:
             f.write(f"Total P&L: {pnl_data['total_realized']:.2f}\n")
             f.write(f"Daily P&L: {pnl_data['daily_realized']:.2f}\n")
@@ -129,24 +121,89 @@ def reset_daily_pnl():
         pnl_data['last_reset_date'] = today
         save_pnl()
 
+# -------------------- PRICE & HISTORY (REST) --------------------
+def fetch_current_prices_for_assets(assets):
+    prices = {}
+    for asset in assets:
+        symbol = f"{asset}USDT"
+        if symbol not in symbol_info:
+            continue
+        try:
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            price = Decimal(ticker['price'])
+            if price > ZERO:
+                prices[symbol] = price
+        except Exception as e:
+            terminal_insert(f"[{now_cst()}] Price fetch error {symbol}: {e}")
+    return prices
+
 def update_unrealized_pnl():
+    assets = [a for a in pnl_data['cost_basis'].keys() if pnl_data['cost_basis'][a][0] > ZERO]
+    if not assets:
+        pnl_data['unrealized'] = ZERO
+        return ZERO
+
+    prices = fetch_current_prices_for_assets(assets)
     unrealized = ZERO
     for asset, (qty, cost) in pnl_data['cost_basis'].items():
         symbol = f"{asset}USDT"
-        if symbol not in live_prices or qty <= ZERO:
+        if symbol not in prices:
             continue
-        market_value = qty * live_prices[symbol]
+        market_value = qty * prices[symbol]
         unrealized += market_value - cost
     pnl_data['unrealized'] = unrealized
     return unrealized
 
+def get_historical_closes(symbol, days):
+    try:
+        end = datetime.now(CST)
+        start = end - timedelta(days=days + 10)
+        klines = client.get_historical_klines(symbol, Client.KLINE_INTERVAL_1DAY, str(start), str(end))
+        closes = [Decimal(k[4]) for k in klines[:-1]]
+        return closes[-days:] if len(closes) >= days else []
+    except:
+        return []
+
+def should_sell_asset(asset):
+    if asset not in pnl_data['cost_basis']:
+        return False
+    qty, cost = pnl_data['cost_basis'][asset]
+    if qty <= ZERO:
+        return False
+
+    symbol = f"{asset}USDT"
+    if symbol not in symbol_info:
+        return False
+
+    try:
+        current_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+
+        # 5-day check
+        closes_5 = get_historical_closes(symbol, 5)
+        if closes_5 and closes_5[0] > ZERO:
+            change_5 = (current_price - closes_5[0]) / closes_5[0]
+            if change_5 > ZERO:
+                return False
+
+        # 15-day check
+        closes_15 = get_historical_closes(symbol, 15)
+        if closes_15 and closes_15[0] > ZERO:
+            change_15 = (current_price - closes_15[0]) / closes_15[0]
+            if change_15 > ZERO:
+                return False
+
+        terminal_insert(f"[{now_cst()}] SELLING {asset}: Not up in 5 or 15 days")
+        return True
+    except:
+        return False
+
+# -------------------- ORDER TRACKING (WEBSOCKET) --------------------
 def record_fill(symbol, side, qty, price, fee_usdt):
     base = symbol.replace('USDT', '')
     qty = Decimal(qty)
     price = Decimal(price)
     fee_usdt = Decimal(fee_usdt)
     notional = qty * price
-
     realized = ZERO
 
     if side == 'BUY':
@@ -171,31 +228,66 @@ def record_fill(symbol, side, qty, price, fee_usdt):
             pnl_data['daily_realized'] += realized
             pnl_data['cost_basis'][base] = (old_qty - qty, old_cost - cost_sold)
 
-    # Persist + Alert
     save_pnl()
     alert_msg = f"{side} {base} {qty} @ {price:.8f} | P&L: ${realized:+.4f}"
     terminal_insert(f"[{now_cst()}] {alert_msg}")
     send_whatsapp_alert(alert_msg)
 
-    # Big daily move alert
     if abs(pnl_data['daily_realized']) >= Decimal('50'):
         send_whatsapp_alert(f"DAILY P&L: ${pnl_data['daily_realized']:+.2f}")
 
-# -------------------- TKINTER GUI (800x800) --------------------
+# -------------------- WEBSOCKETS (ORDER MESSAGES) --------------------
+def on_user_message(ws, msg):
+    try:
+        d = json.loads(msg)
+        if d.get('e') != 'executionReport' or d.get('X') != 'FILLED':
+            return
+        symbol = d['s']
+        side = d['S']
+        qty = d['q']
+        price = d['p']
+        fee = d.get('n', '0')
+        fee_asset = d.get('N', 'USDT')
+        fee_usdt = Decimal(fee) if fee_asset == 'USDT' else Decimal(fee) * Decimal(price)
+        record_fill(symbol, side, qty, price, fee_usdt)
+        threading.Thread(target=regrid_on_fill, args=(symbol,), daemon=True).start()
+    except:
+        pass
+
+class WS(websocket.WebSocketApp):
+    def __init__(self, url, on_msg):
+        super().__init__(url, on_message=on_msg)
+        self._stop = False
+    def run_forever(self, **kw):
+        while not self._stop:
+            try:
+                super().run_forever(ping_interval=25, **kw)
+            except:
+                time.sleep(5)
+    def stop(self):
+        self._stop = True
+        self.close()
+
+def start_user_stream():
+    try:
+        key = client.stream_get_listen_key()['listenKey']
+        WS(f"wss://stream.binance.us:9443/ws/{key}", on_user_message).run_forever()
+    except:
+        pass
+
+# -------------------- TKINTER GUI --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025")
 root.geometry("800x800")
 root.configure(bg="#111111")
 root.resizable(False, False)
 
-# FONTS — Increased by 2pt where allowed
-title_font     = tkfont.Font(family="Helvetica", size=18, weight="bold")   # unchanged
-button_font    = tkfont.Font(family="Helvetica", size=14, weight="bold")   # unchanged
-label_font     = tkfont.Font(family="Helvetica", size=14)                  # +2pt (was 12)
-pnl_font       = tkfont.Font(family="Helvetica", size=16)                  # +4pt total (was 12 → 16)
-term_font      = tkfont.Font(family="Courier", size=16)                    # +2pt (was 14)
+title_font  = tkfont.Font(family="Helvetica", size=18, weight="bold")
+button_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
+label_font  = tkfont.Font(family="Helvetica", size=14)
+pnl_font    = tkfont.Font(family="Helvetica", size=16)
+term_font   = tkfont.Font(family="Courier", size=16)
 
-# Scrollable Frame Utility
 def create_scrollable_frame(parent, bg="#222222"):
     canvas = tk.Canvas(parent, borderwidth=0, background=bg, highlightthickness=0)
     frame = tk.Frame(canvas, background=bg)
@@ -204,12 +296,9 @@ def create_scrollable_frame(parent, bg="#222222"):
     scrollbar.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
     canvas.create_window((0,0), window=frame, anchor="nw")
-    def on_frame_configure(event):
-        canvas.configure(scrollregion=canvas.bbox("all"))
-    frame.bind("<Configure>", on_frame_configure)
+    frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     return frame, canvas
 
-# Layout
 tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font, fg="white", bg="#111111").pack(pady=10)
 
 stats_outer_frame = tk.Frame(root, bg="#111111", height=150)
@@ -240,7 +329,6 @@ button_frame = tk.Frame(root, bg="#111111")
 button_frame.pack(pady=10)
 status_label = tk.Label(button_frame, text="Status: Stopped", fg="red", bg="#111111", font=label_font)
 status_label.pack(side="left", padx=10)
-
 tk.Button(button_frame, text="START", command=lambda: start_trading(), bg="#00aa00", fg="white", font=button_font, width=12).pack(side="right", padx=10)
 tk.Button(button_frame, text="STOP",  command=lambda: stop_trading(),  bg="#aa0000", fg="white", font=button_font, width=12).pack(side="right", padx=5)
 
@@ -309,7 +397,7 @@ def update_stats_labels():
     total_pnl = pnl_data['total_realized'] + unrealized
     daily_pnl = pnl_data['daily_realized'] + unrealized
 
-    color = "lime" if total_pnl >= 0 else "red"
+    color = "lime" if total_pnl >= ZERO else "red"
     pnl_label.config(text=f"P&L: ${total_pnl:+.2f} (Today: ${daily_pnl:+.2f})", fg=color)
 
     status_label.config(text="Status: Running" if running else "Status: Stopped", fg="lime" if running else "red")
@@ -343,12 +431,7 @@ def compute_required_sell_pct(symbol):
 def fetch_top_coins():
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 100,
-            "page": 1
-        }
+        params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 100, "page": 1}
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         coins = [c['symbol'].upper() for c in r.json() if c['symbol'].upper() not in EXCLUDED_COINS]
@@ -372,7 +455,7 @@ def place_limit_order(symbol, side, price, qty, track=True):
     order_amount = price * qty * SAFETY_BUFFER
     current_usdt = account_balances.get('USDT', ZERO)
     if side == 'BUY' and current_usdt - order_amount < min_usdt_reserve:
-        terminal_insert(f"[{now_cst()}] Cannot place BUY for {symbol}: Would violate minimum USDT reserve ({min_usdt_reserve:.2f})")
+        terminal_insert(f"[{now_cst()}] BUY blocked: Reserve {min_usdt_reserve:.2f}")
         return None
     if side == 'BUY' and order_amount > current_usdt:
         terminal_insert(f"[{now_cst()}] NOT ENOUGH USDT")
@@ -423,59 +506,22 @@ def regrid_on_fill(symbol):
     place_single_grid(symbol, 'BUY')
     place_single_grid(symbol, 'SELL')
 
-# -------------------- WEBSOCKETS --------------------
-def on_user_message(ws, msg):
-    try:
-        d = json.loads(msg)
-        if d.get('e') != 'executionReport' or d.get('X') != 'FILLED':
-            return
-        symbol = d['s']
-        side = d['S']
-        qty = d['q']
-        price = d['p']
-        fee = d.get('n', '0')
-        fee_asset = d.get('N', 'USDT')
-        fee_usdt = Decimal(fee) if fee_asset == 'USDT' else Decimal(fee) * Decimal(price)
-        record_fill(symbol, side, qty, price, fee_usdt)
-        threading.Thread(target=regrid_on_fill, args=(symbol,), daemon=True).start()
-    except:
-        pass
-
-class WS(websocket.WebSocketApp):
-    def __init__(self, url, on_msg):
-        super().__init__(url, on_message=on_msg)
-        self._stop = False
-    def run_forever(self, **kw):
-        while not self._stop:
-            try:
-                super().run_forever(ping_interval=25, **kw)
-            except:
-                time.sleep(5)
-    def stop(self):
-        self._stop = True
-        self.close()
-
-def start_user_stream():
-    try:
-        key = client.stream_get_listen_key()['listenKey']
-        WS(f"wss://stream.binance.us:9443/ws/{key}", on_user_message).run_forever()
-    except:
-        pass
-
-def start_price_ws():
-    streams = [f"{s.lower()}@ticker" for s in list(symbol_info.keys())[:500]]
-    if streams:
-        def on_price(ws, m):
-            try:
-                data = json.loads(m)['data']
-                sym = data['s']
-                price = Decimal(data['c'])
-                if price > ZERO:
-                    with price_lock:
-                        live_prices[sym] = price
-            except:
-                pass
-        WS(f"wss://stream.binance.us:9443/stream?streams={'/'.join(streams)}", on_price).run_forever()
+# -------------------- 5/15-DAY SELL CYCLE --------------------
+def sell_stagnant_positions():
+    update_balances()
+    for asset in list(account_balances.keys()):
+        if asset == 'USDT' or account_balances[asset] <= ZERO:
+            continue
+        if should_sell_asset(asset):
+            symbol = f"{asset}USDT"
+            if symbol in symbol_info:
+                cancel_symbol_orders(symbol)
+                qty = account_balances[asset]
+                try:
+                    price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+                    place_limit_order(symbol, 'SELL', price, qty, track=False)
+                except:
+                    pass
 
 # -------------------- THREADS --------------------
 def auto_buy_top_coins():
@@ -503,6 +549,7 @@ def grid_cycle():
     while running:
         try:
             update_balances()
+            sell_stagnant_positions()
             for asset in [a for a in account_balances if a != 'USDT' and account_balances[a] > ZERO]:
                 sym = f"{asset}USDT"
                 if sym in symbol_info:
@@ -514,18 +561,14 @@ def grid_cycle():
             terminal_insert(f"[{now_cst()}] Cycle error: {e}")
             time.sleep(15)
 
-def pnl_refresh_loop():
-    """Force P&L file sync + GUI update every 3 minutes."""
+def pnl_update_loop():
     while True:
-        time.sleep(180)
-        if not running:
-            continue
+        time.sleep(30)
         try:
-            load_pnl()
-            save_pnl()  # Ensure summary file is always up to date
+            update_unrealized_pnl()
             update_stats_labels()
-        except Exception:
-            terminal_insert(f"[{now_cst()}] P&L refresh error: {traceback.format_exc()}")
+        except Exception as e:
+            terminal_insert(f"[{now_cst()}] P&L update error: {e}")
 
 def start_trading():
     global running
@@ -546,29 +589,25 @@ def stop_trading():
 
 def display_pnl_summary_at_startup():
     if os.path.exists(PNL_SUMMARY_FILE):
-        try:
-            with open(PNL_SUMMARY_FILE, 'r') as f:
-                summary = f.read().strip()
-            terminal_insert(f"[{now_cst()}] Loaded P&L Summary:\n{summary}")
-        except Exception as e:
-            terminal_insert(f"[{now_cst()}] P&L summary load error: {e}")
+        with open(PNL_SUMMARY_FILE, 'r') as f:
+            summary = f.read().strip()
+        terminal_insert(f"[{now_cst()}] P&L Summary:\n{summary}")
     else:
-        terminal_insert(f"[{now_cst()}] No P&L summary yet — will be created on first save.")
+        terminal_insert(f"[{now_cst()}] No P&L summary — created.")
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
     load_pnl()
-    save_pnl()  # ←←← THIS LINE CREATES pnl_summary.txt EVEN ON FIRST RUN
+    save_pnl()
     load_symbol_info()
     update_balances()
     min_usdt_reserve = account_balances.get('USDT', ZERO) * RESERVE_PCT
-    terminal_insert(f"[{now_cst()}] Minimum USDT reserve set to: {min_usdt_reserve:.2f}")
+    terminal_insert(f"[{now_cst()}] 33% USDT reserve: {min_usdt_reserve:.2f}")
     fetch_top_coins()
     display_pnl_summary_at_startup()
 
     threading.Thread(target=start_user_stream, daemon=True).start()
-    threading.Thread(target=start_price_ws, daemon=True).start()
-    threading.Thread(target=pnl_refresh_loop, daemon=True).start()
+    threading.Thread(target=pnl_update_loop, daemon=True).start()
 
     terminal_insert(f"[{now_cst()}] INFINITY GRID BOT 2025 READY")
     update_stats_labels()
