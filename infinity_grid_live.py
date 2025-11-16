@@ -34,6 +34,8 @@ FEE_CACHE_TTL = 60*30
 EXCLUDED_COINS = {"USD","USDT","BTC","BCH","ETH","SOL"}
 CST = pytz.timezone("America/Chicago")
 PNL_FILE = "grid_pnl.json"
+PNL_SUMMARY_FILE = "pnl_summary.txt"
+RESERVE_PCT = Decimal('0.33')
 
 # -------------------- CALLMEBOT WHATSAPP ALERTS --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
@@ -72,6 +74,7 @@ _fee_cache = {}
 live_prices = {}
 running = False
 price_lock = threading.Lock()
+min_usdt_reserve = ZERO
 
 # -------------------- P&L TRACKING --------------------
 pnl_data = {
@@ -106,6 +109,10 @@ def save_pnl():
         }
         with open(PNL_FILE, 'w') as f:
             json.dump(data, f)
+        # Write human-readable summary
+        with open(PNL_SUMMARY_FILE, 'w') as f:
+            f.write(f"Total P&L: {pnl_data['total_realized']:.2f}\n")
+            f.write(f"Daily P&L: {pnl_data['daily_realized']:.2f}\n")
     except Exception:
         pass
 
@@ -175,10 +182,12 @@ root.geometry("800x800")
 root.configure(bg="#111111")
 root.resizable(False, False)
 
-title_font = tkfont.Font(family="Helvetica", size=18, weight="bold")
-button_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
-label_font = tkfont.Font(family="Helvetica", size=12)
-term_font = tkfont.Font(family="Courier", size=14)
+# FONTS — Increased by 2pt where allowed
+title_font     = tkfont.Font(family="Helvetica", size=18, weight="bold")   # unchanged
+button_font    = tkfont.Font(family="Helvetica", size=14, weight="bold")   # unchanged
+label_font     = tkfont.Font(family="Helvetica", size=14)                  # +2pt (was 12)
+pnl_font       = tkfont.Font(family="Helvetica", size=16)                  # +4pt total (was 12 → 14 → 16)
+term_font      = tkfont.Font(family="Courier", size=16)                    # +2pt (was 14)
 
 # Scrollable Frame Utility
 def create_scrollable_frame(parent, bg="#222222"):
@@ -206,7 +215,7 @@ usdt_label = tk.Label(stats_scroll_frame, text="USDT Balance: 0.00", fg="lime", 
 usdt_label.pack(fill="x", pady=2)
 active_coins_label = tk.Label(stats_scroll_frame, text="Active Coins: 0", fg="lime", bg="#111111", font=label_font, anchor="w")
 active_coins_label.pack(fill="x", pady=2)
-pnl_label = tk.Label(stats_scroll_frame, text="P&L: $0.00 (Today: $0.00)", fg="lime", bg="#111111", font=label_font, anchor="w")
+pnl_label = tk.Label(stats_scroll_frame, text="P&L: $0.00 (Today: $0.00)", fg="lime", bg="#111111", font=pnl_font, anchor="w")
 pnl_label.pack(fill="x", pady=2)
 top_coins_label = tk.Label(stats_scroll_frame, text="Top Coins: Loading...", fg="lime", bg="#111111", font=label_font, anchor="w", justify="left", wraplength=860)
 top_coins_label.pack(fill="x", pady=2)
@@ -354,7 +363,12 @@ def place_limit_order(symbol, side, price, qty, track=True):
     if qty <= info['minQty'] or price * qty < info['minNotional']:
         return None
 
-    if side == 'BUY' and price * qty * SAFETY_BUFFER > account_balances.get('USDT', ZERO):
+    order_amount = price * qty * SAFETY_BUFFER
+    current_usdt = account_balances.get('USDT', ZERO)
+    if side == 'BUY' and current_usdt - order_amount < min_usdt_reserve:
+        terminal_insert(f"[{now_cst()}] Cannot place BUY for {symbol}: Would violate minimum USDT reserve ({min_usdt_reserve:.2f})")
+        return None
+    if side == 'BUY' and order_amount > current_usdt:
         terminal_insert(f"[{now_cst()}] NOT ENOUGH USDT")
         return None
     if side == 'SELL':
@@ -523,12 +537,24 @@ def stop_trading():
     terminal_insert(f"[{now_cst()}] BOT STOPPED")
     send_whatsapp_alert("INFINITY GRID BOT STOPPED")
 
+def display_pnl_summary_at_startup():
+    if os.path.exists(PNL_SUMMARY_FILE):
+        try:
+            with open(PNL_SUMMARY_FILE, 'r') as f:
+                summary = f.read().strip()
+            terminal_insert(f"[{now_cst()}] Loaded P&L Summary:\n{summary}")
+        except Exception as e:
+            terminal_insert(f"[{now_cst()}] P&L summary load error: {e}")
+
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
     load_pnl()
     load_symbol_info()
     update_balances()
+    min_usdt_reserve = account_balances.get('USDT', ZERO) * RESERVE_PCT
+    terminal_insert(f"[{now_cst()}] Minimum USDT reserve set to: {min_usdt_reserve:.2f}")
     fetch_top_coins()
+    display_pnl_summary_at_startup()
 
     threading.Thread(target=start_user_stream, daemon=True).start()
     threading.Thread(target=start_price_ws, daemon=True).start()
