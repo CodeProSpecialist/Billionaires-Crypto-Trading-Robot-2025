@@ -98,6 +98,12 @@ def load_pnl():
                 }
         except Exception as e:
             terminal_insert(f"[{now_cst()}] P&L load error: {e}")
+    # Ensure defaults if file is missing or corrupt
+    else:
+        pnl_data['total_realized'] = ZERO
+        pnl_data['daily_realized'] = ZERO
+        pnl_data['last_reset_date'] = str(date.today())
+        pnl_data['cost_basis'] = {}
 
 def save_pnl():
     try:
@@ -113,8 +119,8 @@ def save_pnl():
         with open(PNL_SUMMARY_FILE, 'w') as f:
             f.write(f"Total P&L: {pnl_data['total_realized']:.2f}\n")
             f.write(f"Daily P&L: {pnl_data['daily_realized']:.2f}\n")
-    except Exception:
-        pass
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] P&L save error: {e}")
 
 def reset_daily_pnl():
     today = str(date.today())
@@ -186,7 +192,7 @@ root.resizable(False, False)
 title_font     = tkfont.Font(family="Helvetica", size=18, weight="bold")   # unchanged
 button_font    = tkfont.Font(family="Helvetica", size=14, weight="bold")   # unchanged
 label_font     = tkfont.Font(family="Helvetica", size=14)                  # +2pt (was 12)
-pnl_font       = tkfont.Font(family="Helvetica", size=16)                  # +4pt total (was 12 → 14 → 16)
+pnl_font       = tkfont.Font(family="Helvetica", size=16)                  # +4pt total (was 12 → 16)
 term_font      = tkfont.Font(family="Courier", size=16)                    # +2pt (was 14)
 
 # Scrollable Frame Utility
@@ -516,6 +522,7 @@ def pnl_refresh_loop():
             continue
         try:
             load_pnl()
+            save_pnl()  # Ensure summary file is always up to date
             update_stats_labels()
         except Exception:
             terminal_insert(f"[{now_cst()}] P&L refresh error: {traceback.format_exc()}")
@@ -545,10 +552,13 @@ def display_pnl_summary_at_startup():
             terminal_insert(f"[{now_cst()}] Loaded P&L Summary:\n{summary}")
         except Exception as e:
             terminal_insert(f"[{now_cst()}] P&L summary load error: {e}")
+    else:
+        terminal_insert(f"[{now_cst()}] No P&L summary yet — will be created on first save.")
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
     load_pnl()
+    save_pnl()  # ←←← THIS LINE CREATES pnl_summary.txt EVEN ON FIRST RUN
     load_symbol_info()
     update_balances()
     min_usdt_reserve = account_balances.get('USDT', ZERO) * RESERVE_PCT
@@ -558,7 +568,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=start_user_stream, daemon=True).start()
     threading.Thread(target=start_price_ws, daemon=True).start()
-    threading.Thread(target=pnl_refresh_loop, daemon=True).start()  # Every 3 min
+    threading.Thread(target=pnl_refresh_loop, daemon=True).start()
 
     terminal_insert(f"[{now_cst()}] INFINITY GRID BOT 2025 READY")
     update_stats_labels()
