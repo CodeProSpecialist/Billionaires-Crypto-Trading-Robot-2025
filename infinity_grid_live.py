@@ -522,18 +522,48 @@ status_label.pack(side="left", padx=40)
 tk.Button(button_frame, text="START BOT", command=lambda: start_trading(), bg="#238636", fg="white", font=big_font, width=18, height=2).pack(side="right", padx=10)
 tk.Button(button_frame, text="STOP BOT", command=lambda: stop_trading(), bg="#da3633", fg="white", font=big_font, width=18, height=2).pack(side="right", padx=10)
 
+def get_realized_pnl_from_binance():
+    """Fetch REALIZED P&L directly from Binance income history (trades + fees)"""
+    try:
+        # Get all trade income (realized PnL + fees) for today and all time
+        income = client.get_income_history(limit=1000)
+        total_pnl = Decimal('0')
+        today_pnl = Decimal('0')
+        today = date.today()
+
+        for entry in income:
+            if entry['incomeType'] not in ['REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION']:
+                continue
+            amount = Decimal(entry['income'])
+            entry_date = datetime.fromtimestamp(entry['time'] / 1000).date()
+            
+            total_pnl += amount
+            if entry_date == today:
+                today_pnl += amount
+
+        return total_pnl, today_pnl
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] Binance P&L fetch error: {e}")
+        return pnl.total_realized, pnl.daily_realized  # fallback
+
 def update_gui():
     update_balances()
-    pnl.reset_daily_if_needed()
+    
+    # REAL P&L FROM BINANCE API (MOST ACCURATE)
+    total_realized, daily_realized = get_realized_pnl_from_binance()
+
     usdt = account_balances.get('USDT', ZERO)
-    total = pnl.total_realized
-    daily = pnl.daily_realized
+    
     usdt_label.config(text=f"USDT Balance: ${usdt:,.2f}")
-    total_pnl_label.config(text=f"Total P&L: ${total:+,.2f}", fg="#00ff00" if total >= 0 else "#ff4444")
-    pnl_24h_label.config(text=f"24h P&L: ${daily:+,.2f}", fg="#00ff00" if daily >= 0 else "#ff4444")
+    total_pnl_label.config(text=f"Total P&L (Binance): ${total_realized:+,.2f}", 
+                           fg="#00ff00" if total_realized >= 0 else "#ff4444")
+    pnl_24h_label.config(text=f"24h P&L (Binance): ${daily_realized:+,.2f}", 
+                         fg="#00ff00" if daily_realized >= 0 else "#ff4444")
     orders_label.config(text=f"Active Orders: {active_orders}")
-    status_label.config(text="Status: RUNNING" if running else "Status: Stopped", fg="#00ff00" if running else "#ff4444")
-    root.after(2000, update_gui)
+    status_label.config(text="Status: RUNNING" if running else "Status: Stopped", 
+                        fg="#00ff00" if running else "#ff4444")
+    
+    root.after(10000, update_gui)  # Refresh every 10 seconds is 10,000
 
 def start_trading():
     global running
