@@ -446,7 +446,7 @@ def save_pnl():
 # -------------------- GUI --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025 — FINAL")
-root.geometry("1200x1000")
+root.geometry("900x900")
 root.configure(bg="#0d1117")
 
 title_font = tkfont.Font(family="Helvetica", size=24, weight="bold")
