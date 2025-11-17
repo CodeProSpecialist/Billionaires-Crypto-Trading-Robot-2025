@@ -3,6 +3,7 @@
 INFINITY GRID BOT 2025 — BINANCE.US
 WebSocket: Order Fills | REST: P&L + Sell Logic + Grid
 33% USDT Reserve | Sell if not up in 5 OR 15 days
+NOW WITH ACCURATE PnL % (Total & Daily) DISPLAYED IN GUI
 """
 
 import os
@@ -179,18 +180,26 @@ class PnlTracker:
 
 pnl = PnlTracker()
 
-# Legacy dict for unrealized (GUI compatibility)
-pnl_data = {'unrealized': ZERO}
+# -------------------- P&L DATA (Extended for % Calculation) --------------------
+pnl_data = {
+    'unrealized': ZERO,
+    'total_cost': ZERO,        # Total invested USDT (including fees)
+    'current_value': ZERO,     # Current market value of all positions
+    'pnl_percent': ZERO,       # Total PnL in %
+    'daily_pnl_percent': ZERO  # Daily PnL in %
+}
 
 # -------------------- P&L Functions --------------------
 def load_pnl():
-    pass  # Data loaded in PnlTracker
+    pass
 
 def save_pnl():
     try:
         with open(PNL_SUMMARY_FILE, 'w') as f:
-            f.write(f"Total P&L: {pnl.total_realized:.2f}\n")
-            f.write(f"Daily P&L: {pnl.daily_realized:.2f}\n")
+            total_pnl_usd = pnl.total_realized + pnl_data['unrealized']
+            f.write(f"Total P&L: ${total_pnl_usd:+.2f}\n")
+            f.write(f"Daily P&L: ${pnl.daily_realized + (pnl_data['current_value'] - pnl_data['total_cost']):+.2f}\n")
+            f.write(f"Total PnL %: {pnl_data['pnl_percent']:+.2f}%\n")
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Summary write error: {e}")
 
@@ -217,18 +226,60 @@ def fetch_current_prices_for_assets(assets):
 def update_unrealized_pnl():
     assets = [a for a, (q, _) in pnl.cost_basis.items() if q > ZERO]
     if not assets:
-        pnl_data['unrealized'] = ZERO
+        pnl_data.update({
+            'unrealized': ZERO,
+            'total_cost': ZERO,
+            'current_value': ZERO,
+            'pnl_percent': ZERO,
+            'daily_pnl_percent': ZERO
+        })
         return ZERO
 
     prices = fetch_current_prices_for_assets(assets)
-    unrealized = ZERO
+    total_cost = ZERO
+    current_value = ZERO
+
     for asset in assets:
         qty, cost = pnl.get_cost_basis(asset)
+        total_cost += cost
         symbol = f"{asset}USDT"
         if symbol in prices:
-            unrealized += qty * prices[symbol] - cost
-    pnl_data['unrealized'] = unrealized
-    return unrealized
+            current_value += qty * prices[symbol]
+
+    unrealized_usd = current_value - total_cost
+    pnl_percent = (unrealized_usd / total_cost * 100) if total_cost > ZERO else ZERO
+
+    # Daily unrealized: price change since midnight CST
+    daily_unrealized = ZERO
+    today_start = datetime.now(CST).replace(hour=0, minute=0, second=0, microsecond=0)
+    for asset in assets:
+        qty, _ = pnl.get_cost_basis(asset)
+        symbol = f"{asset}USDT"
+        if symbol in prices:
+            try:
+                klines = client.get_historical_klines(
+                    symbol, Client.KLINE_INTERVAL_1DAY,
+                    str(today_start - timedelta(days=1)),
+                    str(today_start + timedelta(hours=1))
+                )
+                if klines:
+                    open_price = Decimal(klines[0][1])
+                    daily_unrealized += qty * (prices[symbol] - open_price)
+            except:
+                pass
+
+    daily_total_unrealized = daily_unrealized
+    daily_pnl_percent = ((pnl.daily_realized + daily_total_unrealized) / total_cost * 100) if total_cost > ZERO else ZERO
+
+    pnl_data.update({
+        'unrealized': unrealized_usd,
+        'total_cost': total_cost,
+        'current_value': current_value,
+        'pnl_percent': pnl_percent,
+        'daily_pnl_percent': daily_pnl_percent
+    })
+
+    return unrealized_usd
 
 def get_historical_closes(symbol, days):
     try:
@@ -252,14 +303,12 @@ def should_sell_asset(asset):
     try:
         current_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
 
-        # 5-day check
         closes_5 = get_historical_closes(symbol, 5)
         if closes_5 and closes_5[0] > ZERO:
             change_5 = (current_price - closes_5[0]) / closes_5[0]
             if change_5 > ZERO:
                 return False
 
-        # 15-day check
         closes_15 = get_historical_closes(symbol, 15)
         if closes_15 and closes_15[0] > ZERO:
             change_15 = (current_price - closes_15[0]) / closes_15[0]
@@ -307,7 +356,7 @@ def record_fill(symbol, side, qty, price, fee_usdt):
     if abs(pnl.daily_realized) >= Decimal('50'):
         send_whatsapp_alert(f"DAILY P&L: ${pnl.daily_realized:+.2f}")
 
-# -------------------- WEBSOCKETS (ORDER MESSAGES) --------------------
+# -------------------- WEBSOCKETS --------------------
 def on_user_message(ws, msg):
     try:
         d = json.loads(msg)
@@ -356,7 +405,7 @@ root.resizable(False, False)
 title_font  = tkfont.Font(family="Helvetica", size=18, weight="bold")
 button_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
 label_font  = tkfont.Font(family="Helvetica", size=14)
-pnl_font    = tkfont.Font(family="Helvetica", size=16)
+pnl_font    = tkfont.Font(family="Helvetica", size=16, weight="bold")
 term_font   = tkfont.Font(family="Courier", size=16)
 
 def create_scrollable_frame(parent, bg="#222222"):
@@ -372,7 +421,7 @@ def create_scrollable_frame(parent, bg="#222222"):
 
 tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font, fg="white", bg="#111111").pack(pady=10)
 
-stats_outer_frame = tk.Frame(root, bg="#111111", height=150)
+stats_outer_frame = tk.Frame(root, bg="#111111", height=180)
 stats_outer_frame.pack(fill="x", padx=10, pady=5)
 stats_outer_frame.pack_propagate(False)
 stats_scroll_frame, _ = create_scrollable_frame(stats_outer_frame, bg="#111111")
@@ -383,6 +432,8 @@ active_coins_label = tk.Label(stats_scroll_frame, text="Active Coins: 0", fg="li
 active_coins_label.pack(fill="x", pady=2)
 pnl_label = tk.Label(stats_scroll_frame, text="P&L: $0.00 (Today: $0.00)", fg="lime", bg="#111111", font=pnl_font, anchor="w")
 pnl_label.pack(fill="x", pady=2)
+pnl_percent_label = tk.Label(stats_scroll_frame, text="PnL %: +0.00% (Today: +0.00%)", fg="lime", bg="#111111", font=pnl_font, anchor="w")
+pnl_percent_label.pack(fill="x", pady=2)
 top_coins_label = tk.Label(stats_scroll_frame, text="Top Coins: Loading...", fg="lime", bg="#111111", font=label_font, anchor="w", justify="left", wraplength=860)
 top_coins_label.pack(fill="x", pady=2)
 
@@ -464,12 +515,27 @@ def update_stats_labels():
     active_coins_label.config(text=f"Active Coins: {active}")
 
     reset_daily_pnl()
-    unrealized = update_unrealized_pnl()
-    total_pnl = pnl.total_realized + unrealized
-    daily_pnl = pnl.daily_realized + unrealized
+    update_unrealized_pnl()
 
-    color = "lime" if total_pnl >= ZERO else "red"
-    pnl_label.config(text=f"P&L: ${total_pnl:+.2f} (Today: ${daily_pnl:+.2f})", fg=color)
+    total_pnl_usd = pnl.total_realized + pnl_data['unrealized']
+    daily_unrealized = pnl_data['current_value'] - pnl_data['total_cost']
+    daily_pnl_usd = pnl.daily_realized + daily_unrealized
+
+    color_usd = "lime" if total_pnl_usd >= ZERO else "red"
+    pnl_label.config(text=f"P&L: ${total_pnl_usd:+.2f} (Today: ${daily_pnl_usd:+.2f})", fg=color_usd)
+
+    # PnL Percentage
+    total_pct = ZERO
+    daily_pct = ZERO
+    if pnl_data['total_cost'] > ZERO:
+        total_pct = ((pnl.total_realized + pnl_data['unrealized']) / pnl_data['total_cost']) * 100
+        daily_pct = (daily_pnl_usd / pnl_data['total_cost']) * 100
+
+    color_pct = "lime" if total_pct >= ZERO else "red"
+    pnl_percent_label.config(
+        text=f"PnL %: {total_pct:+.2f}% (Today: {daily_pct:+.2f}%)",
+        fg=color_pct
+    )
 
     status_label.config(text="Status: Running" if running else "Status: Stopped", fg="lime" if running else "red")
 
