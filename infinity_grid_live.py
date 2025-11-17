@@ -446,7 +446,7 @@ def save_pnl():
 # -------------------- GUI --------------------
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025 — FINAL")
-root.geometry("900x900")
+root.geometry("900x700")
 root.configure(bg="#0d1117")
 
 title_font = tkfont.Font(family="Helvetica", size=24, weight="bold")
@@ -467,7 +467,7 @@ pnl_24h_label = tk.Label(stats, text="24h P&L: $0.00 (+0.00%)", font=big_font, f
 pnl_24h_label.pack(fill="x", pady=6)
 
 # Manual Rebalance Button
-rebalance_btn = tk.Button(root, text="🚨 REBALANCE NOW (Force All ≤5%) 🚨",
+rebalance_btn = tk.Button(root, text=" REBALANCE NOW (Force All ≤5%) ",
                           command=lambda: perform_rebalance("Manual"),
                           bg="#ff4444", fg="white", font=btn_font, height=2, width=40)
 rebalance_btn.pack(pady=15)
