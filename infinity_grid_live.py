@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — FINAL, 100% COMPLETE, ZERO MISSING CODE
-Public CoinGecko API (No Key) + RSI + MACD + Volume + Order Book + Golden Ratio
-Auto-Selects Top 8–12 Profitable /USDT Coins Every Hour
-November 17, 2025 — THE ULTIMATE GRID BOT. FULLY FUNCTIONAL.
+INFINITY GRID PLATINUM 2025 — OPTIMIZED PER-COIN GRID BOT
+Per-Coin Optimization: RSI, MACD, Volume, Order Book Bias, ATR-Adaptive Spacing
+CoinGecko Public API (No Key) + Binance.US + CallMeBot
+November 17, 2025 — MAX PROFIT PER COIN VIA TECHNICAL INDICATORS
 """
 
 import os
@@ -15,8 +15,7 @@ import requests
 from datetime import datetime, date, timedelta
 from decimal import Decimal, getcontext
 import tkinter as tk
-from tkinter import font as tkfont, messagebox  # Fixed typo
-from tkinter import messagebox, scrolledtext
+from tkinter import font as tkfont, messagebox, scrolledtext
 import pytz
 import websocket
 from binance.client import Client
@@ -241,7 +240,7 @@ def calculate_macd(prices, fast=12, slow=26):
 
 def generate_buy_list():
     global buy_list, last_buy_list_update
-    if time.time() - last_buy_list_update < 3600:
+    if time.time() - last_buy_list_update < 3600:  # Update every hour
         return
     try:
         coins = fetch_top_coins()
@@ -278,13 +277,14 @@ def generate_buy_list():
                     'macd': round(macd, 6),
                     '7d': round(change_7d, 2),
                     '14d': round(change_14d, 2),
+                    'volume': volume_24h
                 })
 
         buy_list = sorted(candidates, key=lambda x: x['score'], reverse=True)[:12]
         last_buy_list_update = time.time()
-        terminal_insert(f"[{now_cst()}] BUY LIST UPDATED — {len(buy_list)} COINS")
+        terminal_insert(f"[{now_cst()}] BUY LIST UPDATED — {len(buy_list)} COINS SELECTED")
         for c in buy_list:
-            terminal_insert(f"  → {c['symbol']} | Score {c['score']} | RSI {c['rsi']} | 7d {c['7d']}% | 14d {c['14d']}%")
+            terminal_insert(f"  → {c['symbol']} | Score {c['score']} | RSI {c['rsi']} | 7d {c['7d']}% | 14d {c['14d']}% | Vol ${c['volume']:,.0f}")
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Buy list error: {e}")
 
@@ -344,6 +344,7 @@ def record_fill(symbol, side, qty_str, price_str, fee_usdt):
             pnl.upsert_cost_basis(base, old_qty - qty, old_cost - cost_sold)
         pnl.update_realized(realized)
 
+    realized = pnl.total_realized
     msg = f"{side} {base} {qty:.8f} @ {price:.6f} → Profit ${realized:+.2f}"
     terminal_insert(f"[{now_cst()}] {msg}")
     send_whatsapp_alert(msg)
@@ -371,7 +372,7 @@ def start_user_stream():
                 key = client.stream_get_listen_key()['listenKey']
                 ws = websocket.WebSocketApp(
                     f"wss://stream.binance.us:9443/ws/{key}",
-                    on_message=lambda ws, msg: on_user_message(ws, msg),
+                    on_message=on_user_message,
                     on_close=lambda ws, *args: time.sleep(5)
                 )
                 ws.run_forever(ping_interval=1800)
@@ -392,7 +393,7 @@ def place_limit_order(symbol, side, price, qty):
 
     try:
         order = client.create_order(
-            symbol=symbol, side=side, type='LIMIT', timeIn2Force='GTC',
+            symbol=symbol, side=side, type='LIMIT', timeInForce='GTC',
             price=str(price), quantity=str(qty)
         )
         terminal_insert(f"[{now_cst()}] {side} {symbol} {qty} @ {price}")
@@ -417,17 +418,21 @@ def place_platinum_grid(symbol):
         step = info['stepSize']
         tick = info['tickSize']
 
+        rsi = get_rsi(symbol)
         atr = get_atr(symbol)
-        grid_pct = max(Decimal('0.005'), min((atr / price) * Decimal('1.5'), Decimal('0.03')))
         imbalance = get_orderbook_bias(symbol)
 
-        rsi_score = 1.0
-        size_multiplier = Decimal('1.0') + imbalance * Decimal('0.6')
+        grid_pct = max(Decimal('0.005'), min((atr / price) * Decimal('1.5'), Decimal('0.03')))
+
+        rsi_score = max(0, (70 - float(rsi)) / 40)
+        size_multiplier = Decimal('1.0') + Decimal(rsi_score) * Decimal('1.0') + imbalance * Decimal('0.6')
         size_multiplier = max(Decimal('0.5'), min(size_multiplier, Decimal('3.0')))
 
         buy_growth = GOLDEN_RATIO if imbalance > -0.2 else Decimal('1.3')
         sell_growth = SELL_GROWTH_OPTIMAL if imbalance < 0.2 else Decimal('1.6')
-        num_levels = 10
+
+        num_levels = 8 + int(rsi_score * 6)
+        num_levels = max(6, min(14, num_levels))
 
         cash = BASE_CASH_PER_LEVEL * size_multiplier
 
@@ -455,7 +460,7 @@ def place_platinum_grid(symbol):
                 place_limit_order(symbol, 'SELL', sell_price, qty)
                 owned -= qty
 
-        terminal_insert(f"[{now_cst()}] GRID {symbol} | Bias {imbalance:+.1%} | Levels {num_levels}")
+        terminal_insert(f"[{now_cst()}] PLATINUM GRID {symbol} | RSI {rsi:.1f} | Bias {imbalance:+.1%} | Levels {num_levels}")
 
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Grid error {symbol}: {e}")
@@ -466,6 +471,7 @@ def regrid_symbol(symbol):
     place_platinum_grid(symbol)
 
 def grid_cycle():
+    global active_orders
     while running:
         generate_buy_list()
         update_balances()
