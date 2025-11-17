@@ -522,93 +522,18 @@ status_label.pack(side="left", padx=40)
 tk.Button(button_frame, text="START BOT", command=lambda: start_trading(), bg="#238636", fg="white", font=big_font, width=18, height=2).pack(side="right", padx=10)
 tk.Button(button_frame, text="STOP BOT", command=lambda: stop_trading(), bg="#da3633", fg="white", font=big_font, width=18, height=2).pack(side="right", padx=10)
 
-def get_realized_pnl_from_binance():
-    """
-    Fetch REAL realized P&L from Binance spot trade history (trades + fees).
-    Returns (total_pnl, daily_pnl) — accurate to the penny.
-    """
-    try:
-        total_pnl = Decimal('0')
-        daily_pnl = Decimal('0')
-        today_start = int(datetime.combine(date.today(), datetime.min.time()).timestamp() * 1000)
-        today_end = int(datetime.now().timestamp() * 1000)
-
-        # Get all trade history (last 1000 trades — covers most accounts)
-        all_trades = []
-        for symbol in symbol_info.keys():  # Only USDT pairs
-            try:
-                trades = client.get_my_trades(symbol=symbol, limit=500)
-                all_trades.extend(trades)
-            except:
-                pass
-
-        # Sort by time
-        all_trades.sort(key=lambda x: x['time'])
-
-        # Process trades for P&L calculation
-        positions = {}  # {symbol: {'qty': 0, 'cost': 0}}
-        for trade in all_trades:
-            symbol = trade['symbol']
-            base = symbol.replace('USDT', '')
-            time_ms = int(trade['time'])
-            qty = Decimal(trade['qty'])
-            price = Decimal(trade['price'])
-            commission = Decimal(trade.get('commission', '0'))
-            commission_asset = trade.get('commissionAsset', 'USDT')
-            
-            notional = qty * price
-            fee_usdt = commission if commission_asset == 'USDT' else commission * price
-
-            if trade['isBuyer']:  # BUY
-                if symbol not in positions:
-                    positions[symbol] = {'qty': ZERO, 'cost': ZERO}
-                positions[symbol]['qty'] += qty
-                positions[symbol]['cost'] += notional + fee_usdt
-            else:  # SELL
-                if symbol in positions:
-                    pos = positions[symbol]
-                    if pos['qty'] > ZERO:
-                        avg_cost = pos['cost'] / pos['qty']
-                        cost_sold = avg_cost * qty
-                        trade_pnl = notional - fee_usdt - cost_sold
-                        total_pnl += trade_pnl
-                        if today_start <= time_ms <= today_end:
-                            daily_pnl += trade_pnl
-                        pos['qty'] -= qty
-                        pos['cost'] -= cost_sold
-                        if pos['qty'] <= ZERO:
-                            del positions[symbol]
-
-        # Subtract all fees (they're already in cost basis, but double-check)
-        fees = client.get_trade_fees()
-        for fee in fees.get('tradeFees', []):
-            if fee['symbol'].endswith('USDT'):
-                total_pnl -= Decimal(fee['commission'])
-                # Daily fee check would require time filter (not available, so approximate)
-
-        return total_pnl, daily_pnl
-    except Exception as e:
-        terminal_insert(f"[{now_cst()}] P&L fetch error: {e}")
-        return pnl.total_realized, pnl.daily_realized  # Fallback to your DB method
-
 def update_gui():
     update_balances()
-    
-    # Get REAL P&L from Binance API
-    total_realized, daily_realized = get_realized_pnl_from_binance()
-
+    pnl.reset_daily_if_needed()
     usdt = account_balances.get('USDT', ZERO)
-    
+    total = pnl.total_realized
+    daily = pnl.daily_realized
     usdt_label.config(text=f"USDT Balance: ${usdt:,.2f}")
-    total_pnl_label.config(text=f"Total P&L (Binance): ${total_realized:+,.2f}", 
-                           fg="#00ff00" if total_realized >= 0 else "#ff4444")
-    pnl_24h_label.config(text=f"24h P&L (Binance): ${daily_realized:+,.2f}", 
-                         fg="#00ff00" if daily_realized >= 0 else "#ff4444")
+    total_pnl_label.config(text=f"Total P&L: ${total:+,.2f}", fg="#00ff00" if total >= 0 else "#ff4444")
+    pnl_24h_label.config(text=f"24h P&L: ${daily:+,.2f}", fg="#00ff00" if daily >= 0 else "#ff4444")
     orders_label.config(text=f"Active Orders: {active_orders}")
-    status_label.config(text="Status: RUNNING" if running else "Status: Stopped", 
-                        fg="#00ff00" if running else "#ff4444")
-    
-    root.after(10000, update_gui)  # Refresh every 10 seconds
+    status_label.config(text="Status: RUNNING" if running else "Status: Stopped", fg="#00ff00" if running else "#ff4444")
+    root.after(2000, update_gui)
 
 def start_trading():
     global running
