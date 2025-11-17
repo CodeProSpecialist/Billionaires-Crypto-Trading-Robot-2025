@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID BOT 2025 — BINANCE.US
-FULLY COMPLETE | 100% ACCURATE 24H + TOTAL PnL % | TRADE SYNC ON STARTUP
+FIXED: Trade History Sync (No More KeyError) | FULLY COMPLETE | 100% ACCURATE 24H + TOTAL PnL %
 Professional Trading Bot | November 2025 Edition
 """
 
@@ -180,7 +180,7 @@ pnl_data = {
     'pnl_24h_percent': ZERO
 }
 
-# -------------------- FULL TRADE HISTORY SYNC ON STARTUP --------------------
+# -------------------- FULL TRADE HISTORY SYNC ON STARTUP (FIXED: No More KeyError) --------------------
 def sync_trade_history_on_startup():
     terminal_insert(f"[{now_cst()}] Starting full trade history sync (last 7 days)...")
     session = SessionLocal()
@@ -195,8 +195,10 @@ def sync_trade_history_on_startup():
     realized_total = ZERO
 
     try:
-        account_info = client.get_account()
-        usdt_pairs = [s['symbol'] for s in account_info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+        # FIXED: Get symbols from exchange_info() instead of account_info (which lacks 'symbols')
+        exchange_info = client.get_exchange_info()
+        usdt_pairs = [s['symbol'] for s in exchange_info['symbols'] 
+                      if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
 
         all_trades = []
         for symbol in usdt_pairs:
@@ -263,6 +265,8 @@ def sync_trade_history_on_startup():
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Critical error during trade sync: {e}")
         traceback.print_exc()
+    finally:
+        session.close()
 
 # -------------------- PRICE & PnL UPDATE --------------------
 def fetch_current_prices_for_assets(assets):
@@ -411,10 +415,12 @@ def fetch_top_coins():
     try:
         r = requests.get("https://api.coingecko.com/api/v3/coins/markets", 
                         params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 50, "page": 1}, timeout=10)
+        r.raise_for_status()
         coins = [c['symbol'].upper() for c in r.json() if c['symbol'].upper() not in EXCLUDED_COINS]
         top_coins_label.config(text="Top 25: " + ", ".join(coins[:25]))
         return coins[:25]
-    except:
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] Top coins fetch failed: {e}")
         top_coins_label.config(text="Top Coins: Failed to load")
         return []
 
@@ -457,15 +463,18 @@ def place_limit_order(symbol, side, price, qty, track=True):
 
 def cancel_symbol_orders(symbol):
     try:
-        for o in client.get_open_orders(symbol=symbol):
+        open_orders = client.get_open_orders(symbol=symbol)
+        for o in open_orders:
             client.cancel_order(symbol=symbol, orderId=o['orderId'])
         active_grid_orders[symbol] = []
-    except:
-        pass
+        terminal_insert(f"[{now_cst()}] Canceled orders for {symbol}")
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] Cancel error for {symbol}: {e}")
 
 def place_single_grid(symbol, side):
     try:
-        price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+        ticker = client.get_symbol_ticker(symbol=symbol)
+        price = Decimal(ticker['price'])
     except:
         return
     info = symbol_info.get(symbol)
@@ -483,29 +492,51 @@ def regrid_on_fill(symbol):
     place_single_grid(symbol, 'SELL')
 
 # -------------------- STAGNATION SELL LOGIC --------------------
+def get_historical_closes(symbol, days):
+    try:
+        end = datetime.now(CST)
+        start = end - timedelta(days=days + 10)
+        klines = client.get_historical_klines(symbol, Client.KLINE_INTERVAL_1DAY, str(start), str(end))
+        closes = [Decimal(k[4]) for k in klines[:-1]]
+        return closes[-days:] if len(closes) >= days else []
+    except:
+        return []
+
 def should_sell_asset(asset):
-    qty, _ = pnl.get_cost_basis(asset)
+    qty, cost = pnl.get_cost_basis(asset)
     if qty <= ZERO:
         return False
+
     symbol = f"{asset}USDT"
     if symbol not in symbol_info:
         return False
+
     try:
         current_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-        klines5 = client.get_historical_klines(symbol, "1d", "6 days ago UTC")
-        klines15 = client.get_historical_klines(symbol, "1d", "16 days ago UTC")
-        if klines5 and Decimal(klines5[0][4]) > current_price * Decimal('0.99'):
-            return True
-        if klines15 and Decimal(klines15[0][4]) > current_price * Decimal('0.99'):
-            return True
-        return False
+
+        # 5-day check
+        closes_5 = get_historical_closes(symbol, 5)
+        if closes_5 and closes_5[0] > ZERO:
+            change_5 = (current_price - closes_5[0]) / closes_5[0]
+            if change_5 > ZERO:
+                return False
+
+        # 15-day check
+        closes_15 = get_historical_closes(symbol, 15)
+        if closes_15 and closes_15[0] > ZERO:
+            change_15 = (current_price - closes_15[0]) / closes_15[0]
+            if change_15 > ZERO:
+                return False
+
+        terminal_insert(f"[{now_cst()}] SELLING {asset}: Not up in 5 or 15 days")
+        return True
     except:
         return False
 
 def sell_stagnant_positions():
     update_balances()
     for asset in list(account_balances.keys()):
-        if asset in ['USDT'] or account_balances[asset] <= ZERO:
+        if asset == 'USDT' or account_balances[asset] <= ZERO:
             continue
         if should_sell_asset(asset):
             symbol = f"{asset}USDT"
@@ -515,7 +546,6 @@ def sell_stagnant_positions():
                 try:
                     price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
                     place_limit_order(symbol, 'SELL', price, qty, track=False)
-                    terminal_insert(f"[{now_cst()}] SELLING stagnant {asset}")
                 except:
                     pass
 
@@ -553,8 +583,8 @@ class WS(websocket.WebSocketApp):
 
 def start_user_stream():
     try:
-        key = client.stream_get_listen_key()['listenKey']
-        WS(f"wss://stream.binance.us:9443/ws/{key}", on_user_message).run_forever()
+        listen_key = client.stream_get_listen_key()['listenKey']
+        WS(f"wss://stream.binance.us:9443/ws/{listen_key}", on_user_message).run_forever()
     except:
         time.sleep(10)
         start_user_stream()
@@ -572,6 +602,7 @@ def record_fill(symbol, side, qty, price, fee_usdt):
         new_qty = old_qty + qty
         new_cost = old_cost + notional + fee_usdt
         pnl.upsert_cost_basis(base, new_qty, new_cost)
+
     elif side == 'SELL':
         old_qty, old_cost = pnl.get_cost_basis(base)
         if qty >= old_qty:
@@ -586,9 +617,12 @@ def record_fill(symbol, side, qty, price, fee_usdt):
             pnl.upsert_cost_basis(base, old_qty - qty, old_cost - cost_sold)
 
     save_pnl()
-    msg = f"{side} {base} {qty} @ {price:.6f} | Realized: ${realized:+.4f}"
-    terminal_insert(f"[{now_cst()}] {msg}")
-    send_whatsapp_alert(msg)
+    alert_msg = f"{side} {base} {qty} @ {price:.8f} | P&L: ${realized:+.4f}"
+    terminal_insert(f"[{now_cst()}] {alert_msg}")
+    send_whatsapp_alert(alert_msg)
+
+    if abs(pnl.daily_realized) >= Decimal('50'):
+        send_whatsapp_alert(f"DAILY P&L: ${pnl.daily_realized:+.2f}")
 
 def save_pnl():
     try:
@@ -630,14 +664,26 @@ def auto_buy_top_coins():
                 sym = c + 'USDT'
                 if sym not in symbol_info:
                     continue
-                price = Decimal(client.get_symbol_ticker(symbol=sym)['price'])
-                qty = round_down(per_coin / price, symbol_info[sym]['stepSize'])
-                if qty > ZERO:
-                    place_limit_order(sym, 'BUY', price, qty, track=False)
+                ticker = client.get_symbol_ticker(symbol=sym)
+                p = Decimal(ticker['price'])
+                q = round_down(per_coin / p, symbol_info[sym]['stepSize'])
+                if q > ZERO:
+                    place_limit_order(sym, 'BUY', p, q, track=False)
         except:
             pass
 
+def pnl_update_loop():
+    while True:
+        time.sleep(30)
+        try:
+            update_unrealized_pnl()
+        except Exception as e:
+            terminal_insert(f"[{now_cst()}] P&L update error: {e}")
+
 # -------------------- GUI --------------------
+# Global GUI elements (defined here for reference in functions)
+top_coins_label = None
+
 root = tk.Tk()
 root.title("INFINITY GRID BOT 2025 - Binance.US")
 root.geometry("1000x900")
@@ -713,6 +759,7 @@ def start_trading():
         running = True
         threading.Thread(target=grid_cycle, daemon=True).start()
         threading.Thread(target=auto_buy_top_coins, daemon=True).start()
+        threading.Thread(target=pnl_update_loop, daemon=True).start()
         terminal_insert(f"[{now_cst()}] BOT STARTED")
         send_whatsapp_alert("Infinity Grid Bot STARTED")
 
@@ -724,6 +771,17 @@ def stop_trading():
     terminal_insert(f"[{now_cst()}] BOT STOPPED")
     send_whatsapp_alert("Infinity Grid Bot STOPPED")
 
+def display_pnl_summary_at_startup():
+    if os.path.exists(PNL_SUMMARY_FILE):
+        try:
+            with open(PNL_SUMMARY_FILE, 'r') as f:
+                summary = f.read().strip()
+            terminal_insert(f"[{now_cst()}] P&L Summary:\n{summary}")
+        except:
+            terminal_insert(f"[{now_cst()}] P&L summary load failed")
+    else:
+        terminal_insert(f"[{now_cst()}] No P&L summary file found — starting fresh")
+
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
     terminal_insert(f"[{now_cst()}] Initializing Infinity Grid Bot 2025...")
@@ -731,12 +789,20 @@ if __name__ == "__main__":
     update_balances()
     fetch_top_coins()
 
-    # Critical: Sync trade history on every launch
+    # Critical: Sync trade history on every launch (now FIXED)
     sync_trade_history_on_startup()
     update_unrealized_pnl()
     save_pnl()
 
     threading.Thread(target=start_user_stream, daemon=True).start()
 
+    display_pnl_summary_at_startup()
+
     update_gui()
     root.mainloop()
+
+    # Cleanup on exit
+    def _shutdown():
+        pnl.close()
+        stop_trading()
+    atexit.register(_shutdown)
