@@ -594,7 +594,7 @@ def get_realized_pnl_from_binance():
 def update_gui():
     update_balances()
     
-    # REAL P&L FROM BINANCE API (MOST ACCURATE)
+    # Get REAL P&L from Binance API
     total_realized, daily_realized = get_realized_pnl_from_binance()
 
     usdt = account_balances.get('USDT', ZERO)
@@ -608,7 +608,7 @@ def update_gui():
     status_label.config(text="Status: RUNNING" if running else "Status: Stopped", 
                         fg="#00ff00" if running else "#ff4444")
     
-    root.after(10000, update_gui)  # Refresh every 10 seconds is 10,000
+    root.after(10000, update_gui)  # Refresh every 10 seconds
 
 def start_trading():
     global running
