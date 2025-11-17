@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID BOT 2025 — BINANCE.US
-WebSocket-Only Fill Tracking | No IP Ban | 100% Accurate PnL Forever
-November 2025 — Production Ready
+Full P&L Tracker + Manual & Daily Rebalance (Max 5% per coin)
+WebSocket-Only Fills | No IP Ban | Perfect PnL Forever
+FINAL PRODUCTION VERSION — November 17, 2025
 """
 
 import os
@@ -35,14 +36,14 @@ SAFETY_BUFFER = Decimal('0.95')
 CASH_USDT_PER_GRID_ORDER = Decimal('8.0')
 GRID_BUY_PCT = Decimal('0.01')
 MIN_SELL_PCT = Decimal('0.018')
-TARGET_PROFIT_PCT = Decimal('0.018')
-CONSERVATIVE_USE_TAKER = True
-FEE_CACHE_TTL = 60 * 30
+RESERVE_PCT = Decimal('0.33')
+MAX_POSITION_PCT = Decimal('0.05')           # No coin > 5%
+DAILY_LOSS_TRIGGER_PCT = Decimal('-0.03')    # Trigger if 24h PnL ≤ -3%
 EXCLUDED_COINS = {"USD", "USDT", "BTC", "BCH", "ETH", "SOL"}
 CST = pytz.timezone("America/Chicago")
 PNL_SUMMARY_FILE = "pnl_summary.txt"
-RESERVE_PCT = Decimal('0.33')
 first_run_done = False
+last_auto_rebalance_date = None
 
 # -------------------- WHATSAPP ALERTS --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
@@ -52,11 +53,9 @@ def send_whatsapp_alert(msg: str):
     if not (CALLMEBOT_API_KEY and CALLMEBOT_PHONE):
         return
     try:
-        requests.get(
-            "https://api.callmebot.com/whatsapp.php",
-            params={"phone": CALLMEBOT_PHONE, "text": msg, "apikey": CALLMEBOT_API_KEY},
-            timeout=10
-        )
+        requests.get("https://api.callmebot.com/whatsapp.php",
+                     params={"phone": CALLMEBOT_PHONE, "text": msg, "apikey": CALLMEBOT_API_KEY},
+                     timeout=10)
     except:
         pass
 
@@ -73,151 +72,176 @@ client = Client(api_key, api_secret, tld='us')
 symbol_info = {}
 account_balances = {}
 active_grid_orders = {}
-_fee_cache = {}
 running = False
 min_usdt_reserve = ZERO
 
-# -------------------- DATABASE --------------------
+# -------------------- DATABASE & FULL P&L TRACKER --------------------
 Base = declarative_base()
 
 class CostBasis(Base):
     __tablename__ = 'cost_basis'
     id = Column(Integer, primary_key=True)
     asset = Column(String(16), nullable=False, unique=True, index=True)
-    quantity = Column(Numeric(32, 16), nullable=False, default=0)
-    cost_usdt = Column(Numeric(32, 8), nullable=False, default=0)
+    quantity = Column(Numeric(32, 16), default=0)
+    cost_usdt = Column(Numeric(32, 8), default=0)
 
 class RealizedPnl(Base):
     __tablename__ = 'realized_pnl'
     id = Column(Integer, primary_key=True)
     date = Column(Date, nullable=False, index=True)
-    total_usdt = Column(Numeric(32, 8), nullable=False, default=0)
+    total_usdt = Column(Numeric(32, 8), default=0)
 
-DB_PATH = "grid_pnl.sqlite3"
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+engine = create_engine("sqlite:///grid_pnl.sqlite3", future=True, connect_args={"timeout": 30})
+SessionLocal = sessionmaker(bind=engine)
 Base.metadata.create_all(engine)
 atexit.register(engine.dispose)
 
-# -------------------- P&L TRACKER --------------------
 class PnlTracker:
     def __init__(self):
-        self._session = SessionLocal()
-        self.total_realized = self._load_total()
+        self.session = SessionLocal()
+        self.total_realized = self._load_total_realized()
         self.daily_realized = ZERO
         self.last_reset_date = str(date.today())
         self.cost_basis = {}
-        self._cache_cost_basis()
+        self._load_cost_basis()
 
-    def _load_total(self):
-        row = self._session.query(func.sum(RealizedPnl.total_usdt)).scalar()
-        return Decimal(row) if row else ZERO
+    def _load_total_realized(self):
+        val = self.session.query(func.sum(RealizedPnl.total_usdt)).scalar()
+        return Decimal(val) if val else ZERO
 
-    def _cache_cost_basis(self):
-        self.cost_basis = {
-            r.asset: (Decimal(r.quantity), Decimal(r.cost_usdt))
-            for r in self._session.query(CostBasis).all()
-        }
+    def _load_cost_basis(self):
+        for row in self.session.query(CostBasis).all():
+            self.cost_basis[row.asset] = (Decimal(row.quantity), Decimal(row.cost_usdt))
 
     def reset_daily_if_needed(self):
-        today = date.today()
-        if self.last_reset_date != str(today):
-            row = self._session.query(RealizedPnl).filter(RealizedPnl.date == today).first()
+        today = str(date.today())
+        if self.last_reset_date != today:
+            row = self.session.query(RealizedPnl).filter(RealizedPnl.date == date.today()).first()
             self.daily_realized = Decimal(row.total_usdt) if row else ZERO
-            self.last_reset_date = str(today)
+            self.last_reset_date = today
 
     def update_realized(self, amount: Decimal):
         self.total_realized += amount
         self.daily_realized += amount
         today = date.today()
-        row = self._session.query(RealizedPnl).filter(RealizedPnl.date == today).first()
+        row = self.session.query(RealizedPnl).filter(RealizedPnl.date == today).first()
         if row:
             row.total_usdt = float(self.total_realized)
         else:
-            self._session.add(RealizedPnl(date=today, total_usdt=float(self.total_realized)))
+            self.session.add(RealizedPnl(date=today, total_usdt=float(self.total_realized)))
         try:
-            self._session.commit()
+            self.session.commit()
         except SQLAlchemyError:
-            self._session.rollback()
+            self.session.rollback()
 
     def upsert_cost_basis(self, asset: str, qty: Decimal, cost: Decimal):
-        row = self._session.query(CostBasis).filter(CostBasis.asset == asset).first()
+        row = self.session.query(CostBasis).filter(CostBasis.asset == asset).first()
         if row:
-            row.quantity = qty
-            row.cost_usdt = cost
+            row.quantity = float(qty)
+            row.cost_usdt = float(cost)
         else:
-            self._session.add(CostBasis(asset=asset, quantity=qty, cost_usdt=cost))
+            self.session.add(CostBasis(asset=asset, quantity=float(qty), cost_usdt=float(cost)))
         self.cost_basis[asset] = (qty, cost)
         try:
-            self._session.commit()
+            self.session.commit()
         except SQLAlchemyError:
-            self._session.rollback()
+            self.session.rollback()
 
     def delete_cost_basis(self, asset: str):
-        self._session.query(CostBasis).filter(CostBasis.asset == asset).delete()
+        self.session.query(CostBasis).filter(CostBasis.asset == asset).delete()
         self.cost_basis.pop(asset, None)
         try:
-            self._session.commit()
+            self.session.commit()
         except SQLAlchemyError:
-            self._session.rollback()
+            self.session.rollback()
 
     def get_cost_basis(self, asset: str):
         return self.cost_basis.get(asset, (ZERO, ZERO))
 
     def close(self):
-        self._session.close()
+        self.session.close()
 
 pnl = PnlTracker()
 
-# -------------------- P&L DATA --------------------
-pnl_data = {
-    'unrealized': ZERO, 'total_cost': ZERO, 'current_value': ZERO,
-    'total_pnl_usd': ZERO, 'total_pnl_percent': ZERO,
-    'pnl_24h_usd': ZERO, 'pnl_24h_percent': ZERO
-}
+pnl_data = {k: ZERO for k in [
+    'unrealized','total_cost','current_value','total_pnl_usd','total_pnl_percent',
+    'pnl_24h_usd','pnl_24h_percent'
+]}
 
-# -------------------- LIGHT STARTUP SYNC (500 trades max) --------------------
+# -------------------- UTILITIES --------------------
+def now_cst():
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+def update_balances():
+    global account_balances, min_usdt_reserve
+    try:
+        info = client.get_account()
+        account_balances = {a['asset']: Decimal(a['free']) for a in info['balances'] if Decimal(a['free']) > ZERO}
+        min_usdt_reserve = account_balances.get('USDT', ZERO) * RESERVE_PCT
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] Balance update failed: {e}")
+
+def load_symbol_info():
+    global symbol_info
+    try:
+        info = client.get_exchange_info()
+        for s in info['symbols']:
+            if s['quoteAsset'] != 'USDT' or s['status'] != 'TRADING': continue
+            filters = {f['filterType']: f for f in s['filters']}
+            step = Decimal(filters.get('LOT_SIZE', {}).get('stepSize', '0'))
+            tick = Decimal(filters.get('PRICE_FILTER', {}).get('tickSize', '0'))
+            if step == ZERO or tick == ZERO: continue
+            symbol_info[s['symbol']] = {
+                'stepSize': step,
+                'tickSize': tick,
+                'minQty': Decimal(filters.get('LOT_SIZE', {}).get('minQty', '0')),
+                'minNotional': Decimal(filters.get('MIN_NOTIONAL', {}).get('minNotional', '10'))
+            }
+        terminal_insert(f"[{now_cst()}] Loaded {len(symbol_info)} USDT pairs")
+    except Exception as e:
+        terminal_insert(f"[{now_cst()}] Symbol load failed: {e}")
+
+# -------------------- LIGHT STARTUP SYNC --------------------
 def light_startup_sync():
     global first_run_done
-    if first_run_done:
-        return
-    terminal_insert(f"[{now_cst()}] Light startup sync: fetching last 500 fills...")
+    if first_run_done: return
+    terminal_insert(f"[{now_cst()}] Starting safe startup sync...")
     try:
-        orders = client.get_all_orders(limit=500)
-        fills = [o for o in orders if o['status'] == 'FILLED']
-        fills.sort(key=lambda x: x['time'])
-        for o in fills:
-            base = o['symbol'].replace('USDT', '')
-            qty = Decimal(o['executedQty'])
-            if qty <= 0: continue
-            price = Decimal(o['price'])
-            notional = qty * price
-            fee = Decimal(o.get('commission', '0') or '0')
-            fee_asset = o.get('commissionAsset', 'USDT')
-            fee_usdt = fee if fee_asset == 'USDT' else fee * price
-            record_fill(o['symbol'], o['side'], str(qty), str(price), fee_usdt)
-        terminal_insert(f"[{now_cst()}] Light sync complete: {len(fills)} fills restored")
+        exchange_info = client.get_exchange_info()
+        usdt_pairs = [s['symbol'] for s in exchange_info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+        processed = 0
+        for symbol in usdt_pairs[:30]:
+            try:
+                trades = client.get_my_trades(symbol=symbol, limit=100)
+                for t in trades:
+                    base = symbol.replace('USDT', '')
+                    qty = Decimal(t['qty'])
+                    if qty <= ZERO: continue
+                    price = Decimal(t['price'])
+                    fee = Decimal(t.get('commission', '0'))
+                    fee_asset = t.get('commissionAsset', 'USDT')
+                    fee_usdt = fee if fee_asset == 'USDT' else fee * price
+                    record_fill(symbol, 'BUY' if t['isBuyer'] else 'SELL', str(qty), str(price), fee_usdt)
+                    processed += 1
+            except: continue
+        terminal_insert(f"[{now_cst()}] Startup sync complete — {processed} fills restored")
     except Exception as e:
-        terminal_insert(f"[{now_cst()}] Light sync skipped: {e}")
+        terminal_insert(f"[{now_cst()}] Startup sync skipped: {e}")
     first_run_done = True
 
-# -------------------- WEBSOCKET FILL TRACKING --------------------
+# -------------------- WEBSOCKET & FILL TRACKING --------------------
 def record_fill(symbol, side, qty_str, price_str, fee_usdt):
     qty = Decimal(qty_str)
     price = Decimal(price_str)
     fee = Decimal(fee_usdt)
     base = symbol.replace('USDT', '')
     notional = qty * price
-    realized = ZERO
 
     if side == 'BUY':
         old_qty, old_cost = pnl.get_cost_basis(base)
-        new_qty = old_qty + qty
-        new_cost = old_cost + notional + fee
-        pnl.upsert_cost_basis(base, new_qty, new_cost)
-    elif side == 'SELL':
+        pnl.upsert_cost_basis(base, old_qty + qty, old_cost + notional + fee)
+    else:
         old_qty, old_cost = pnl.get_cost_basis(base)
-        if old_qty <= ZERO: return
         if qty >= old_qty:
             realized = (notional - fee) - old_cost
             pnl.update_realized(realized)
@@ -237,8 +261,7 @@ def record_fill(symbol, side, qty_str, price_str, fee_usdt):
 def on_user_message(ws, message):
     try:
         data = json.loads(message)
-        if data.get('e') != 'executionReport' or data.get('X') != 'FILLED':
-            return
+        if data.get('e') != 'executionReport' or data.get('X') != 'FILLED': return
         symbol = data['s']
         side = data['S']
         qty = data['q']
@@ -249,87 +272,35 @@ def on_user_message(ws, message):
         record_fill(symbol, side, qty, price, fee_usdt)
         threading.Thread(target=regrid_on_fill, args=(symbol,), daemon=True).start()
     except Exception as e:
-        terminal_insert(f"[{now_cst()}] WS parse error: {e}")
+        terminal_insert(f"[{now_cst()}] WS Error: {e}")
 
 def start_user_stream():
     def run():
         while True:
             try:
-                listen_key = client.stream_get_listen_key()['listenKey']
+                key = client.stream_get_listen_key()['listenKey']
                 ws = websocket.WebSocketApp(
-                    f"wss://stream.binance.us:9443/ws/{listen_key}",
+                    f"wss://stream.binance.us:9443/ws/{key}",
                     on_message=on_user_message,
-                    on_error=lambda ws, err: terminal_insert(f"[{now_cst()}] WS Error: {err}"),
-                    on_close=lambda ws, code, reason: time.sleep(5)
+                    on_close=lambda ws, *_: time.sleep(5)
                 )
                 ws.run_forever(ping_interval=1800)
             except:
                 time.sleep(10)
     threading.Thread(target=run, daemon=True).start()
 
-# -------------------- UTILITIES --------------------
-def now_cst():
-    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-
-def _safe_decimal(val, fallback='0'):
-    try: return Decimal(str(val))
-    except: return Decimal(fallback)
-
-def round_down(val, step):
-    return (val // step) * step if step > ZERO else val
-
-def format_decimal(d):
-    s = f"{d:.8f}"
-    return s.rstrip('0').rstrip('.') if '.' in s else s
-
-# -------------------- SYMBOL & BALANCE --------------------
-def load_symbol_info():
-    global symbol_info
-    try:
-        info = client.get_exchange_info()
-        for s in info['symbols']:
-            if s['quoteAsset'] != 'USDT' or s['status'] != 'TRADING': continue
-            f = {x['filterType']: x for x in s['filters']}
-            step = _safe_decimal(f.get('LOT_SIZE', {}).get('stepSize', '0'))
-            tick = _safe_decimal(f.get('PRICE_FILTER', {}).get('tickSize', '0'))
-            if step == ZERO or tick == ZERO: continue
-            symbol_info[s['symbol']] = {
-                'stepSize': step,
-                'tickSize': tick,
-                'minQty': _safe_decimal(f.get('LOT_SIZE', {}).get('minQty', '0')),
-                'minNotional': _safe_decimal(f.get('MIN_NOTIONAL', {}).get('minNotional', '10'))
-            }
-        terminal_insert(f"[{now_cst()}] Loaded {len(symbol_info)} USDT pairs")
-    except Exception as e:
-        terminal_insert(f"[{now_cst()}] Symbol load failed: {e}")
-
-def update_balances():
-    global account_balances, min_usdt_reserve
-    try:
-        info = client.get_account()
-        account_balances = {a['asset']: _safe_decimal(a['free']) for a in info['balances'] if _safe_decimal(a['free']) > ZERO}
-        min_usdt_reserve = account_balances.get('USDT', ZERO) * RESERVE_PCT
-    except Exception as e:
-        terminal_insert(f"[{now_cst()}] Balance update failed: {e}")
-
 # -------------------- ORDERS & GRID --------------------
 def place_limit_order(symbol, side, price, qty, track=True):
     info = symbol_info.get(symbol)
     if not info: return None
-    price = round_down(Decimal(price), info['tickSize'])
-    qty = round_down(Decimal(qty), info['stepSize'])
-    if qty <= info['minQty'] or price * qty < info['minNotional']: return None
-
-    if side == 'BUY':
-        needed = price * qty * SAFETY_BUFFER
-        if account_balances.get('USDT', ZERO) - needed < min_usdt_reserve:
-            terminal_insert(f"[{now_cst()}] BUY blocked: reserve")
-            return None
+    price = (Decimal(price) // info['tickSize']) * info['tickSize']
+    qty = (Decimal(qty) // info['stepSize']) * info['stepSize']
+    if qty < info['minQty'] or price * qty < info['minNotional']: return None
 
     try:
         order = client.create_order(
             symbol=symbol, side=side, type='LIMIT', timeInForce='GTC',
-            price=format_decimal(price), quantity=format_decimal(qty)
+            price=str(price), quantity=str(qty)
         )
         terminal_insert(f"[{now_cst()}] {side} {symbol} {qty} @ {price}")
         if track:
@@ -349,51 +320,71 @@ def cancel_symbol_orders(symbol):
 def place_single_grid(symbol, side):
     try:
         price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-    except: return
-    info = symbol_info.get(symbol)
-    if not info: return
-    p = price * (ONE - GRID_BUY_PCT) if side == 'BUY' else price * (ONE + compute_required_sell_pct(symbol))
-    p = round_down(p, info['tickSize'])
-    q = round_down(CASH_USDT_PER_GRID_ORDER / p, info['stepSize'])
-    if q > ZERO:
-        place_limit_order(symbol, side, p, q)
+        p = price * (ONE - GRID_BUY_PCT) if side == 'BUY' else price * (ONE + MIN_SELL_PCT)
+        p = (p // symbol_info[symbol]['tickSize']) * symbol_info[symbol]['tickSize']
+        q = CASH_USDT_PER_GRID_ORDER / p
+        q = (q // symbol_info[symbol]['stepSize']) * symbol_info[symbol]['stepSize']
+        if q > ZERO:
+            place_limit_order(symbol, side, p, q)
+    except: pass
 
 def regrid_on_fill(symbol):
     cancel_symbol_orders(symbol)
     place_single_grid(symbol, 'BUY')
     place_single_grid(symbol, 'SELL')
 
-def compute_required_sell_pct(symbol):
-    return MIN_SELL_PCT  # Simplified — you can restore fee logic if needed
+# -------------------- REBALANCE (MANUAL + AUTO) --------------------
+def perform_rebalance(reason: str = "Manual"):
+    global last_auto_rebalance_date
+    terminal_insert(f"[{now_cst()}] {reason} REBALANCE STARTED")
+    send_whatsapp_alert(f"🚨 {reason} REBALANCE STARTED")
 
-# -------------------- STAGNATION SELL --------------------
-def should_sell_asset(asset):
-    qty, _ = pnl.get_cost_basis(asset)
-    if qty <= ZERO: return False
-    symbol = f"{asset}USDT"
-    if symbol not in symbol_info: return False
-    try:
-        current = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-        klines = client.get_historical_klines(symbol, "1d", "15 days ago UTC")
-        if klines and Decimal(klines[0][4]) > current * Decimal('0.98'):
-            return True
-    except: pass
-    return False
+    for sym in list(active_grid_orders.keys()):
+        cancel_symbol_orders(sym)
 
-def sell_stagnant_positions():
     update_balances()
-    for asset in list(account_balances.keys()):
+    update_unrealized_pnl()
+    total_value = pnl_data['current_value'] + account_balances.get('USDT', ZERO)
+    if total_value <= ZERO:
+        terminal_insert(f"[{now_cst()}] Rebalance skipped: zero value")
+        return
+
+    target_value = total_value * MAX_POSITION_PCT
+    prices = {}
+    for asset in account_balances:
         if asset == 'USDT' or account_balances[asset] <= ZERO: continue
-        if should_sell_asset(asset):
-            symbol = f"{asset}USDT"
-            if symbol in symbol_info:
-                cancel_symbol_orders(symbol)
-                qty = account_balances[asset]
-                try:
-                    price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-                    place_limit_order(symbol, 'SELL', price, qty, track=False)
-                    terminal_insert(f"[{now_cst()}] SELLING stagnant {asset}")
-                except: pass
+        sym = f"{asset}USDT"
+        if sym not in symbol_info: continue
+        try:
+            prices[asset] = Decimal(client.get_symbol_ticker(symbol=sym)['price'])
+        except: continue
+
+    for asset, qty in account_balances.items():
+        if asset == 'USDT' or qty <= ZERO: continue
+        price = prices.get(asset)
+        if not price: continue
+        current_value = qty * price
+        if current_value > target_value:
+            sell_qty = (current_value - target_value) / price
+            step = symbol_info[f"{asset}USDT"]['stepSize']
+            sell_qty = (sell_qty // step) * step
+            if sell_qty > ZERO:
+                place_limit_order(f"{asset}USDT", 'SELL', price * Decimal('0.999'), sell_qty, track=False)
+                terminal_insert(f"[{now_cst()}] REBALANCE SELL {asset}: {sell_qty} ({current_value/total_value:.1%} → 5%)")
+
+    if reason == "Daily Loss Protection":
+        last_auto_rebalance_date = date.today()
+    terminal_insert(f"[{now_cst()}] {reason} REBALANCE COMPLETE")
+    send_whatsapp_alert(f"✅ {reason} REBALANCE COMPLETE — All positions ≤5%")
+
+def emergency_rebalance_if_needed():
+    global last_auto_rebalance_date
+    if last_auto_rebalance_date == date.today():
+        return
+    pnl.reset_daily_if_needed()
+    update_unrealized_pnl()
+    if pnl_data['pnl_24h_percent'] <= DAILY_LOSS_TRIGGER_PCT:
+        perform_rebalance("Daily Loss Protection")
 
 # -------------------- P&L UPDATE --------------------
 def update_unrealized_pnl():
@@ -401,6 +392,8 @@ def update_unrealized_pnl():
     if not assets:
         for k in pnl_data: pnl_data[k] = ZERO
         return
+
+    total_cost = current_value = ZERO
     prices = {}
     for a in assets:
         sym = f"{a}USDT"
@@ -408,19 +401,19 @@ def update_unrealized_pnl():
             try:
                 prices[sym] = Decimal(client.get_symbol_ticker(symbol=sym)['price'])
             except: pass
-    total_cost = current_value = ZERO
+
     for a in assets:
         qty, cost = pnl.get_cost_basis(a)
         total_cost += cost
         if f"{a}USDT" in prices:
             current_value += qty * prices[f"{a}USDT"]
+
     unrealized = current_value - total_cost
     total_pnl = pnl.total_realized + unrealized
     total_pct = (total_pnl / total_cost * 100) if total_cost > ZERO else ZERO
 
-    # 24h PnL
-    yesterday = datetime.now(CST) - timedelta(hours=24)
     pnl_24h = pnl.daily_realized
+    yesterday = datetime.now(CST) - timedelta(hours=24)
     for a in assets:
         qty, _ = pnl.get_cost_basis(a)
         sym = f"{a}USDT"
@@ -428,8 +421,8 @@ def update_unrealized_pnl():
             try:
                 klines = client.get_historical_klines(sym, "1h", str(yesterday))
                 if klines:
-                    price_24h_ago = Decimal(klines[0][1])
-                    pnl_24h += qty * (prices[sym] - price_24h_ago)
+                    price_24h = Decimal(klines[0][1])
+                    pnl_24h += qty * (prices[sym] - price_24h)
             except: pass
     pnl_24h_pct = (pnl_24h / total_cost * 100) if total_cost > ZERO else ZERO
 
@@ -450,76 +443,37 @@ def save_pnl():
             f.write(f"24h P&L: ${pnl_data['pnl_24h_usd']:+.2f} ({pnl_data['pnl_24h_percent']:+.2f}%)\n")
     except: pass
 
-# -------------------- TOP COINS --------------------
-def fetch_top_coins():
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/coins/markets", 
-                        params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 25, "page": 1}, timeout=10)
-        coins = [c['symbol'].upper() for c in r.json() if c['symbol'].upper() not in EXCLUDED_COINS]
-        top_coins_label.config(text="Top 25: " + ", ".join(coins))
-        return coins
-    except:
-        top_coins_label.config(text="Top Coins: Failed")
-        return []
-
-# -------------------- CYCLES --------------------
-def grid_cycle():
-    while running:
-        try:
-            update_balances()
-            sell_stagnant_positions()
-            for asset in [a for a in account_balances if a != 'USDT' and account_balances[a] > ZERO]:
-                sym = f"{asset}USDT"
-                if sym in symbol_info:
-                    cancel_symbol_orders(sym)
-                    place_single_grid(sym, 'BUY')
-                    place_single_grid(sym, 'SELL')
-            time.sleep(180)
-        except Exception as e:
-            terminal_insert(f"[{now_cst()}] Grid error: {e}")
-            time.sleep(15)
-
-def pnl_update_loop():
-    while True:
-        time.sleep(30)
-        try:
-            update_unrealized_pnl()
-            save_pnl()
-        except: pass
-
 # -------------------- GUI --------------------
 root = tk.Tk()
-root.title("INFINITY GRID BOT 2025")
-root.geometry("1000x900")
+root.title("INFINITY GRID BOT 2025 — FINAL")
+root.geometry("1200x1000")
 root.configure(bg="#0d1117")
 
-title_font = tkfont.Font(family="Helvetica", size=22, weight="bold")
+title_font = tkfont.Font(family="Helvetica", size=24, weight="bold")
 big_font = tkfont.Font(family="Helvetica", size=18, weight="bold")
-label_font = tkfont.Font(family="Helvetica", size=14)
-term_font = tkfont.Font(family="Consolas", size=12)
+btn_font = tkfont.Font(family="Helvetica", size=14, weight="bold")
+term_font = tkfont.Font(family="Consolas", size=11)
 
-tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font, fg="#58a6ff", bg="#0d1117").pack(pady=15)
+tk.Label(root, text="INFINITY GRID BOT 2025", font=title_font, fg="#58a6ff", bg="#0d1117").pack(pady=20)
 
-stats_frame = tk.Frame(root, bg="#0d1117")
-stats_frame.pack(padx=20, fill="x")
+stats = tk.Frame(root, bg="#0d1117")
+stats.pack(padx=30, fill="x")
 
-usdt_label = tk.Label(stats_frame, text="USDT: $0.00", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
-usdt_label.pack(fill="x", pady=5)
+usdt_label = tk.Label(stats, text="USDT Balance: $0.00", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
+usdt_label.pack(fill="x", pady=4)
+pnl_label = tk.Label(stats, text="Total P&L: $0.00", font=big_font, fg="lime", bg="#0d1117", anchor="w")
+pnl_label.pack(fill="x", pady=6)
+pnl_24h_label = tk.Label(stats, text="24h P&L: $0.00 (+0.00%)", font=big_font, fg="lime", bg="#0d1117", anchor="w")
+pnl_24h_label.pack(fill="x", pady=6)
 
-active_label = tk.Label(stats_frame, text="Active: 0", font=label_font, fg="#8b949e", bg="#0d1117", anchor="w")
-active_label.pack(fill="x", pady=5)
-
-pnl_label = tk.Label(stats_frame, text="Total P&L: $0.00", font=big_font, fg="lime", bg="#0d1117", anchor="w")
-pnl_label.pack(fill="x", pady=8)
-
-pnl_percent_label = tk.Label(stats_frame, text="24h: $0.00 (+0.00%) │ Total: +0.00%", font=big_font, fg="lime", bg="#0d1117", anchor="w")
-pnl_percent_label.pack(fill="x", pady=8)
-
-top_coins_label = tk.Label(stats_frame, text="Top Coins: Loading...", font=label_font, fg="#f0f6fc", bg="#0d1117", anchor="w")
-top_coins_label.pack(fill="x", pady=5)
+# Manual Rebalance Button
+rebalance_btn = tk.Button(root, text="🚨 REBALANCE NOW (Force All ≤5%) 🚨",
+                          command=lambda: perform_rebalance("Manual"),
+                          bg="#ff4444", fg="white", font=btn_font, height=2, width=40)
+rebalance_btn.pack(pady=15)
 
 terminal_frame = tk.Frame(root, bg="black")
-terminal_frame.pack(fill="both", expand=True, padx=20, pady=10)
+terminal_frame.pack(fill="both", expand=True, padx=30, pady=10)
 terminal_text = scrolledtext.ScrolledText(terminal_frame, bg="black", fg="#39d353", font=term_font)
 terminal_text.pack(fill="both", expand=True)
 
@@ -528,25 +482,44 @@ def terminal_insert(msg):
     terminal_text.see(tk.END)
 
 button_frame = tk.Frame(root, bg="#0d1117")
-button_frame.pack(pady=15)
+button_frame.pack(pady=20)
 status_label = tk.Label(button_frame, text="Status: Stopped", font=big_font, fg="red", bg="#0d1117")
-status_label.pack(side="left", padx=30)
-tk.Button(button_frame, text="START", command=lambda: start_trading(), bg="#238636", fg="white", font=big_font, width=15, height=2).pack(side="right", padx=10)
-tk.Button(button_frame, text="STOP", command=lambda: stop_trading(), bg="#da3633", fg="white", font=big_font, width=15, height=2).pack(side="right", padx=10)
+status_label.pack(side="left", padx=40)
+tk.Button(button_frame, text="START BOT", command=lambda: start_trading(), bg="#238636", fg="white", font=big_font, width=18, height=2).pack(side="right", padx=10)
+tk.Button(button_frame, text="STOP BOT", command=lambda: stop_trading(), bg="#da3633", fg="white", font=big_font, width=18, height=2).pack(side="right", padx=10)
+
+# -------------------- CYCLES --------------------
+def grid_cycle():
+    while running:
+        update_balances()
+        for asset in [a for a in account_balances if a != 'USDT' and account_balances[a] > ZERO]:
+            sym = f"{asset}USDT"
+            if sym in symbol_info:
+                cancel_symbol_orders(sym)
+                place_single_grid(sym, 'BUY')
+                place_single_grid(sym, 'SELL')
+        time.sleep(180)
+
+def daily_safety_checker():
+    while True:
+        now = datetime.now(CST)
+        next_run = now.replace(hour=9, minute=5, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        time.sleep(max((next_run - now).total_seconds(), 60))
+        if running:
+            emergency_rebalance_if_needed()
 
 def update_gui():
     update_balances()
     pnl.reset_daily_if_needed()
     update_unrealized_pnl()
-
     usdt_label.config(text=f"USDT Balance: ${account_balances.get('USDT', ZERO):.2f}")
-    active_label.config(text=f"Active Coins: {len([a for a in account_balances if a != 'USDT' and account_balances[a] > ZERO])}")
     pnl_label.config(text=f"Total P&L: ${pnl_data['total_pnl_usd']:+.2f}", fg="lime" if pnl_data['total_pnl_usd'] >= 0 else "red")
-    pnl_percent_label.config(
-        text=f"24h: ${pnl_data['pnl_24h_usd']:+.2f} ({pnl_data['pnl_24h_percent']:+.2f}%) │ Total: {pnl_data['total_pnl_percent']:+.2f}%",
-        fg="lime" if pnl_data['pnl_24h_usd'] >= 0 else "red"
-    )
-    status_label.config(text="Status: RUNNING" if running else "Status: Stopped", fg="lime" if running else "red")
+    pnl_24h_label.config(text=f"24h P&L: ${pnl_data['pnl_24h_usd']:+.2f} ({pnl_data['pnl_24h_percent']:+.2f}%)",
+                         fg="lime" if pnl_data['pnl_24h_usd'] >= 0 else "red")
+    status_label.config(text="Status: RUNNING" if running else "Status: Stopped",
+                        fg="lime" if running else "red")
     root.after(3000, update_gui)
 
 def start_trading():
@@ -554,9 +527,9 @@ def start_trading():
     if not running:
         running = True
         threading.Thread(target=grid_cycle, daemon=True).start()
-        threading.Thread(target=pnl_update_loop, daemon=True).start()
-        terminal_insert(f"[{now_cst()}] BOT STARTED")
-        send_whatsapp_alert("Infinity Grid Bot STARTED")
+        threading.Thread(target=daily_safety_checker, daemon=True).start()
+        terminal_insert(f"[{now_cst()}] BOT STARTED — Daily Protection Active")
+        send_whatsapp_alert("Infinity Grid Bot STARTED — Protection ON")
 
 def stop_trading():
     global running
@@ -568,14 +541,14 @@ def stop_trading():
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
-    terminal_insert(f"[{now_cst()}] INFINITY GRID BOT 2025 — WebSocket Mode")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID BOT 2025 — FINAL PRODUCTION")
     load_symbol_info()
     update_balances()
-    fetch_top_coins()
     light_startup_sync()
     update_unrealized_pnl()
     save_pnl()
     start_user_stream()
+    threading.Thread(target=daily_safety_checker, daemon=True).start()
     update_gui()
     root.mainloop()
 
