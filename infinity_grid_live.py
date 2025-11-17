@@ -21,6 +21,15 @@ import websocket
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
+# -------------------- SQLAlchemy Imports --------------------
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Date, Numeric,
+    func, and_, or_
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+import atexit
+
 # -------------------- CONFIG --------------------
 getcontext().prec = 28
 ZERO = Decimal('0')
@@ -34,7 +43,6 @@ CONSERVATIVE_USE_TAKER = True
 FEE_CACHE_TTL = 60*30
 EXCLUDED_COINS = {"USD","USDT","BTC","BCH","ETH","SOL"}
 CST = pytz.timezone("America/Chicago")
-PNL_FILE = "grid_pnl.json"
 PNL_SUMMARY_FILE = "pnl_summary.txt"
 RESERVE_PCT = Decimal('0.33')
 
@@ -70,56 +78,125 @@ _fee_cache = {}
 running = False
 min_usdt_reserve = ZERO
 
-# -------------------- P&L TRACKING --------------------
-pnl_data = {
-    'total_realized': ZERO,
-    'daily_realized': ZERO,
-    'last_reset_date': str(date.today()),
-    'cost_basis': {}
-}
+# -------------------- SQLAlchemy Database Models --------------------
+Base = declarative_base()
 
-def load_pnl():
-    global pnl_data
-    if os.path.exists(PNL_FILE):
+class CostBasis(Base):
+    __tablename__ = 'cost_basis'
+    id        = Column(Integer, primary_key=True)
+    asset     = Column(String(16), nullable=False, unique=True, index=True)
+    quantity  = Column(Numeric(32, 16), nullable=False, default=0)
+    cost_usdt = Column(Numeric(32, 8), nullable=False, default=0)
+
+class RealizedPnl(Base):
+    __tablename__ = 'realized_pnl'
+    id            = Column(Integer, primary_key=True)
+    date          = Column(Date, nullable=False, index=True)
+    total_usdt    = Column(Numeric(32, 8), nullable=False, default=0)
+
+# -------------------- Database Setup --------------------
+DB_PATH = "grid_pnl.sqlite3"
+engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+Base.metadata.create_all(engine)
+atexit.register(engine.dispose)
+
+# -------------------- P&L Tracker (SQLAlchemy) --------------------
+class PnlTracker:
+    def __init__(self):
+        self._session = SessionLocal()
+        self.total_realized = self._load_total()
+        self.daily_realized = self._load_daily()
+        self.last_reset_date = str(date.today())
+        self._cache_cost_basis()
+
+    def _commit(self):
         try:
-            with open(PNL_FILE, 'r') as f:
-                data = json.load(f)
-                pnl_data['total_realized'] = Decimal(data.get('total_realized', '0'))
-                pnl_data['daily_realized'] = Decimal(data.get('daily_realized', '0'))
-                pnl_data['last_reset_date'] = data.get('last_reset_date', str(date.today()))
-                pnl_data['cost_basis'] = {
-                    k: (Decimal(v[0]), Decimal(v[1])) for k, v in data.get('cost_basis', {}).items()
-                }
-        except Exception as e:
-            terminal_insert(f"[{now_cst()}] P&L load error: {e}")
-    else:
-        pnl_data['total_realized'] = ZERO
-        pnl_data['daily_realized'] = ZERO
-        pnl_data['last_reset_date'] = str(date.today())
-        pnl_data['cost_basis'] = {}
+            self._session.commit()
+        except SQLAlchemyError as e:
+            self._session.rollback()
+            terminal_insert(f"[{now_cst()}] DB commit error: {e}")
+
+    def _load_total(self):
+        row = self._session.query(func.sum(RealizedPnl.total_usdt)).scalar()
+        return Decimal(row) if row else ZERO
+
+    def _load_daily(self):
+        today = date.today()
+        row = self._session.query(RealizedPnl).filter(RealizedPnl.date == today).first()
+        return Decimal(row.total_usdt) if row else ZERO
+
+    def _cache_cost_basis(self):
+        self.cost_basis = {
+            r.asset: (Decimal(r.quantity), Decimal(r.cost_usdt))
+            for r in self._session.query(CostBasis).all()
+        }
+
+    def reset_daily_if_needed(self):
+        today = str(date.today())
+        if self.last_reset_date != today:
+            existing = self._session.query(RealizedPnl).filter(RealizedPnl.date == date.today()).first()
+            if existing:
+                existing.total_usdt = 0
+            else:
+                self._session.add(RealizedPnl(date=date.today(), total_usdt=0))
+            self.daily_realized = ZERO
+            self.last_reset_date = today
+            self._commit()
+
+    def update_realized(self, amount: Decimal):
+        self.total_realized += amount
+        self.daily_realized += amount
+        today = date.today()
+        row = self._session.query(RealizedPnl).filter(RealizedPnl.date == today).first()
+        if row:
+            row.total_usdt = self.total_realized
+        else:
+            self._session.add(RealizedPnl(date=today, total_usdt=self.total_realized))
+        self._commit()
+
+    def upsert_cost_basis(self, asset: str, qty: Decimal, cost: Decimal):
+        row = self._session.query(CostBasis).filter(CostBasis.asset == asset).first()
+        if row:
+            row.quantity  = qty
+            row.cost_usdt = cost
+        else:
+            self._session.add(CostBasis(asset=asset, quantity=qty, cost_usdt=cost))
+        self.cost_basis[asset] = (qty, cost)
+        self._commit()
+
+    def delete_cost_basis(self, asset: str):
+        self._session.query(CostBasis).filter(CostBasis.asset == asset).delete()
+        self.cost_basis.pop(asset, None)
+        self._commit()
+
+    def get_cost_basis(self, asset: str):
+        return self.cost_basis.get(asset, (ZERO, ZERO))
+
+    def close(self):
+        self._session.close()
+
+pnl = PnlTracker()
+
+# Legacy dict for unrealized (GUI compatibility)
+pnl_data = {'unrealized': ZERO}
+
+# -------------------- P&L Functions --------------------
+def load_pnl():
+    pass  # Data loaded in PnlTracker
 
 def save_pnl():
     try:
-        data = {
-            'total_realized': str(pnl_data['total_realized']),
-            'daily_realized': str(pnl_data['daily_realized']),
-            'last_reset_date': pnl_data['last_reset_date'],
-            'cost_basis': {k: [str(q), str(c)] for k, (q, c) in pnl_data['cost_basis'].items()}
-        }
-        with open(PNL_FILE, 'w') as f:
-            json.dump(data, f)
         with open(PNL_SUMMARY_FILE, 'w') as f:
-            f.write(f"Total P&L: {pnl_data['total_realized']:.2f}\n")
-            f.write(f"Daily P&L: {pnl_data['daily_realized']:.2f}\n")
+            f.write(f"Total P&L: {pnl.total_realized:.2f}\n")
+            f.write(f"Daily P&L: {pnl.daily_realized:.2f}\n")
     except Exception as e:
-        terminal_insert(f"[{now_cst()}] P&L save error: {e}")
+        terminal_insert(f"[{now_cst()}] Summary write error: {e}")
 
 def reset_daily_pnl():
-    today = str(date.today())
-    if pnl_data['last_reset_date'] != today:
-        pnl_data['daily_realized'] = ZERO
-        pnl_data['last_reset_date'] = today
-        save_pnl()
+    pnl.reset_daily_if_needed()
+    save_pnl()
 
 # -------------------- PRICE & HISTORY (REST) --------------------
 def fetch_current_prices_for_assets(assets):
@@ -138,19 +215,18 @@ def fetch_current_prices_for_assets(assets):
     return prices
 
 def update_unrealized_pnl():
-    assets = [a for a in pnl_data['cost_basis'].keys() if pnl_data['cost_basis'][a][0] > ZERO]
+    assets = [a for a, (q, _) in pnl.cost_basis.items() if q > ZERO]
     if not assets:
         pnl_data['unrealized'] = ZERO
         return ZERO
 
     prices = fetch_current_prices_for_assets(assets)
     unrealized = ZERO
-    for asset, (qty, cost) in pnl_data['cost_basis'].items():
+    for asset in assets:
+        qty, cost = pnl.get_cost_basis(asset)
         symbol = f"{asset}USDT"
-        if symbol not in prices:
-            continue
-        market_value = qty * prices[symbol]
-        unrealized += market_value - cost
+        if symbol in prices:
+            unrealized += qty * prices[symbol] - cost
     pnl_data['unrealized'] = unrealized
     return unrealized
 
@@ -165,9 +241,7 @@ def get_historical_closes(symbol, days):
         return []
 
 def should_sell_asset(asset):
-    if asset not in pnl_data['cost_basis']:
-        return False
-    qty, cost = pnl_data['cost_basis'][asset]
+    qty, cost = pnl.get_cost_basis(asset)
     if qty <= ZERO:
         return False
 
@@ -207,34 +281,31 @@ def record_fill(symbol, side, qty, price, fee_usdt):
     realized = ZERO
 
     if side == 'BUY':
-        old_qty, old_cost = pnl_data['cost_basis'].get(base, (ZERO, ZERO))
+        old_qty, old_cost = pnl.get_cost_basis(base)
         new_qty = old_qty + qty
         new_cost = old_cost + notional + fee_usdt
-        pnl_data['cost_basis'][base] = (new_qty, new_cost)
+        pnl.upsert_cost_basis(base, new_qty, new_cost)
+
     elif side == 'SELL':
-        if base not in pnl_data['cost_basis']:
-            return
-        old_qty, old_cost = pnl_data['cost_basis'][base]
+        old_qty, old_cost = pnl.get_cost_basis(base)
         if qty >= old_qty:
             realized = (notional - fee_usdt) - old_cost
-            pnl_data['total_realized'] += realized
-            pnl_data['daily_realized'] += realized
-            del pnl_data['cost_basis'][base]
+            pnl.update_realized(realized)
+            pnl.delete_cost_basis(base)
         else:
             avg_cost = old_cost / old_qty
             cost_sold = avg_cost * qty
             realized = (notional - fee_usdt) - cost_sold
-            pnl_data['total_realized'] += realized
-            pnl_data['daily_realized'] += realized
-            pnl_data['cost_basis'][base] = (old_qty - qty, old_cost - cost_sold)
+            pnl.update_realized(realized)
+            pnl.upsert_cost_basis(base, old_qty - qty, old_cost - cost_sold)
 
     save_pnl()
     alert_msg = f"{side} {base} {qty} @ {price:.8f} | P&L: ${realized:+.4f}"
     terminal_insert(f"[{now_cst()}] {alert_msg}")
     send_whatsapp_alert(alert_msg)
 
-    if abs(pnl_data['daily_realized']) >= Decimal('50'):
-        send_whatsapp_alert(f"DAILY P&L: ${pnl_data['daily_realized']:+.2f}")
+    if abs(pnl.daily_realized) >= Decimal('50'):
+        send_whatsapp_alert(f"DAILY P&L: ${pnl.daily_realized:+.2f}")
 
 # -------------------- WEBSOCKETS (ORDER MESSAGES) --------------------
 def on_user_message(ws, msg):
@@ -394,8 +465,8 @@ def update_stats_labels():
 
     reset_daily_pnl()
     unrealized = update_unrealized_pnl()
-    total_pnl = pnl_data['total_realized'] + unrealized
-    daily_pnl = pnl_data['daily_realized'] + unrealized
+    total_pnl = pnl.total_realized + unrealized
+    daily_pnl = pnl.daily_realized + unrealized
 
     color = "lime" if total_pnl >= ZERO else "red"
     pnl_label.config(text=f"P&L: ${total_pnl:+.2f} (Today: ${daily_pnl:+.2f})", fg=color)
@@ -608,6 +679,11 @@ if __name__ == "__main__":
 
     threading.Thread(target=start_user_stream, daemon=True).start()
     threading.Thread(target=pnl_update_loop, daemon=True).start()
+
+    def _shutdown():
+        pnl.close()
+        stop_trading()
+    atexit.register(_shutdown)
 
     terminal_insert(f"[{now_cst()}] INFINITY GRID BOT 2025 READY")
     update_stats_labels()
