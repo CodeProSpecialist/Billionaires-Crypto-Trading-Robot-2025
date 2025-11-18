@@ -1,4 +1,4 @@
-# Check back here weekly or currently daily for the newedt program version. 
+# Check back here weekly or currently daily for the newest program version. 
 There is an upgrade in progress to make this program work better than anything else available anywhere. 
 
 ## Overview
