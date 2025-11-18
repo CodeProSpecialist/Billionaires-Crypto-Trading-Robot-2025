@@ -1,4 +1,5 @@
-# Infinity Grid Bot 2025 — Automated Trading Bot for Binance.US 
+# Check back here weekly or currently daily for the newedt program version. 
+There is an upgrade in progress to make this program work better than anything else available anywhere. 
 
 ## Overview
 **Infinity Grid Bot 2025** is a fully automated cryptocurrency trading bot for **Binance.US**.  
