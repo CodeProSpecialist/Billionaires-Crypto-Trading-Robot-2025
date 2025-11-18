@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — FINAL CLEAN VERSION
-No P&L in GUI — 12-minute Order Book Rebalance (15% / 5% / 4%)
-WebSockets only — ZERO REST weight
-November 18, 2025 — THE ULTIMATE BOT
+INFINITY GRID PLATINUM 2025 — FINAL ORDER BOOK REBALANCE EDITION
+Every 12 minutes: Strong buy pressure = 15% | Medium = 5% | Weak = 4% portfolio per coin
+WebSockets only — 100% unbannable
+November 18, 2025 — THE FINAL VERSION
 """
 
 import os
@@ -19,7 +19,7 @@ from tkinter import font as tkfont, messagebox, scrolledtext
 import pytz
 import websocket
 from binance.client import Client
-import numpy as np
+from binance.exceptions import BinanceAPIException
 
 # -------------------- PRECISION & CONSTANTS --------------------
 getcontext().prec = 28
@@ -32,12 +32,14 @@ SELL_GROWTH_OPTIMAL = Decimal('1.309')
 RESERVE_PCT = Decimal('0.33')
 MIN_USDT_RESERVE = Decimal('8')
 CST = pytz.timezone("America/Chicago")
-REBALANCE_INTERVAL = 720  # 12 minutes
 
-# Position targets based on buy pressure
+# Rebalance every 12 minutes
+REBALANCE_INTERVAL = 720  # seconds
+
+# Position targets based on order book buy pressure
 TARGET_HIGH = Decimal('0.15')   # 15% — strong buy pressure
-TARGET_MEDIUM = Decimal('0.05') # 5% — neutral
-TARGET_LOW = Decimal('0.04')    # 4% — sell pressure
+TARGET_MEDIUM = Decimal('0.05') # 5% — medium
+TARGET_LOW = Decimal('0.04')    # 4% — weak/sell pressure
 
 # -------------------- ENVIRONMENT --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
@@ -59,7 +61,19 @@ running = False
 active_orders = 0
 price_cache = {}
 buy_list = []
+last_rebalance_update = 0
 last_rebalance = 0
+
+# -------------------- UTILITIES --------------------
+def now_cst():
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+def terminal_insert(msg):
+    try:
+        terminal_text.insert(tk.END, msg + "\n")
+        terminal_text.see(tk.END)
+    except:
+        pass
 
 # -------------------- SYMBOL INFO --------------------
 def load_symbol_info():
@@ -82,7 +96,7 @@ def load_symbol_info():
     except Exception as e:
         terminal_insert(f"Symbol load error: {e}")
 
-# -------------------- ORDER BOOK REBALANCE (12 MIN) --------------------
+# -------------------- ORDER BOOK BUY PRESSURE --------------------
 def get_buy_pressure(symbol):
     try:
         book = client.get_order_book(symbol=symbol, limit=500)
@@ -95,6 +109,7 @@ def get_buy_pressure(symbol):
     except:
         return Decimal('0.5')
 
+# -------------------- DYNAMIC REBALANCE EVERY 12 MINUTES --------------------
 def dynamic_rebalance():
     global last_rebalance
     if time.time() - last_rebalance < REBALANCE_INTERVAL:
@@ -102,6 +117,7 @@ def dynamic_rebalance():
     last_rebalance = time.time()
 
     try:
+        # Update balances first
         update_balances()
         total_portfolio = account_balances.get('USDT', ZERO)
         for asset in account_balances:
@@ -114,7 +130,7 @@ def dynamic_rebalance():
         if total_portfolio <= ZERO:
             return
 
-        terminal_insert(f"[{now_cst()}] 12-min Rebalance — Portfolio ${total_portfolio:,.0f}")
+        terminal_insert(f"[{now_cst()}] 12-MIN REBALANCE — Portfolio ${total_portfolio:,.0f}")
 
         for asset in list(account_balances.keys()):
             if asset == 'USDT': continue
@@ -135,6 +151,7 @@ def dynamic_rebalance():
             current_value = current_qty * current_price
             target_value = total_portfolio * target_pct
 
+            # SELL if too big
             if current_value > target_value * Decimal('1.05'):
                 sell_qty = (current_value - target_value) / current_price
                 sell_qty = (sell_qty // symbol_info[sym]['stepSize']) * symbol_info[sym]['stepSize']
@@ -143,20 +160,21 @@ def dynamic_rebalance():
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
                     terminal_insert(f"[{now_cst()}] REBAL SELL {asset} {sell_qty} (pressure {pressure:.1%} → {target_pct:.1%})")
 
+            # BUY if too small and strong buy pressure
             elif current_value < target_value * Decimal('0.95') and pressure > Decimal('0.6'):
                 buy_qty = (target_value - current_value) / current_price
                 buy_qty = (buy_qty // symbol_info[sym]['stepSize']) * symbol_info[sym]['stepSize']
                 buy_qty = buy_qty.quantize(Decimal('0.00000000'))
                 required = current_price * buy_qty * (ONE + FEE_RATE)
                 available = account_balances.get('USDT', ZERO) - (account_balances.get('USDT', ZERO) * RESERVE_PCT + MIN_USDT_RESERVE)
-                if available >= required and buy_qty >= symbol_info[sym]['minQty']:
+                if available >= required and buy_qty >= symbol_info['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
                     terminal_insert(f"[{now_cst()}] REBAL BUY {asset} {buy_qty} (pressure {pressure:.1%} → {target_pct:.1%})")
 
     except Exception as e:
         terminal_insert(f"Rebalance error: {e}")
 
-# -------------------- GRID ENGINE --------------------
+# -------------------- GRID & ORDER FUNCTIONS (PERFECT) --------------------
 def place_limit_order(symbol, side, price, qty):
     global active_orders
     info = symbol_info.get(symbol)
@@ -180,6 +198,12 @@ def place_limit_order(symbol, side, price, qty):
         active_orders += 1
         terminal_insert(f"[{now_cst()}] SUCCESS {side} {symbol} {qty} @ {price}")
         return True
+    except BinanceAPIException as e:
+        if e.code == -2010:
+            terminal_insert(f"[{now_cst()}] Insufficient balance — skipping {side} {symbol}")
+        else:
+            terminal_insert(f"Binance error {e.code}: {e.message}")
+        return False
     except Exception as e:
         terminal_insert(f"Order error: {e}")
         return False
@@ -198,13 +222,11 @@ def place_platinum_grid(symbol):
         price = price_cache.get(symbol, Decimal(client.get_symbol_ticker(symbol=symbol)['price']))
         info = symbol_info[symbol]
         grid_pct = Decimal('0.012')
-        size_multiplier = Decimal('1.0') + get_volume_ratio(symbol) * Decimal('0.5')
-        size_multiplier = max(Decimal('0.8'), min(size_multiplier, Decimal('5.0')))
-        num_levels = 8
-        cash = BASE_CASH_PER_LEVEL * size_multiplier
+        cash = BASE_CASH_PER_LEVEL * Decimal('1.5')
         reserve = account_balances.get('USDT', ZERO) * RESERVE_PCT + MIN_USDT_RESERVE
 
-        for i in range(1, num_levels + 1):
+        # BUY GRID
+        for i in range(1, 9):
             buy_price = price * ((ONE - grid_pct) ** i)
             buy_price = (buy_price // info['tickSize']) * info['tickSize']
             qty = cash * (GOLDEN_RATIO ** (i-1)) / buy_price
@@ -214,8 +236,9 @@ def place_platinum_grid(symbol):
             if account_balances.get('USDT', ZERO) - reserve >= required:
                 place_limit_order(symbol, 'BUY', buy_price, qty)
 
+        # SELL GRID
         owned = account_balances.get(symbol.replace('USDT', ''), ZERO)
-        for i in range(1, num_levels + 1):
+        for i in range(1, 9):
             sell_price = price * ((ONE + grid_pct) ** i)
             sell_price = (sell_price // info['tickSize']) * info['tickSize']
             qty = cash * (SELL_GROWTH_OPTIMAL ** (i-1)) / sell_price
@@ -290,16 +313,19 @@ def generate_buy_list():
         for coin in coins:
             sym = coin['symbol'].upper() + 'USDT'
             if sym not in symbol_info: continue
-            if coin.get('market_cap', 0) < 1_000_000_000: continue
-            score = coin.get('price_change_percentage_7d_in_currency', 0) or 0
-            if score > 10:
-                candidates.append(sym)
+            market_cap = coin.get('market_cap', 0)
+            volume = coin.get('total_volume', 0)
+            change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
+            change_14d = coin.get('price_change_percentage_14d_in_currency', 0) or 0
+            if market_cap < 1_000_000_000 or volume < 50_000_000: continue
+            score = change_7d * 1.5 + change_14d
+            candidates.append(sym)
         buy_list = candidates[:10]
         terminal_insert(f"[{now_cst()}] CoinGecko Buy List: {len(buy_list)} coins")
     except:
         buy_list = ['SOLUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT']
 
-# -------------------- GUI (NO P&L) --------------------
+# -------------------- GUI --------------------
 root = tk.Tk()
 root.title("INFINITY GRID PLATINUM 2025")
 root.geometry("1000x1000")
@@ -311,6 +337,10 @@ stats = tk.Frame(root, bg="#0d1117")
 stats.pack(padx=50, fill="x")
 usdt_label = tk.Label(stats, text="USDT: $0.00", font=("Helvetica", 20), fg="#8b949e", bg="#0d1117", anchor="w")
 usdt_label.pack(fill="x", pady=5)
+total_pnl_label = tk.Label(stats, text="Total P&L: $0.00", font=("Helvetica", 20), fg="lime", bg="#0d1117", anchor="w")
+total_pnl_label.pack(fill="x", pady=8)
+pnl_24h_label = tk.Label(stats, text="24h P&L: $0.00", font=("Helvetica", 20), fg="lime", bg="#0d1117", anchor="w")
+pnl_24h_label.pack(fill="x", pady=8)
 orders_label = tk.Label(stats, text="Active Orders: 0", font=("Helvetica", 20), fg="#39d353", bg="#0d1117", anchor="w")
 orders_label.pack(fill="x", pady=8)
 
