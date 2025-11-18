@@ -1,6 +1,7 @@
 # Check back here weekly for the newest program version. 
  The newest update was on 11-18-2025. 
 
+```bash 
 INFINITY GRID PLATINUM 2025 – Full Feature Overview
 This is a fully automated Binance.US spot trading bot (Python/Tkinter GUI) that runs an infinite grid strategy on a dynamically selected basket of altcoins, combined with order-book-based dynamic rebalancing.
 Core Strategy Components
@@ -83,7 +84,7 @@ This bot combines three powerful ideas into one system:
 	2	Momentum filtering via CoinGecko (only buys coins that are already outperforming)
 	3	Dynamic portfolio rebalancing based on real-time order-book sentiment (not just price)
 Result: A hands-off, 24/7 grid bot that concentrates capital into the strongest performing mid/large-cap altcoins while constantly harvesting grid profits and adapting allocation based on market pressure.
-
+```
 ---
 
 ## Setup
