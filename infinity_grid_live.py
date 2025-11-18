@@ -318,26 +318,62 @@ def start_user_stream():
 
 # -------------------- COINGECKO BUY LIST --------------------
 def generate_buy_list():
-    global buy_list
+    """CoinGecko top coins — ONLY CLEAN /USDT PAIRS — BLACKLIST ENFORCED"""
+    global buy_list, last_buy_list_update
+    if time.time() - last_buy_list_update < 3600:  # hourly
+        return
+
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {'vs_currency': 'usd', 'order': 'market_cap_desc', 'per_page': 100}
-        coins = requests.get(url, params=params, timeout=15).json()
+        params = {
+            'vs_currency': 'usd',
+            'order': 'market_cap_desc',
+            'per_page': 100,
+            'page': 1,
+            'price_change_percentage': '7d,14d'
+        }
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        coins = r.json()
+
         candidates = []
         for coin in coins:
-            sym = coin['symbol'].upper() + 'USDT'
-            if sym not in symbol_info: continue
+            base = coin['symbol'].upper()
+
+            # HARD BLACKLIST — NEVER EVER
+            if base in BLACKLISTED_BASE_ASSETS:
+                continue
+
+            sym = base + 'USDT'
+            if sym not in symbol_info:  # Must exist on Binance.US
+                continue
+
             market_cap = coin.get('market_cap', 0)
             volume = coin.get('total_volume', 0)
             change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
             change_14d = coin.get('price_change_percentage_14d_in_currency', 0) or 0
-            if market_cap < 1_000_000_000 or volume < 50_000_000: continue
-            score = change_7d * 1.5 + change_14d
-            candidates.append(sym)
-        buy_list = candidates[:10]
-        terminal_insert(f"[{now_cst()}] CoinGecko Buy List: {len(buy_list)} coins")
-    except:
-        buy_list = ['SOLUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT']
+
+            # Only high-quality altcoins
+            if market_cap < 800_000_000 or volume < 40_000_000:
+                continue
+            if change_7d < 6 or change_14d < 12:
+                continue
+
+            score = change_7d * 1.5 + change_14d + (volume / max(market_cap, 1) * 100)
+            candidates.append((sym, score, coin['name']))
+
+        candidates.sort(key=lambda x: -x[1])
+        buy_list = [x[0] for x in candidates[:10]]
+
+        last_buy_list_update = time.time()
+        terminal_insert(f"[{now_cst()}] BLACKLIST ACTIVE — {len(buy_list)} CLEAN /USDT coins selected")
+        for sym, score, name in candidates[:10]:
+            terminal_insert(f"  → {sym} ({name}) | Score {score:.0f}")
+
+    except Exception as e:
+        terminal_insert(f"Buy list error: {e}")
+        # Ultra-safe fallback — only clean alts
+        buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT', 'UNIUSDT', 'AAVEUSDT', 'CRVUSDT', 'COMPUSDT', 'MKRUSDT']
 
 # -------------------- GUI 800x900 — P&L REMOVED --------------------
 root = tk.Tk()
