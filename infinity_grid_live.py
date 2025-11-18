@@ -151,11 +151,11 @@ def dynamic_rebalance():
             pressure = get_buy_pressure(sym)
 
             if pressure > Decimal('0.65'):
-                target_pct = TARGET_HIGH
+                target_pct = TARGET_HIGH  # 15%
             elif pressure < Decimal('0.35'):
-                target_pct = TARGET_LOW
+                target_pct = TARGET_LOW    # 4%
             else:
-                target_pct = TARGET_MEDIUM
+                target_pct = TARGET_MEDIUM # 5%
 
             current_qty = account_balances.get(asset, ZERO)
             current_price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
@@ -178,7 +178,7 @@ def dynamic_rebalance():
                 available = account_balances.get('USDT', ZERO) - (account_balances.get('USDT', ZERO) * RESERVE_PCT + MIN_USDT_RESERVE)
                 if available >= required and buy_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
-                    terminal_insert(f"[{now_cst()}] REBAL BUY {asset} {buy_qty} (pressure {pressure {pressure:.1%} → {target_pct:.1%})")
+                    terminal_insert(f"[{now_cst()}] REBAL BUY {asset} {buy_qty} (pressure {pressure:.1%} → {target_pct:.1%})")
 
     except Exception as e:
         terminal_insert(f"Rebalance error: {e}")
