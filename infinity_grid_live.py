@@ -468,7 +468,7 @@ def get_light_pnl():
 # -------------------- GUI --------------------
 root = tk.Tk()
 root.title("INFINITY GRID PLATINUM 2025")
-root.geometry("1000x1000")
+root.geometry("800x900")
 root.configure(bg="#0d1117")
 
 tk.Label(root, text="INFINITY GRID PLATINUM 2025", font=("Helvetica", 30, "bold"), fg="#58a6ff", bg="#0d1117").pack(pady=20)
