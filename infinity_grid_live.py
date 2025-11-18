@@ -58,6 +58,7 @@ running = False
 active_orders = 0
 price_cache = {}
 buy_list = []
+last_buy_list_update = 0
 last_rebalance = 0
 
 # -------------------- HARD BLACKLIST — NEVER TOUCH THESE (even in /USDT pairs) --------------------
