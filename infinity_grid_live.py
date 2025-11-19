@@ -555,7 +555,7 @@ def regrid_symbol(symbol):
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
-# -------------------- SMARTER REBALANCING (NO MISSING METHOD) --------------------
+# -------------------- SMARTER REBALANCING (NO 24HR TICKER CALL) --------------------
 def dynamic_rebalance():
     if exit_in_progress or not is_trading_allowed(): 
         return
@@ -570,10 +570,12 @@ def dynamic_rebalance():
             sym = asset + 'USDT'
             if sym not in symbol_info: 
                 continue
-            price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
+            price = price_cache.get(sym) or Decimal(client.get_symbol_ticker(symbol=sym)['price'])
             total_portfolio += qty * price
         if total_portfolio <= ZERO: 
             return
+
+        terminal_insert(f"[{now_cst()}] Rebalance — Portfolio ${total_portfolio:,.0f}")
 
         for asset in list(account_balances.keys()):
             if asset == 'USDT': 
@@ -582,7 +584,7 @@ def dynamic_rebalance():
             if sym not in symbol_info: 
                 continue
 
-            current_price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
+            current_price = price_cache.get(sym) or Decimal(client.get_symbol_ticker(symbol=sym)['price'])
             current_qty = account_balances.get(asset, ZERO)
             current_value = current_qty * current_price
 
@@ -590,17 +592,18 @@ def dynamic_rebalance():
             rsi = get_rsi(sym)
             mfi = get_mfi(sym)
             macd_line, signal_line, histogram = get_macd(sym)
-            macd_bullish = histogram is not None and histogram > ZERO
+            macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
 
-            # SAFE volume from websocket cache (always up-to-date, no REST call)
-            volume_24h = Decimal('0')
-            if sym in ticker_24hr_cache:
-                volume_24h = Decimal(ticker_24hr_cache[sym].get('quoteVolume', '0'))
+            # Safe volume estimate: use order book depth as proxy (we already pull it)
+            try:
+                book = client.get_order_book(symbol=sym, limit=20)
+                est_volume_proxy = sum(Decimal(x[1]) * current_price for x in book['bids'] + book['asks'])
+            except:
+                est_volume_proxy = Decimal('50000000')  # assume decent if we can't read
 
-            # Signal strength tiers
+            # Strong = big depth + strong signals
             if (pressure >= Decimal('0.70') and rsi < Decimal('75') and 
-                mfi > Decimal('62') and macd_bullish and 
-                volume_24h > Decimal('100000000')):
+                mfi > Decimal('62') and macd_bullish and est_volume_proxy > Decimal('100_000_000')):
                 target_pct = Decimal('0.20')
             elif pressure >= Decimal('0.60') and rsi < Decimal('72') and macd_bullish:
                 target_pct = Decimal('0.12')
@@ -611,8 +614,8 @@ def dynamic_rebalance():
 
             target_value = total_portfolio * target_pct
 
-            # ±12% tolerance + only sell if decent volume (no forced dumps on illiquid coins)
-            if current_value > target_value * Decimal('1.12') and volume_24h > Decimal('30000000'):
+            # Wider tolerance (±12%)
+            if current_value > target_value * Decimal('1.12'):
                 sell_qty = floor_to_step((current_value - target_value) / current_price, symbol_info[sym]['stepSize'])
                 if sell_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
@@ -620,12 +623,11 @@ def dynamic_rebalance():
             elif current_value < target_value * Decimal('0.88'):
                 buy_qty = floor_to_step((target_value - current_value) / current_price, symbol_info[sym]['stepSize'])
                 required = current_price * buy_qty * (ONE + taker_fee)
-                if (get_available_usdt_after_reserve() >= required and 
-                    buy_qty >= symbol_info[sym]['minQty']):
+                if get_available_usdt_after_reserve() >= required and buy_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
 
     except Exception as e:
-        terminal_insert(f"Rebalance error: {e}")
+        terminal_insert(f"Rebalance error (ignored): {e}")
 
 # -------------------- AGGRESSIVE EVENING EXIT --------------------
 def aggressive_evening_exit():
