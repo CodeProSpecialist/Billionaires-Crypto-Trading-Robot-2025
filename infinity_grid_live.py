@@ -73,9 +73,9 @@ kline_cache = {}  # For RSI calculation: symbol -> list of closes
 
 # -------------------- BLACKLIST --------------------
 BLACKLISTED_BASE_ASSETS = {
-    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH',
-    'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDP', 'GUSD',
-    'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'
+    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH', 'LTC', 'DOGE', 'PEPE', 'SHIB', 
+    'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDP', 'GUSD',  # All stables
+    'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'  # Wrapped junk
 }
 
 # -------------------- CALLMEBOT --------------------
