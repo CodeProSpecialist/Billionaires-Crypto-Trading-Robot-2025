@@ -357,8 +357,8 @@ def on_user_message(ws, message):
             qty = Decimal(data['q'])
             price = Decimal(data['p'])
             base = symbol.replace('USDT', '')
-            terminal_insert(f"[{now_cst()}] FILLED {side} {base} {qty:.6f} @ ${price:.8f}")
-            send_whatsapp(f"{'🟢BUY' if side=='BUY' else '🔴SELL'} {base} {qty:.4f} @ ${price:.6f}")
+            terminal_insert(f"[{now_cst()}] FILLED {side} {base} {qty:.6f} @ ${price:.8f}{get_total_balance_str()}")
+            send_whatsapp(f"{'🟢BUY' if side=='BUY' else '🔴SELL'} {base} {qty:.4f} @ ${price:.6f}{get_total_balance_str()}")
             if not exit_in_progress:
                 threading.Thread(target=regrid_symbol, args=(symbol,), daemon=True).start()
 
@@ -753,8 +753,8 @@ def start_bot():
     threading.Thread(target=grid_cycle, daemon=True).start()
     threading.Thread(target=rebalance_loop, daemon=True).start()  # New rebalance thread
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT — Profit Mode ON")
-    send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT — Profit Mode ON, {get_total_balance_str()}")
+    send_whatsapp(f"INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated, {get_total_balance_str()}")
 
 def stop_bot():
     global running
@@ -794,7 +794,7 @@ if __name__ == "__main__":
     update_fees()
     start_user_stream()
     generate_buy_list()
-    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION READY")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION READY, {get_total_balance_str()}")
     terminal_insert(f"Personal Fees → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
     update_gui()
     root.mainloop()
