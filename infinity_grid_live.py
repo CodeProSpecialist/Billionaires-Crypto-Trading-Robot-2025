@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — FINAL PERFECTION EDITION
+INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION EDITION
 ★ Mandatory full exit at 17:30 CST → 100% USDT every night
 ★ Military-grade websocket heartbeat — never drops
 ★ Real personal maker/taker fees
 ★ Buy: 100% safe — checks USDT + reserve + taker fee before sending
-★ Sell: 100% safe — checks asset quantity + +0.3% profit required
+★ Sell: 100% safe — checks quantity + +0.3% profit required
 ★ Strict LOT_SIZE & tickSize compliance
 November 19, 2025
 """
@@ -32,7 +32,7 @@ ONE = Decimal('1')
 
 maker_fee = Decimal('0.0010')
 taker_fee = Decimal('0.0020')
-last_fee_update = 0
+last_fee_update =  = 0
 FEE_UPDATE_INTERVAL = 21600
 
 MIN_SELL_PROFIT_PCT = Decimal('0.003')
@@ -67,7 +67,7 @@ running = True
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
 if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
-    messagebox.showwarning("CallMeBot", "CALLMEBOT_API_KEY or CALLMEBOT_PHONE not set — WhatsApp alerts DISABLED")
+    print("WhatsApp alerts disabled — set CALLMEBOT_API_KEY and CALLMEBOT_PHONE for alerts")
 
 api_key = os.getenv('BINANCE_API_KEY')
 api_secret = os.getenv('BINANCE_API_SECRET')
@@ -105,8 +105,7 @@ def update_fees():
         taker_fee = Decimal(info['takerCommission']) / 10000
         last_fee_update = time.time()
         terminal_insert(f"[{now_cst()}] Fees → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
-    except Exception as e:
-        terminal_insert(f"Fee update failed: {e} — using defaults")
+    except: pass
 
 # -------------------- UTILITIES --------------------
 def now_cst():
@@ -437,7 +436,6 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
 
         update_fees()
 
-        # BUY: 100% SAFE CHECK
         if side == 'BUY':
             total_cost = notional * (ONE + taker_fee)
             available = get_available_usdt_after_reserve()
@@ -445,7 +443,6 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
                 terminal_insert(f"[{now_cst()}] BLOCKED BUY {symbol} — Not enough USDT (need ${total_cost:.2f}, have ${available:.2f})")
                 return False
 
-        # SELL: 100% SAFE CHECK
         if side == 'SELL':
             base_asset = symbol.replace('USDT', '')
             available_qty = get_available_asset(base_asset)
@@ -711,6 +708,7 @@ def grid_cycle():
         if exit_in_progress or not is_trading_allowed():
             time.sleep(60)
             continue
+
         generate_buy_list()
         for sym in buy_list:
             if running and sym in symbol_info:
