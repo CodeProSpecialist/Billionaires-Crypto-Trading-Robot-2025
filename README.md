@@ -1,85 +1,70 @@
 # Check back here weekly for the newest program version. 
  The newest update was on 11-19-2025. 
 ```
-INFINITY GRID PLATINUM 2025
-The Safest & Most Profitable Grid Bot Ever Built November 19, 2025 — Aggressive Evening Exit Edition
-Core Philosophy – Why This Bot Exists
-On Binance.US (and most altcoin markets), the hours between 18:00 CST and 08:00 CST are statistically the most dangerous time of the entire day. During U.S. night + Asian morning session there is almost zero real buying volume → order books become razor-thin → any selling pressure causes cascading 10-30 % deflationary wipes. Holding altcoins overnight on Binance.US is the highest-risk gambling you can do.
-That is why INFINITY GRID PLATINUM 2025 treats the daily full exit as 100% MANDATORY. Starting at 17:30 CST every single day, the bot will relentlessly sell everything using aggressive but controlled limit orders until the portfolio is 100% USDT — no exceptions, no excuses.
-Only after it confirms you are completely flat does it allow itself to “sleep” safely overnight.
-Complete Feature Overview & Advantages
-#
-Feature
-How It Works
-Why It’s a Game-Changer (Pros)
-1
-Mandatory Daily Exit at 17:30 CST
-Bot begins dumping every single altcoin at exactly 17:30 Chicago time
-Eliminates 99 % of overnight crash risk — you are never exposed when volume dies
-2
-Aggressive Limit-Sell Engine (No Market Orders)
-Places limit sells 0.2 % below real-time best bid
-Zero slippage, maximum control, still fills extremely fast in normal conditions
-3
-Relentless 5-Minute Auto-Retry Until 100 % USDT
-Every 5 min: cancel old orders → read fresh book → place tighter sells → repeat forever
-Works even on illiquid coins, weekends, holidays — you WILL be flat before sleep
-4
-True Night Sleep Mode Only After Full Exit
-All new buys/rebalancing blocked after 18:00 until portfolio = 100 % USDT
-Impossible to accidentally hold positions overnight
-5
-Platinum Infinity Grid (Golden Ratio)
-8 buy + 8 sell levels with 1.2 % spacing and Golden Ratio (1.618) progression
-Mathematically optimal order density → maximum fills in ranging markets
-6
-RSI + Order-Book Smart Rebalancing
-Every 12 min forces positions to 15 % (overbought), 4 % (oversold), or 5 % (neutral) of total portfolio
-Automatically takes profit, prevents blow-ups, keeps risk perfectly distributed
-7
-CoinGecko Top-10 Trending Auto-Selector
-Hourly scans 100 largest coins → picks only the 10 with strongest 7d/14d momentum + real volume
-Always trading the hottest, most liquid coins — no more dead positions
-8
-Permanent Blacklist
-Excludes BTC, ETH, SOL, all stables, wrapped tokens
-100 % capital focused on mid-cap altcoins where grid trading actually prints money
-9
-Dual Binance.US Real-Time WebSockets
-Zero-latency balance, price, and fill updates
-Instant re-gridding the millisecond a fill happens
-10
-Full WhatsApp Alerts (CallMeBot)
-Every exit wave, fill, rebalance, and final “100 % USDT” confirmation sent to your phone
-You always know exactly what’s happening — no surprises
-11
-Beautiful Dark GUI + Live Terminal
-Centered 800×900 window with live stats and scrolling log
-Professional monitoring, no command line needed
-12
-33 % USDT Reserve + $8 Minimum Buffer
-Never spends the last third of cash
-Always has dry powder ready for the next morning’s dip buys
-13
-Single-File, Zero Dependencies Beyond Standard Libraries
-One .py file — just set API keys and run
-Easy to deploy, audit, backup, and move between machines
-Daily Lifecycle (24-Hour Cycle)
-Time (CST)
-What the Bot Does
-03:00 – 17:29
-Full aggressive trading — grids, rebalancing, trending coin rotation
-17:30 – ~18:30
-MANDATORY EXIT MODE — relentless limit sells every 5 min until 100 % USDT
-18:00 – 02:59
-Complete silence — zero new orders possible until full exit confirmed
-03:00 next day
-Wakes up fresh with 100 % USDT and starts hunting the next day’s profits
-Result
-You make money all day using one of the most sophisticated grid + rebalancing systems ever coded… and every single night you are guaranteed to be 100 % in USDT — automatically, without thinking, without fail.
-This is not just a grid bot. This is the safest, most disciplined, and highest-expectancy automated trading system possible in 2025.
-Press START → go live your life → wake up richer and completely protected every single morning.
-INFINITY GRID PLATINUM 2025 — Peace of mind meets maximum profit. 💎🚀
+# INFINITY GRID PLATINUM 2025  
+**The Safest & Most Profitable Grid Bot Ever Built**  
+**November 19, 2025 — Aggressive Evening Exit Edition**
+
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
+![Binance.US](https://img.shields.io/badge/Binance.US-Exclusive-orange)
+![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen)
+
+### Core Philosophy – Why This Bot Exists
+
+On **Binance.US** (and almost every altcoin market), the period between **18:00 CST and 08:00 CST** is statistically the most dangerous time of the entire day.
+
+During U.S. night + Asian morning session:
+- Almost zero real buying volume
+- Razor-thin order books
+- Any selling pressure causes cascading 10–30 % deflationary crashes
+
+**Holding altcoins overnight on Binance.US = the highest-risk gamble you can take.**
+
+That’s why **INFINITY GRID PLATINUM 2025 treats the daily full exit as 100 % MANDATORY**.  
+Starting at **17:30 CST every single day**, the bot will relentlessly sell **everything** using aggressive but controlled limit orders until the portfolio is **100 % USDT — no exceptions, no excuses**.
+
+Only after confirming you are completely flat does it allow itself to sleep safely overnight.
+
+### Complete Feature Overview & Advantages
+
+| # | Feature                                          | How It Works                                                                                           | Why It’s a Game-Changer (Pros)                                                                                           |
+|---|--------------------------------------------------|--------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| 1 | **Mandatory Daily Exit at 17:30 CST**            | Begins dumping every altcoin at exactly 17:30 Chicago time                                             | Eliminates 99 % of overnight crash risk — you are never exposed when volume dies                                        |
+| 2 | **Aggressive Limit-Sell Engine (No Market Orders)** | Places limit sells 0.2 % below real-time best bid                                                      | Zero slippage, maximum control, still fills extremely fast                                                               |
+| 3 | **Relentless 5-Minute Auto-Retry Until 100 % USDT** | Every 5 min: cancel old orders → fresh book → tighter sells → repeat forever                          | Works on illiquid coins, weekends, holidays — you **will** be flat before sleep                                          |
+| 4 | **True Night Sleep Mode Only After Full Exit**   | All new buys & rebalancing blocked after 18:00 until 100 % USDT confirmed                              | Impossible to accidentally hold positions overnight                                                                      |
+| 5 | **Platinum Infinity Grid (Golden Ratio)**        | 8 buy + 8 sell levels, 1.2 % spacing, Golden Ratio (1.618) progression                                | Mathematically optimal density → maximum fills in ranging markets                                                       |
+| 6 | **RSI + Order-Book Smart Rebalancing**           | Every 12 min forces positions to 15 % (overbought), 4 % (oversold), or 5 % (neutral)                   | Auto profit-taking, prevents blow-ups, perfect risk distribution                                                         |
+| 7 | **CoinGecko Top-10 Trending Auto-Selector**      | Hourly scans → picks only the 10 hottest coins with real momentum + volume                            | Always trading the coins that are actually moving — no dead positions                                                    |
+| 8 | **Permanent Blacklist**                          | Excludes BTC, ETH SOL all stables & wrapped tokens                                                 | 100 % capital focused on mid-cap altcoins where grid trading actually prints money                                       |
+| 9 | **Dual Binance.US Real-Time WebSockets**         | Zero-latency balance, price & fill updates                                                             | Instant re-gridding the millisecond a fill occurs                                                                        |
+|10| **Full WhatsApp Alerts (CallMeBot)**             | Every exit wave, fill, rebalance & final “100 % USDT” confirmation sent to your phone                 | You always know what’s happening — no surprises                                                                          |
+|11| **Beautiful Dark GUI + Live Terminal**           | Centered 800×900 window with live stats and scrolling log                                           | Professional monitoring without command line                                                                             |
+|12| **33 % USDT Reserve + $8 Minimum Buffer**        | Never spends the last third of cash                                                                    | Always has dry powder ready for the next morning’s dip buys                                                              |
+|13| **Single-File, Zero External Dependencies**     | One .py file — just set API keys and run                                                               | Easy to deploy, audit, backup, and move between machines                                                                |
+
+### Daily 24-Hour Lifecycle
+
+| Time (CST)         | Bot Behavior                                                                                             |
+|---------------------|----------------------------------------------------------------------------------------------------------|
+| 03:00 – 17:29       | Full aggressive trading — grids, rebalancing, trending coin rotation                                   |
+| **17:30 – ~18:30**  | **MANDATORY EXIT MODE** — relentless limit sells every 5 min until 100 % USDT                           |
+| 18:00 – 02:59       | Complete silence — zero new orders possible until full exit confirmed                                   |
+| 03:00 next day      | Wakes up fresh with 100 % USDT and starts hunting the next day’s profits                                |
+
+### Result
+
+You make money all day using one of the most sophisticated grid + rebalancing systems ever coded…  
+and **every single night you are guaranteed to be 100 % in USDT** — automatically, without thinking, without fail.
+
+This is not just a grid bot.  
+This is **the safest, most disciplined, and highest-expectancy automated trading system possible in 2025**.
+
+**Press START → live your life → wake up richer and completely protected every single morning.**
+
+**INFINITY GRID PLATINUM 2025 — Peace of mind meets maximum profit.** 
+
+Made with ❤️ by traders who refuse to get deflated overnight
 
 
 
