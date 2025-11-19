@@ -285,18 +285,22 @@ def get_buy_pressure_and_slippage(symbol):
     except:
         return Decimal('0.5'), Decimal('10')
 
-# -------------------- WHALE WALL PROTECTION --------------------
+# -------------------- WHALE WALL PROTECTION (FIXED) --------------------
 def is_whale_wall_danger(symbol) -> bool:
     now = time.time()
-    if symbol in last_whale_check and now - last_whale_check[symbol] < WHALE_CHECK_INTERVAL:
-        return last_whale_check[symbol][1]  # cached result
+    if symbol in last_whale_check:
+        last_time, danger = last_whale_check[symbol]
+        if now - last_time < WHALE_CHECK_INTERVAL:
+            return danger  # return cached danger result
 
     pressure, slippage = get_buy_pressure_and_slippage(symbol)
     danger = (
         pressure < Decimal('0.40') or
         slippage > Decimal('1.2') or
-        pressure < Decimal('0.55') and slippage > Decimal('0.8')
+        (pressure < Decimal('0.55') and slippage > Decimal('0.8'))
     )
+    
+    # Store both timestamp and result
     last_whale_check[symbol] = (now, danger)
     return danger
 
