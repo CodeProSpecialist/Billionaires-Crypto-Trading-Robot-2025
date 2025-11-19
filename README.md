@@ -7,7 +7,7 @@
 **November 19, 2025 — Aggressive Evening Exit Edition**
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
-![Binance.US](https://img.shields.io/badge/Binance.US-Exclusive-orange)
+
 ![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen)
 
 ### Core Philosophy – Why This Bot Exists
