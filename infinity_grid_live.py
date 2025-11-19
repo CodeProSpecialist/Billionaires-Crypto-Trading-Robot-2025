@@ -435,54 +435,67 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-# -------------------- PERFECTED MOMENTUM BUY LIST --------------------
+# -------------------- PERFECTED MOMENTUM BUY LIST (NO BINANCE 24HR CALL) --------------------
 def generate_buy_list():
     global buy_list, last_buy_list_update
-    if exit_in_progress or not is_trading_allowed(): return
-    if time.time() - last_buy_list_update < 1800: return  # every 30 min
+    if exit_in_progress or not is_trading_allowed(): 
+        return
+    if time.time() - last_buy_list_update < 1800:  # every 30 min max
+        return
 
     try:
-        # 1. Get top 150 from CoinGecko
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
             'vs_currency': 'usd',
             'order': 'market_cap_desc',
             'per_page': 150,
             'page': 1,
-            'price_change_percentage': '24h,7d',
-            'sparkline': 'false'
+            'price_change_percentage': '24h,7d'
         }
-        coins = requests.get(url, params=params, timeout=20).json()
-
-        # 2. Get Binance 24hr stats for real volume
-        binance_stats = {t['symbol']: t for t in client.get_ticker_24hr() if t['symbol'].endswith('USDT')}
+        coins = requests.get(url, params=params, timeout=25).json()
 
         candidates = []
         for coin in coins:
             base = coin['symbol'].upper()
-            if base in BLACKLISTED_BASE_ASSETS: continue
+            if base in BLACKLISTED_BASE_ASSETS: 
+                continue
+                
             sym = base + 'USDT'
-            if sym not in symbol_info or sym not in binance_stats: continue
+            
+            # Critical: only coins that actually exist & trade on Binance.US
+            if sym not in symbol_info: 
+                continue
 
-            bstats = binance_stats[sym]
-            volume_usdt = Decimal(bstats['quoteVolume'])
-            price_change_24h = Decimal(bstats['priceChangePercent'])
+            volume_24h = Decimal(str(coin.get('total_volume') or 0))
+            change_24h = Decimal(str(coin.get('price_change_percentage_24h') or 0))
+            market_cap = Decimal(str(coin.get('market_cap') or 1))
 
-            if volume_usdt < Decimal('50_000_000'): continue
-            if price_change_24h < Decimal('4'): continue  # must be pumping today
+            # Filters: decent liquidity + pumping today + not a dead coin
+            if volume_24h < Decimal('40_000_000'): 
+                continue
+            if change_24h < Decimal('3.0'):  # must be up today
+                continue
+            if market_cap < Decimal('500_000_000'): 
+                continue
 
-            # Score: volume-weighted momentum
-            score = float(volume_usdt / 1_000_000) * (1 + float(price_change_24h) / 100)
-            candidates.append((sym, score))
+            # Score: high volume + strong 24h pump = rocket
+            score = float(volume_24h / 1_000_000) * (1 + float(change_24h) / 100)
+            candidates.append((sym, score, f"{base} +{change_24h:.2f}% vol ${volume_24h/1e6:.0f}M"))
 
+        # Top 15 rockets only
         candidates.sort(key=lambda x: -x[1])
-        buy_list = [x[0] for x in candidates[:15]]  # top 15 real rockets
+        buy_list = [x[0] for x in candidates[:15]]
+        
         last_buy_list_update = time.time()
-        terminal_insert(f"[{now_cst()}] 🚀 Buy list refreshed — {len(buy_list)} rockets")
-        send_whatsapp(f"🚀 New rocket list — {len(buy_list)} coins ready")
+        names = [x[2].split()[0] for x in candidates[:15]]
+        terminal_insert(f"[{now_cst()}] 🚀 Buy list refreshed — {len(buy_list)} coins: {', '.join(names)}")
+        send_whatsapp(f"🚀 New rocket list ({len(buy_list)}): {', '.join(names)}")
+
     except Exception as e:
-        terminal_insert(f"Buy list error: {e}")
-        buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT', 'AAVEUSDT', 'NEARUSDT']
+        terminal_insert(f"Buy list failed: {e}")
+        # Super safe fallback
+        buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT', 
+                    'AAVEUSDT', 'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT']
 
 # -------------------- MID-MOVE GRID (NO TOPS, NO BOTTOMS) --------------------
 def place_platinum_grid(symbol):
