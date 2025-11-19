@@ -1,92 +1,59 @@
 # Check back here weekly for the newest program version. 
  The newest update was on 11-19-2025. 
 
-# INFINITY GRID PLATINUM 2025 – Full Feature Overview
+Infinity Grid Platinum 2025
+Ultra-Fast 30-Second RSI + Order-Book Rebalance Edition November 19, 2025 — Current Version
+Core Philosophy
+A hyper-responsive, momentum-chasing infinity grid trading bot built exclusively for Binance.US USDT spot pairs. It constantly maintains golden-ratio-scaled buy/sell grids on the 10 hottest mid-cap altcoins while aggressively reallocating capital based on real-time RSI and order-book sentiment — now checking and rebalancing the entire portfolio every 30 seconds.
+Key Features & Upgrades
+Feature
+Description
+Infinity Grid Engine
+8 buy + 8 sell limit orders around current price
+• Buy side: Golden ratio (φ ≈ 1.618×) quantity growth
+• Sell side: Optimized 1.309× growth for maximum bounce capture
+• 1.2 % grid spacing, 1.5× base cash per level
+Ultra-Fast Rebalancing
+Every 30 seconds the bot recalculates target allocation using:
+• 14-period RSI
+• Top-20 order-book bid/ask pressure ratio
+Smart Dynamic Allocation
+• 15 % of total portfolio → if RSI ≥ 70 AND bid pressure ≥ 65 % (confirmed bull)
+• 4 % → if RSI ≤ 35 AND bid pressure ≤ 35 % (confirmed bear)
+• 5 % neutral default
+Aggressive Coin Rotation
+Hourly Coingecko scan selects the top 10 altcoins matching:
+• Market cap ≥ $800 M
+• 24 h volume ≥ $40 M
+• +6 % 7d & +12 % 14d price change
+Heavy blacklist excludes BTC, ETH, stables, and majors
+Instant Grid Refresh
+Every time an order fills → immediately cancel all open orders for that symbol → place brand-new grid at the new price
+Risk Controls
+• 33 % USDT reserve + minimum $8 cash always protected
+• Full compliance with Binance lot size, tick size, and min notional rules
+• High-precision Decimal math (28 digits)
+Real-Time Data Feeds
+Binance WebSocket user stream + full ticker stream for instant balance/execution/price updates
+Notifications
+WhatsApp alerts via CallMeBot on:
+• Every grid fill
+• Rebalance buys/sells
+• New buy-list
+• Bot start/stop (with cooldowns)
+User Interface
+Clean dark Tkinter GUI (800×900)
+• Live terminal log
+• Real-time USDT balance & active order count
+• Big START / STOP buttons
+Trading Behavior Summary
+	•	Acts like a classic infinity grid on steroids during strong trends
+	•	Rapidly scales into coins showing confirmed buying pressure and momentum
+	•	Quickly cuts exposure when order-book turns bearish or RSI becomes oversold
+	•	Constantly rotates into whatever mid-cap is pumping hardest right now
+This is one of the most adaptive and aggressive grid-style bots available in 2025 — designed for the fast-moving altcoin meta where seconds matter.
+Perfect for traders who want “set it and forget it” performance with whale-level responsiveness. 🚀
 
-This is a fully automated Binance.US spot trading bot (Python/Tkinter GUI) that runs an **infinite grid strategy** on a dynamically selected basket of altcoins, combined with **order-book-based dynamic rebalancing**.
-
-## Core Strategy Components
-
-| Component                  | Description                                                                 |
-|----------------------------|-----------------------------------------------------------------------------|
-| **Grid Type**              | Asymmetric Infinite Grid (Buy grid below price, Sell grid above price)     |
-| **Position Sizing**        | Golden Ratio (φ ≈ 1.618) progression on buys, optimized 1.309× on sells    |
-| **Base Investment per Level** | $12 USD equivalent per grid level (`BASE_CASH_PER_LEVEL × 1.5`)           |
-| **Grid Depth**             | 8 buy levels + 8 sell levels per coin                                      |
-| **Grid Spacing**           | Fixed-percentage: 1.2% between each level (compounding downward/upward)    |
-| **Re-grid on Fill**        | Instantly cancels all open orders for that symbol and places a fresh grid centered on the new current price |
-
-## Coin Selection (CoinGecko Integration)
-
-- Updates **every hour** (or on bot start)
-- Pulls top 100 coins by market cap from CoinGecko API (`vs_currency=usd`)
-- Strict filtering:
-  - Must have a valid `/USDT` trading pair on Binance.US
-  - Market cap ≥ $800 M
-  - 24h volume ≥ $40 M
-  - 7-day price change ≥ +6%
-  - 14-day price change ≥ +12%
-  - Scoring formula: `1.5×7d% + 14d% + (volume / market_cap × 100)`
-- **Hard blacklist** (never traded, even if pair exists):  
-  `BTC`, `ETH`, `SOL`, `XRP`, `BNB`, `BCH` + all stablecoins + wrapped tokens (`WBTC`, `WETH`, etc.)
-- Selects **top 10 scoring** coins → final `buy_list`
-- Fallback safe list if API fails:  
-  `ADAUSDT`, `AVAXUSDT`, `DOTUSDT`, `MATICUSDT`, `LINKUSDT`, `UNIUSDT`, `AAVEUSDT`, `CRVUSDT`, `COMPUSDT`, `MKRUSDT`
-
-## Grid Order Placement Details
-
-| Side | Levels | Price Formula                            | Quantity Progression                     | Notes                          |
-|------|--------|------------------------------------------|------------------------------------------|--------------------------------|
-| Buy  | 8      | `current_price × (1 - 0.012)^n`          | `cash × 1.618^(n-1) / price`             | Larger size deeper in dip      |
-| Sell | 8      | `current_price × (1 + 0.012)^n`          | `cash × 1.309^(n-1) / price`             | Smaller size higher up         |
-
-- All prices/quantities rounded to exchange tickSize/stepSize
-- Minimum notional and quantity filters respected
-- Limit orders placed slightly aggressive for faster fills:
-  - Buys: `calculated_price × 1.001`
-  - Sells: `calculated_price × 0.999`
-
-## Rebalancing Engine (Order-Book Pressure Based)
-
-- Runs **every 12 minutes** (`REBALANCE_INTERVAL = 720` seconds)
-- Calculates total portfolio value in USD (all holdings × current price + USDT)
-- For every held altcoin:
-  1. Fetches top 20 bid/ask levels → computes **buy pressure ratio** (bids value / total depth value)
-     - > 65% bids → **High conviction** → target **15%** of portfolio
-     - < 35% bids → **Low conviction** → target **4%** of portfolio
-     - Otherwise → target **5%** of portfolio
-  2. If current value > 105% of target → place limit sell to reduce
-  3. If current value < 95% of target **and** buy pressure > 60% → place limit buy (only if enough free USDT after reserves)
-
-## Fee & Reserve Handling
-
-- Assumes 0.1% maker/taker fee (`FEE_RATE = 0.001`)
-- Every buy adds fee buffer: `required_usdt = price × qty × 1.001`
-- **Reserve system**: Always keeps **33% of USDT balance + minimum $8** untouched → never goes all-in
-
-## Safety & Risk Management
-
-- Full blacklist enforcement
-- Strict market-cap, volume, and momentum filters
-- Reserve system prevents liquidation-style drawdowns
-- Instant re-grid on every fill → true infinite grid behavior
-- All open orders canceled on STOP or per-symbol regrid
-
-## GUI & Monitoring
-
-- Fixed 800×900 dark-theme window
-- Real-time scrolling terminal log
-- Live USDT balance and active order counter
-- Large START / STOP buttons
-- Runs exclusively on **Binance.US** (`tld='us'`)
-
-## Summary
-
-The bot combines three powerful mechanisms:
-
-1. **Infinite grid profit** from volatility on 10 high-conviction altcoins  
-2. **Momentum filtering** via CoinGecko (only trades coins already outperforming)  
-3. **Dynamic allocation** based on real-time order-book sentiment (not just price)
 
 Result: A completely hands-off, 24/7 grid bot that automatically concentrates capital into the strongest mid/large-cap altcoins while continuously harvesting grid profits.
 ---
