@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION
-★ MACD + RSI + Order Book Buy Pressure + Money Flow Index (MFI) all combined
-★ Dynamic rebalance every 15 seconds
-★ Only websocket threads — zero GUI freeze
-★ WhatsApp shows live total portfolio balance
-★ Daily 17:30 CST → 100% USDT forced exit
-November 19, 2025 — Respectful & Complete Edition
+INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION (Nov 19, 2025)
+★ All upgrades applied: whale protection, perfect momentum list, mid-move entry, smart rebalance
 """
 
 import os
@@ -22,6 +17,7 @@ import pytz
 import websocket
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+import threading
 
 # -------------------- PRECISION & CONSTANTS --------------------
 getcontext().prec = 28
@@ -76,6 +72,8 @@ last_buy_list_update = 0
 kline_cache = {}
 macd_cache = {}
 placing_order_for = set()
+last_whale_check = {}
+WHALE_CHECK_INTERVAL = 60  # seconds
 
 BLACKLISTED_BASE_ASSETS = {
     'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH', 'LTC', 'DOGE', 'PEPE', 'SHIB',
@@ -240,8 +238,7 @@ def get_mfi(symbol, period=14):
         typical_prices = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
         raw_money_flow = [tp * v for tp, v in zip(typical_prices, volumes)]
 
-        positive_flow = ZERO
-        negative_flow = ZERO
+        positive_flow = negative_flow = ZERO
         for i in range(1, len(typical_prices)):
             if typical_prices[i] > typical_prices[i-1]:
                 positive_flow += raw_money_flow[i]
@@ -254,15 +251,54 @@ def get_mfi(symbol, period=14):
         return mfi.quantize(Decimal('0.01'))
     except: return Decimal('50')
 
-def get_buy_pressure(symbol):
+def get_buy_pressure_and_slippage(symbol):
+    """Returns (buy_pressure, estimated_slippage_pct_for_10k_usdt)"""
     try:
-        book = client.get_order_book(symbol=symbol, limit=20)
-        bid_vol = sum(Decimal(b[1]) for b in book['bids'])
-        ask_vol = sum(Decimal(a[1]) for a in book['asks'])
+        book = client.get_order_book(symbol=symbol, limit=50)
+        bids = book['bids']
+        asks = book['asks']
+        
+        bid_vol = sum(Decimal(b[1]) for b in bids)
+        ask_vol = sum(Decimal(a[1]) for a in asks)
         total = bid_vol + ask_vol
-        if total == ZERO: return Decimal('0.5')
-        return (bid_vol / total).quantize(Decimal('0.0001'))
-    except: return Decimal('0.5')
+        buy_pressure = (bid_vol / total) if total > ZERO else Decimal('0.5')
+
+        # Estimate slippage for ~$10k buy
+        target_usdt = Decimal('10000')
+        accumulated = ZERO
+        slippage_price = ZERO
+        for price_str, qty_str in bids:
+            price = Decimal(price_str)
+            qty = Decimal(qty_str)
+            cost = price * qty
+            if accumulated + cost >= target_usdt:
+                remaining = target_usdt - accumulated
+                slippage_price = price
+                break
+            accumulated += cost
+        else:
+            slippage_price = Decimal(bids[-1][0])  # worst case
+
+        current_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+        slippage_pct = (current_price - slippage_price) / current_price * 100
+        return buy_pressure.quantize(Decimal('0.0001')), slippage_pct.quantize(Decimal('0.01'))
+    except:
+        return Decimal('0.5'), Decimal('10')
+
+# -------------------- WHALE WALL PROTECTION --------------------
+def is_whale_wall_danger(symbol) -> bool:
+    now = time.time()
+    if symbol in last_whale_check and now - last_whale_check[symbol] < WHALE_CHECK_INTERVAL:
+        return last_whale_check[symbol][1]  # cached result
+
+    pressure, slippage = get_buy_pressure_and_slippage(symbol)
+    danger = (
+        pressure < Decimal('0.40') or
+        slippage > Decimal('1.2') or
+        pressure < Decimal('0.55') and slippage > Decimal('0.8')
+    )
+    last_whale_check[symbol] = (now, danger)
+    return danger
 
 # -------------------- TRADING HOURS & EXIT --------------------
 def is_trading_allowed():
@@ -280,7 +316,8 @@ def is_portfolio_fully_in_usdt():
             return False
     return True
 
-# -------------------- WEBSOCKETS (ONLY THREADS) --------------------
+# -------------------- WEBSOCKETS --------------------
+# (unchanged - still perfect)
 def start_user_stream():
     import threading
 
@@ -398,25 +435,82 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-# -------------------- GRID WITH MULTI-INDICATOR CONFIRMATION --------------------
+# -------------------- PERFECTED MOMENTUM BUY LIST --------------------
+def generate_buy_list():
+    global buy_list, last_buy_list_update
+    if exit_in_progress or not is_trading_allowed(): return
+    if time.time() - last_buy_list_update < 1800: return  # every 30 min
+
+    try:
+        # 1. Get top 150 from CoinGecko
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            'vs_currency': 'usd',
+            'order': 'market_cap_desc',
+            'per_page': 150,
+            'page': 1,
+            'price_change_percentage': '24h,7d',
+            'sparkline': 'false'
+        }
+        coins = requests.get(url, params=params, timeout=20).json()
+
+        # 2. Get Binance 24hr stats for real volume
+        binance_stats = {t['symbol']: t for t in client.get_ticker_24hr() if t['symbol'].endswith('USDT')}
+
+        candidates = []
+        for coin in coins:
+            base = coin['symbol'].upper()
+            if base in BLACKLISTED_BASE_ASSETS: continue
+            sym = base + 'USDT'
+            if sym not in symbol_info or sym not in binance_stats: continue
+
+            bstats = binance_stats[sym]
+            volume_usdt = Decimal(bstats['quoteVolume'])
+            price_change_24h = Decimal(bstats['priceChangePercent'])
+
+            if volume_usdt < Decimal('50_000_000'): continue
+            if price_change_24h < Decimal('4'): continue  # must be pumping today
+
+            # Score: volume-weighted momentum
+            score = float(volume_usdt / 1_000_000) * (1 + float(price_change_24h) / 100)
+            candidates.append((sym, score))
+
+        candidates.sort(key=lambda x: -x[1])
+        buy_list = [x[0] for x in candidates[:15]]  # top 15 real rockets
+        last_buy_list_update = time.time()
+        terminal_insert(f"[{now_cst()}] 🚀 Buy list refreshed — {len(buy_list)} rockets")
+        send_whatsapp(f"🚀 New rocket list — {len(buy_list)} coins ready")
+    except Exception as e:
+        terminal_insert(f"Buy list error: {e}")
+        buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT', 'AAVEUSDT', 'NEARUSDT']
+
+# -------------------- MID-MOVE GRID (NO TOPS, NO BOTTOMS) --------------------
 def place_platinum_grid(symbol):
     if exit_in_progress or not is_trading_allowed(): return
+    if is_whale_wall_danger(symbol):
+        terminal_insert(f"[{now_cst()}] 🐳 Whale wall detected on {symbol} — skipping grid")
+        return
+
     try:
         price = price_cache.get(symbol, Decimal(client.get_symbol_ticker(symbol=symbol)['price']))
         info = symbol_info[symbol]
         grid_pct = Decimal('0.012')
         cash = BASE_CASH_PER_LEVEL * Decimal('1.5')
 
-        # Multi-indicator confirmation
+        rsi = get_rsi(symbol)
+        mfi = get_mfi(symbol)
         macd_line, signal_line, histogram = get_macd(symbol)
         macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
-        mfi = get_mfi(symbol)
-        mfi_bullish = mfi > Decimal('55')
+        pressure, _ = get_buy_pressure_and_slippage(symbol)
 
-        if not (macd_bullish and mfi_bullish):
-            terminal_insert(f"[{now_cst()}] Indicators not aligned — skipping grid for {symbol}")
+        # Mid-move sweet spot only
+        if not (Decimal('60') <= rsi <= Decimal('74') and
+                Decimal('50') < mfi < Decimal('82') and
+                macd_bullish and
+                pressure > Decimal('0.58')):
             return
 
+        # Place buys BELOW price (catch dips), sells ABOVE
         for i in range(1, 9):
             buy_price = price * ((ONE - grid_pct) ** i)
             buy_price = (buy_price // info['tickSize']) * info['tickSize']
@@ -442,22 +536,22 @@ def regrid_symbol(symbol):
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
-# -------------------- DYNAMIC REBALANCE — ALL INDICATORS --------------------
+# -------------------- SMARTER REBALANCING --------------------
 def dynamic_rebalance():
     if exit_in_progress or not is_trading_allowed(): return
 
     try:
         update_balances()
-        total_portfolio = account_balances.get('USDT', ZERO)
-        for asset in account_balances:
-            if asset == 'USDT': continue
+        total_portfolio = Decimal('0')
+        for asset, qty in account_balances.items():
+            if asset == 'USDT':
+                total_portfolio += qty
+                continue
             sym = asset + 'USDT'
-            if sym in symbol_info:
-                price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
-                total_portfolio += account_balances[asset] * price
+            if sym not in symbol_info: continue
+            price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
+            total_portfolio += qty * price
         if total_portfolio <= ZERO: return
-
-        terminal_insert(f"[{now_cst()}] Rebalance — Portfolio ${total_portfolio:,.0f}")
 
         for asset in list(account_balances.keys()):
             if asset == 'USDT': continue
@@ -468,88 +562,43 @@ def dynamic_rebalance():
             current_qty = account_balances.get(asset, ZERO)
             current_value = current_qty * current_price
 
-            buy_pressure = get_buy_pressure(sym)
+            pressure, slippage = get_buy_pressure_and_slippage(sym)
             rsi = get_rsi(sym)
             mfi = get_mfi(sym)
             macd_line, signal_line, histogram = get_macd(sym)
-            macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
+            macd_bullish = histogram is not None and histogram > ZERO
 
-            # Combined signal strength
-            if buy_pressure >= Decimal('0.70') and rsi < Decimal('75') and mfi > Decimal('60') and macd_bullish:
+            binance_stats = client.get_ticker_24hr(symbol=sym)
+            volume_24h = Decimal(binance_stats['quoteVolume'])
+
+            # Strong signal → 20%, decent → 12%, weak → 4%
+            if pressure >= Decimal('0.70') and rsi < Decimal('75') and mfi > Decimal('62') and macd_bullish and volume_24h > Decimal('100_000_000'):
                 target_pct = Decimal('0.20')
-            elif buy_pressure >= Decimal('0.60') and rsi < Decimal('70') and mfi > Decimal('55') and macd_bullish:
-                target_pct = Decimal('0.15')
-            elif buy_pressure >= Decimal('0.55') and macd_bullish:
-                target_pct = Decimal('0.10')
-            elif buy_pressure >= Decimal('0.45'):
-                target_pct = Decimal('0.05')
-            elif buy_pressure >= Decimal('0.30') and rsi > Decimal('25'):
-                target_pct = Decimal('0.03')
+            elif pressure >= Decimal('0.60') and rsi < Decimal('72') and macd_bullish:
+                target_pct = Decimal('0.12')
+            elif pressure >= Decimal('0.50') and macd_bullish:
+                target_pct = Decimal('0.06')
             else:
-                target_pct = Decimal('0.01')
+                target_pct = Decimal('0.02')
 
             target_value = total_portfolio * target_pct
 
-            if current_value > target_value * Decimal('1.08'):
+            # Wider tolerance: ±12% instead of ±8%
+            if current_value > target_value * Decimal('1.12') and volume_24h > Decimal('30_000_000'):
                 sell_qty = ((current_value - target_value) / current_price)
-                sell_qty = floor_to_step(sell_qty, symbol_info[sym]['stepSize']).quantize(Decimal('0.00000000'))
+                sell_qty = floor_to_step(sell_qty, symbol_info[sym]['stepSize'])
                 if sell_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
 
-            elif current_value < target_value * Decimal('0.92'):
+            elif current_value < target_value * Decimal('0.88'):
                 buy_qty = ((target_value - current_value) / current_price)
-                buy_qty = floor_to_step(buy_qty, symbol_info[sym]['stepSize']).quantize(Decimal('0.00000000'))
+                buy_qty = floor_to_step(buy_qty, symbol_info[sym]['stepSize'])
                 required = current_price * buy_qty * (ONE + taker_fee)
                 if get_available_usdt_after_reserve() >= required and buy_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
 
     except Exception as e:
         terminal_insert(f"Rebalance error: {e}")
-
-# -------------------- COINGECKO BUY LIST --------------------
-def generate_buy_list():
-    global buy_list, last_buy_list_update
-    if exit_in_progress or not is_trading_allowed(): return
-    if time.time() - last_buy_list_update < 3600: return
-
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            'vs_currency': 'usd',
-            'order': 'market_cap_desc',
-            'per_page': 100,
-            'page': 1,
-            'price_change_percentage': '7d,14d'
-        }
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        coins = r.json()
-
-        candidates = []
-        for coin in coins:
-            base = coin['symbol'].upper()
-            if base in BLACKLISTED_BASE_ASSETS: continue
-            sym = base + 'USDT'
-            if sym not in symbol_info: continue
-
-            market_cap = coin.get('market_cap') or 0
-            volume = coin.get('total_volume') or 0
-            change_7d = coin.get('price_change_percentage_7d_in_currency') or 0
-            change_14d = coin.get('price_change_percentage_14d_in_currency') or 0
-
-            if market_cap < 800_000_000 or volume < 40_000_000: continue
-            if change_7d < 6 or change_14d < 12: continue
-
-            score = change_7d * 1.5 + change_14d + (volume / max(market_cap, 1) * 100)
-            candidates.append((sym, score))
-
-        candidates.sort(key=lambda x: -x[1])
-        buy_list = [x[0] for x in candidates[:10]]
-        last_buy_list_update = time.time()
-        terminal_insert(f"[{now_cst()}] Buy list updated — {len(buy_list)} coins")
-        send_whatsapp(f"New trending list — Top {len(buy_list)} coins")
-    except:
-        buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT']
 
 # -------------------- AGGRESSIVE EVENING EXIT --------------------
 def aggressive_evening_exit():
@@ -585,7 +634,7 @@ def aggressive_evening_exit():
                 place_limit_order(sym, 'SELL', sell_price, sell_qty, is_exit=True)
         except: pass
 
-# -------------------- MAIN LOOP (15-SECOND CYCLE) --------------------
+# -------------------- MAIN LOOP --------------------
 def main_loop():
     if not running: return
 
@@ -602,7 +651,7 @@ def main_loop():
 
 # -------------------- GUI --------------------
 root = tk.Tk()
-root.title("INFINITY GRID PLATINUM 2025")
+root.title("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION")
 root.geometry("800x900")
 root.resizable(False, False)
 root.configure(bg="#0d1117")
@@ -642,8 +691,8 @@ def start_bot():
     if running: return
     running = True
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — Profit Mode Activated")
-    send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — FINAL PERFECTION ENGAGED")
+    send_whatsapp("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION STARTED")
     root.after(100, main_loop)
 
 def stop_bot():
@@ -668,6 +717,6 @@ if __name__ == "__main__":
     update_fees()
     start_user_stream()
     generate_buy_list()
-    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION READY")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION LOADED")
     update_gui()
     root.mainloop()
