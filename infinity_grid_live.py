@@ -63,7 +63,7 @@ last_rebalance = 0
 
 # -------------------- HARD BLACKLIST — NEVER TOUCH THESE (even in /USDT pairs) --------------------
 BLACKLISTED_BASE_ASSETS = {
-    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH',
+    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH', 'LTC', 'DOGE', 'PEPE', 'SHIB', 
     'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDP', 'GUSD',  # All stables
     'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'  # Wrapped junk
 }
