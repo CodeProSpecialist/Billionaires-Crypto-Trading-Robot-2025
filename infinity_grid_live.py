@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION EDITION
+INFINITY GRID PLATINUM 2025 — FINAL PERFECTION EDITION
 ★ Mandatory full exit at 17:30 CST → 100% USDT every night
 ★ Perfect websocket heartbeat — never drops
 ★ Real personal maker/taker fees from Binance.US
-★ Buy: exact fee + 33% + $8 reserve aware
+★ Buy: fee + 33% + $8 reserve aware
 ★ Sell: +0.3% net profit required
 ★ Strict LOT_SIZE & tickSize compliance
-★ Relentless 5-minute exit retries
+★ 5-minute exit retries until flat
 November 19, 2025
 """
 
@@ -31,7 +31,7 @@ getcontext().prec = 28
 ZERO = Decimal('0')
 ONE = Decimal('1')
 
-# Dynamic fees
+# Dynamic fees (updated from API)
 maker_fee = Decimal('0.0010')
 taker_fee = Decimal('0.0020')
 last_fee_update = 0
@@ -63,7 +63,7 @@ last_buy_alert = 0
 last_sell_alert = 0
 ALERT_COOLDOWN = 3600
 
-running = True  # Global running flag
+running = True
 
 # -------------------- ENVIRONMENT --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
@@ -96,25 +96,27 @@ BLACKLISTED_BASE_ASSETS = {
     'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'
 }
 
-# -------------------- DYNAMIC FEE FETCHER --------------------
+# -------------------- FIXED FEE FETCHER FOR BINANCE.US --------------------
 def update_fees():
     global maker_fee, taker_fee, last_fee_update
     if time.time() - last_fee_update < FEE_UPDATE_INTERVAL:
         return
     try:
-        fee_info = client.get_trade_fee()
-        for f in fee_info['tradeFee']:
-            maker_fee = Decimal(str(f['maker']))
-            taker_fee = Decimal(str(f['taker']))
-            break
+        # Binance.US returns plain text "maker taker" like "0.00100000 0.00200000"
+        response = client._request_margin('get', 'tradeFee', signed=True, data={})
+        fee_text = response.text.strip()
+        parts = fee_text.split()
+        if len(parts) >= 2:
+            maker_fee = Decimal(parts[0])
+            taker_fee = Decimal(parts[1])
         last_fee_update = time.time()
         terminal_insert(f"[{now_cst()}] Fees updated → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
     except Exception as e:
-        terminal_insert(f"Fee update failed: {e}")
+        terminal_insert(f"Fee update failed: {e} — using defaults")
 
 # -------------------- UTILITIES --------------------
 def now_cst():
-    return datetime.now(CST).strftime("%Y-%m-%d %H:MM:%S")
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
 
 def terminal_insert(msg):
     try:
@@ -221,7 +223,7 @@ def get_rsi(symbol, period=14):
         rsi = Decimal('100') - (Decimal('100') / (ONE + rs))
         return rsi.quantize(Decimal('0.01'))
     except:
-        return Decimal(' 50')
+        return Decimal('50')
 
 def get_buy_pressure(symbol):
     try:
@@ -260,7 +262,7 @@ def start_user_stream():
         while running:
             time.sleep(1800)
             try:
-                client.stream_get_listen_key()
+                client.stream_get_listen_key()  # Refreshes automatically on Binance.US
             except:
                 pass
 
@@ -346,7 +348,7 @@ def on_user_message(ws, message):
                 price_cache[symbol] = Decimal(data['c'])
 
     except Exception as e:
-        terminal_insert(f"WS Error: {e}")
+        pass  # Silent on malformed messages
 
 # -------------------- AGGRESSIVE EVENING EXIT --------------------
 def aggressive_evening_exit():
@@ -395,6 +397,7 @@ def aggressive_evening_exit():
             if sell_qty < info['minQty']:
                 continue
 
+            # Cancel old exit orders
             if sym in exit_sell_orders:
                 for oid in exit_sell_orders[sym]:
                     try: client.cancel_order(symbol=sym, orderId=oid)
@@ -446,7 +449,7 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
         if side == 'BUY':
             total_cost = notional * (ONE + taker_fee)
             if get_available_usdt_for_buy() < total_cost:
-                terminal_insert(f"[{now_cst()}] Insufficient USDT after reserve+fees for BUY {symbol}")
+                terminal_insert(f"[{now_cst()}] Insufficient USDT after reserve+fees")
                 return False
 
         if side == 'SELL' and not is_exit:
@@ -521,7 +524,7 @@ def place_platinum_grid(symbol):
             if qty <= owned:
                 place_limit_order(symbol, 'SELL', sell_price, qty)
                 owned -= qty
-    except Exception as e:
+    except:
         pass
 
 def regrid_symbol(symbol):
@@ -687,8 +690,8 @@ def start_bot():
     running = True
     threading.Thread(target=grid_cycle, daemon=True).start()
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT — Profit Mode ON")
-    send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — Professional Mode Active")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT")
+    send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — God Mode Activated")
 
 def stop_bot():
     global running
