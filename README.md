@@ -19,7 +19,8 @@ During U.S. night + Asian morning session:
 - Razor-thin order books
 - Any selling pressure causes cascading 10–30 % deflationary crashes
 
-**Holding altcoins overnight on Binance.US = the highest-risk gamble you can take.**
+**Holding altcoins 
+overnight = the highest-risk gamble you can take.**
 
 That’s why **INFINITY GRID PLATINUM 2025 treats the daily full exit as 100 % MANDATORY**.  
 Starting at **17:30 CST every single day**, the bot will relentlessly sell **everything** using aggressive but controlled limit orders until the portfolio is **100 % USDT — no exceptions, no excuses**.
