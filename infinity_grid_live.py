@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — FINAL CLEAN & PERFECT
-800x900 GUI | P&L Removed | update_balances Fixed | Order Book Rebalance
-November 18, 2025 — FLAWLESS
+INFINITY GRID PLATINUM 2025 — RSI + ORDER BOOK REBALANCE EDITION
+November 19, 2025 — RSI 70 = 15% | RSI 35 = 4% | Smart Dynamic Allocation
 """
 
 import os
@@ -33,19 +32,29 @@ MIN_USDT_RESERVE = Decimal('8')
 CST = pytz.timezone("America/Chicago")
 REBALANCE_INTERVAL = 720  # 12 minutes
 
-# Position targets
-TARGET_HIGH = Decimal('0.15')   # 15%
-TARGET_MEDIUM = Decimal('0.05') # 5%
-TARGET_LOW = Decimal('0.04')    # 4%
+# RSI Settings (14-period)
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = Decimal('70')
+RSI_OVERSOLD = Decimal('35')
+
+# -------------------- CALLMEBOT ALERT TRACKING --------------------
+last_buy_alert = 0
+last_sell_alert = 0
+ALERT_COOLDOWN = 3600  # 1 hour
 
 # -------------------- ENVIRONMENT --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
 
+if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
+    messagebox.showwarning("CallMeBot", "CALLMEBOT_API_KEY or CALLMEBOT_PHONE not set — WhatsApp alerts DISABLED")
+else:
+    print("✓ CallMeBot WhatsApp alerts ENABLED")
+
 api_key = os.getenv('BINANCE_API_KEY')
 api_secret = os.getenv('BINANCE_API_SECRET')
 if not api_key or not api_secret:
-    messagebox.showerror("Error", "Set BINANCE_API_KEY and BINANCE_API_SECRET required!")
+    messagebox.showerror("Error", "BINANCE_API_KEY and BINANCE_API_SECRET required!")
     sys.exit(1)
 
 client = Client(api_key, api_secret, tld='us')
@@ -60,13 +69,38 @@ price_cache = {}
 buy_list = []
 last_buy_list_update = 0
 last_rebalance = 0
+kline_cache = {}  # For RSI calculation: symbol -> list of closes
 
-# -------------------- HARD BLACKLIST — NEVER TOUCH THESE (even in /USDT pairs) --------------------
+# -------------------- BLACKLIST --------------------
 BLACKLISTED_BASE_ASSETS = {
-    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH', 'LTC', 'DOGE', 'PEPE', 'SHIB', 
-    'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDP', 'GUSD',  # All stables
-    'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'  # Wrapped junk
+    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH',
+    'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDP', 'GUSD',
+    'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'
 }
+
+# -------------------- CALLMEBOT --------------------
+def send_whatsapp(message):
+    global last_buy_alert, last_sell_alert
+    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
+        return
+
+    now = time.time()
+    is_buy = "BUY" in message.upper()
+    is_sell = "SELL" in message.upper()
+
+    if is_buy and now - last_buy_alert < ALERT_COOLDOWN:
+        return
+    if is_sell and now - last_sell_alert < ALERT_COOLDOWN:
+        return
+
+    try:
+        url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
+        requests.get(url, timeout=10)
+        if is_buy: last_buy_alert = now
+        if is_sell: last_sell_alert = now
+        print(f"WhatsApp → {message}")
+    except Exception as e:
+        print(f"CallMeBot failed: {e}")
 
 # -------------------- UTILITIES --------------------
 def now_cst():
@@ -76,10 +110,9 @@ def terminal_insert(msg):
     try:
         terminal_text.insert(tk.END, msg + "\n")
         terminal_text.see(tk.END)
-    except:
-        pass
+    except: pass
 
-# -------------------- FIXED update_balances --------------------
+# -------------------- BALANCES & SYMBOL INFO --------------------
 def update_balances():
     global account_balances
     try:
@@ -96,7 +129,6 @@ def update_balances():
     except Exception as e:
         terminal_insert(f"[{now_cst()}] Balance update failed: {e}")
 
-# -------------------- SYMBOL INFO --------------------
 def load_symbol_info():
     global symbol_info
     try:
@@ -117,7 +149,44 @@ def load_symbol_info():
     except Exception as e:
         terminal_insert(f"Symbol load error: {e}")
 
-# -------------------- ORDER BOOK REBALANCE --------------------
+# -------------------- RSI & ORDER BOOK PRESSURE --------------------
+def get_rsi(symbol, period=14):
+    try:
+        if symbol not in kline_cache or len(kline_cache[symbol]) < period + 1:
+            klines = client.get_klines(symbol=symbol, interval='1m', limit=period + 1)
+            closes = [Decimal(k[4]) for k in klines]
+            kline_cache[symbol] = closes
+        else:
+            # Update only latest close
+            latest = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
+            kline_cache[symbol] = (kline_cache[symbol][-(period):] + [latest])[-period-1:]
+
+        closes = kline_cache[symbol]
+        if len(closes) < period + 1:
+            return Decimal('50')
+
+        gains = ZERO
+        losses = ZERO
+        for i in range(1, len(closes)):
+            change = closes[i] - closes[i-1]
+            if change > 0:
+                gains += change
+            else:
+                losses -= change
+
+        if losses == ZERO:
+            return Decimal('100')
+        if gains == ZERO:
+            return ZERO
+
+        avg_gain = gains / period
+        avg_loss = losses / period
+        rs = avg_gain / avg_loss
+        rsi = Decimal('100') - (Decimal('100') / (ONE + rs))
+        return rsi.quantize(Decimal('0.01'))
+    except:
+        return Decimal('50')
+
 def get_buy_pressure(symbol):
     try:
         book = client.get_order_book(symbol=symbol, limit=500)
@@ -126,10 +195,11 @@ def get_buy_pressure(symbol):
         total = bids + asks
         if total == ZERO:
             return Decimal('0.5')
-        return bids / total
+        return (bids / total).quantize(Decimal('0.0001'))
     except:
         return Decimal('0.5')
 
+# -------------------- SMART DYNAMIC REBALANCE (NEW LOGIC) --------------------
 def dynamic_rebalance():
     global last_rebalance
     if time.time() - last_rebalance < REBALANCE_INTERVAL:
@@ -145,7 +215,6 @@ def dynamic_rebalance():
             if sym in symbol_info:
                 price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
                 total_portfolio += account_balances[asset] * price
-
         if total_portfolio <= ZERO:
             return
 
@@ -156,42 +225,51 @@ def dynamic_rebalance():
             sym = asset + 'USDT'
             if sym not in symbol_info: continue
 
+            rsi = get_rsi(sym)
             pressure = get_buy_pressure(sym)
-
-            if pressure > Decimal('0.65'):
-                target_pct = TARGET_HIGH  # 15%
-            elif pressure < Decimal('0.35'):
-                target_pct = TARGET_LOW    # 4%
-            else:
-                target_pct = TARGET_MEDIUM # 5%
-
             current_qty = account_balances.get(asset, ZERO)
             current_price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
             current_value = current_qty * current_price
+
+            # === NEW RSI + ORDER BOOK TARGET LOGIC ===
+            if rsi >= RSI_OVERBOUGHT and pressure >= Decimal('0.65'):
+                target_pct = Decimal('0.15')  # 15% — Bullish confirmed
+                reason = f"RSI≥70 ({rsi}) + Strong Bids ({pressure:.1%})"
+            elif rsi <= RSI_OVERSOLD and pressure <= Decimal('0.35'):
+                target_pct = Decimal('0.04')  # 4% — Bearish confirmed
+                reason = f"RSI≤35 ({rsi}) + Weak Bids ({pressure:.1%})"
+            else:
+                target_pct = Decimal('0.05')  # 5% — Neutral
+                reason = f"Neutral (RSI {rsi}, Bids {pressure:.1%})"
+
             target_value = total_portfolio * target_pct
 
             if current_value > target_value * Decimal('1.05'):
-                sell_qty = (current_value - target_value) / current_price
+                sell_qty = ((current_value - target_value) / current_price)
                 sell_qty = (sell_qty // symbol_info[sym]['stepSize']) * symbol_info[sym]['stepSize']
                 sell_qty = sell_qty.quantize(Decimal('0.00000000'))
                 if sell_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
-                    terminal_insert(f"[{now_cst()}] REBAL SELL {asset} {sell_qty} (pressure {pressure:.1%} → {target_pct:.1%})")
+                    msg = f"REBAL SELL {asset} {sell_qty} → {target_pct:.0%} [{reason}]"
+                    terminal_insert(f"[{now_cst()}] {msg}")
+                    send_whatsapp(f"↓ {msg}")
 
-            elif current_value < target_value * Decimal('0.95') and pressure > Decimal('0.6'):
-                buy_qty = (target_value - current_value) / current_price
+            elif current_value < target_value * Decimal('0.95'):
+                buy_qty = ((target_value - current_value) / current_price)
                 buy_qty = (buy_qty // symbol_info[sym]['stepSize']) * symbol_info[sym]['stepSize']
                 buy_qty = buy_qty.quantize(Decimal('0.00000000'))
                 required = current_price * buy_qty * (ONE + FEE_RATE)
                 available = account_balances.get('USDT', ZERO) - (account_balances.get('USDT', ZERO) * RESERVE_PCT + MIN_USDT_RESERVE)
                 if available >= required and buy_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
-                    terminal_insert(f"[{now_cst()}] REBAL BUY {asset} {buy_qty} (pressure {pressure:.1%} → {target_pct:.1%})")
+                    msg = f"REBAL BUY {asset} {buy_qty} → {target_pct:.0%} [{reason}]"
+                    terminal_insert(f"[{now_cst()}] {msg}")
+                    send_whatsapp(f"↑ {msg}")
 
     except Exception as e:
         terminal_insert(f"Rebalance error: {e}")
 
-# -------------------- GRID ENGINE --------------------
+# -------------------- GRID ENGINE (UNCHANGED + ALERTS) --------------------
 def place_limit_order(symbol, side, price, qty):
     global active_orders
     info = symbol_info.get(symbol)
@@ -213,7 +291,11 @@ def place_limit_order(symbol, side, price, qty):
                                     price=str(price), quantity=str(qty))
         active_grid_orders.setdefault(symbol, []).append(order['orderId'])
         active_orders += 1
-        terminal_insert(f"[{now_cst()}] SUCCESS {side} {symbol} {qty} @ {price}")
+
+        base = symbol.replace('USDT', '')
+        msg = f"GRID {side} {base} {qty} @ ${price:.8f}"
+        terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
+        send_whatsapp(f"∞ {msg}")
         return True
     except BinanceAPIException as e:
         if e.code == -2010:
@@ -262,7 +344,6 @@ def place_platinum_grid(symbol):
             if qty <= owned:
                 place_limit_order(symbol, 'SELL', sell_price, qty)
                 owned -= qty
-
     except Exception as e:
         pass
 
@@ -291,7 +372,9 @@ def on_user_message(ws, message):
             qty = Decimal(data['q'])
             price = Decimal(data['p'])
             base = symbol.replace('USDT', '')
-            terminal_insert(f"[{now_cst()}] FILLED {side} {base} {qty:.6f} @ {price:.8f}")
+            fill_msg = f"FILLED {side} {base} {qty:.6f} @ ${price:.8f}"
+            terminal_insert(f"[{now_cst()}] {fill_msg}")
+            send_whatsapp(f"{'🟢' if side=='BUY' else '🔴'} {base} {qty:.4f} @ ${price:.6f}")
             threading.Thread(target=regrid_symbol, args=(symbol,), daemon=True).start()
 
         elif e == '24hrTicker':
@@ -319,9 +402,8 @@ def start_user_stream():
 
 # -------------------- COINGECKO BUY LIST --------------------
 def generate_buy_list():
-    """CoinGecko top coins — ONLY CLEAN /USDT PAIRS — BLACKLIST ENFORCED"""
     global buy_list, last_buy_list_update
-    if time.time() - last_buy_list_update < 3600:  # hourly
+    if time.time() - last_buy_list_update < 3600:
         return
 
     try:
@@ -331,6 +413,7 @@ def generate_buy_list():
             'order': 'market_cap_desc',
             'per_page': 100,
             'page': 1,
+            'sparkline': False,
             'price_change_percentage': '7d,14d'
         }
         r = requests.get(url, params=params, timeout=20)
@@ -340,50 +423,38 @@ def generate_buy_list():
         candidates = []
         for coin in coins:
             base = coin['symbol'].upper()
-
-            # HARD BLACKLIST — NEVER EVER
-            if base in BLACKLISTED_BASE_ASSETS:
-                continue
-
+            if base in BLACKLISTED_BASE_ASSETS: continue
             sym = base + 'USDT'
-            if sym not in symbol_info:  # Must exist on Binance.US
-                continue
+            if sym not in symbol_info: continue
 
             market_cap = coin.get('market_cap', 0)
             volume = coin.get('total_volume', 0)
             change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
             change_14d = coin.get('price_change_percentage_14d_in_currency', 0) or 0
 
-            # Only high-quality altcoins
-            if market_cap < 800_000_000 or volume < 40_000_000:
-                continue
-            if change_7d < 6 or change_14d < 12:
-                continue
+            if market_cap < 800_000_000 or volume < 40_000_000: continue
+            if change_7d < 6 or change_14d < 12: continue
 
             score = change_7d * 1.5 + change_14d + (volume / max(market_cap, 1) * 100)
             candidates.append((sym, score, coin['name']))
 
         candidates.sort(key=lambda x: -x[1])
         buy_list = [x[0] for x in candidates[:10]]
-
         last_buy_list_update = time.time()
-        terminal_insert(f"[{now_cst()}] BLACKLIST ACTIVE — {len(buy_list)} CLEAN /USDT coins selected")
-        for sym, score, name in candidates[:10]:
-            terminal_insert(f"  → {sym} ({name}) | Score {score:.0f}")
+        terminal_insert(f"[{now_cst()}] BLACKLIST ACTIVE — {len(buy_list)} coins selected")
+        send_whatsapp(f"New buy list — Top {len(buy_list)} coins updated")
 
     except Exception as e:
         terminal_insert(f"Buy list error: {e}")
-        # Ultra-safe fallback — only clean alts
         buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT', 'UNIUSDT', 'AAVEUSDT', 'CRVUSDT', 'COMPUSDT', 'MKRUSDT']
 
-# -------------------- GUI 800x900 — P&L REMOVED --------------------
+# -------------------- GUI 800x900 --------------------
 root = tk.Tk()
 root.title("INFINITY GRID PLATINUM 2025")
 root.geometry("800x900")
 root.resizable(False, False)
 root.configure(bg="#0d1117")
 
-# Center window
 screen_w = root.winfo_screenwidth()
 screen_h = root.winfo_screenheight()
 x = (screen_w - 800) // 2
@@ -399,10 +470,8 @@ tk.Label(root, text="PLATINUM 2025", font=title_font, fg="#ffffff", bg="#0d1117"
 
 stats = tk.Frame(root, bg="#0d1117")
 stats.pack(padx=40, fill="x", pady=20)
-
 usdt_label = tk.Label(stats, text="USDT Balance: $0.00", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
 usdt_label.pack(fill="x", pady=5)
-
 orders_label = tk.Label(stats, text="Active Orders: 0", font=big_font, fg="#39d353", bg="#0d1117", anchor="w")
 orders_label.pack(fill="x", pady=5)
 
@@ -421,7 +490,8 @@ def start_bot():
     running = True
     threading.Thread(target=grid_cycle, daemon=True).start()
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — 12-MIN REBALANCE ACTIVE")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — RSI+ORDERBOOK REBALANCE ACTIVE")
+    send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — RSI Smart Mode ON")
 
 def stop_bot():
     global running
@@ -429,6 +499,7 @@ def stop_bot():
     for s in list(active_grid_orders.keys()):
         cancel_symbol_orders(s)
     status_label.config(text="Status: Stopped", fg="red")
+    send_whatsapp("INFINITY GRID STOPPED")
 
 tk.Button(button_frame, text="START BOT", command=start_bot, bg="#238636", fg="white", font=big_font, width=20, height=2).pack(side="right", padx=15)
 tk.Button(button_frame, text="STOP BOT", command=stop_bot, bg="#da3633", fg="white", font=big_font, width=20, height=2).pack(side="right", padx=15)
@@ -452,6 +523,6 @@ if __name__ == "__main__":
     load_symbol_info()
     start_user_stream()
     generate_buy_list()
-    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL & READY")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — RSI + ORDER BOOK REBALANCE READY")
     update_gui()
     root.mainloop()
