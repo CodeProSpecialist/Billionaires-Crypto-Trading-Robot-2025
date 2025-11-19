@@ -47,7 +47,7 @@ SELL_GROWTH_OPTIMAL = Decimal('1.309')
 RESERVE_PCT = Decimal('0.33')
 MIN_USDT_RESERVE = Decimal('8')
 CST = pytz.timezone("America/Chicago")
-REBALANCE_INTERVAL = 720
+REBALANCE_INTERVAL = 15  # Changed to 15 seconds
 
 EVENING_EXIT_START = "17:30"
 TRADING_START_HOUR = 3
@@ -63,7 +63,7 @@ RSI_OVERSOLD = Decimal('35')
 
 last_buy_alert = 0
 last_sell_alert = 0
-ALERT_COOLDOWN = 3600
+ALERT_COOLDOWN = 600  # Changed to 10 minutes (600 seconds)
 
 running = True
 
@@ -131,10 +131,14 @@ def send_whatsapp(message):
         return
     try:
         url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
+        # Debug: Uncomment next line to log URL
+        # print(f"Sending WhatsApp: {url}")
         requests.get(url, timeout=10)
         if is_buy: last_buy_alert = now
         if is_sell: last_sell_alert = now
-    except: pass
+    except Exception as e:
+        # Debug: Log errors
+        print(f"WhatsApp send error: {e}")
 
 def floor_to_step(value: Decimal, step_size: Decimal) -> Decimal:
     if step_size <= ZERO: return value
@@ -577,9 +581,10 @@ def regrid_symbol(symbol):
 
 # -------------------- DYNAMIC REBALANCE --------------------
 def dynamic_rebalance():
+    global last_rebalance
     if exit_in_progress or not is_trading_allowed():
         return
-    global last_rebalance
+    # Light check for edge cases (e.g., manual calls)
     if time.time() - last_rebalance < REBALANCE_INTERVAL:
         return
     last_rebalance = time.time()
@@ -630,11 +635,21 @@ def dynamic_rebalance():
                 buy_qty = floor_to_step(buy_qty, symbol_info[sym]['stepSize'])
                 buy_qty = buy_qty.quantize(Decimal('0.00000000'))
                 required = current_price * buy_qty * (ONE + taker_fee)
-                if get_available_usdt_after_reserve() >= required and buy_qty >= symbol_info[sym]['minQty']:
+                available = get_available_usdt_after_reserve()
+                if available >= required and buy_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
+                else:
+                    if buy_qty >= symbol_info[sym]['minQty']:
+                        terminal_insert(f"[{now_cst()}] REBAL BUY BLOCKED {sym} — Need ${required:.2f} | Avail ${available:.2f}")
 
     except Exception as e:
         terminal_insert(f"Rebalance error: {e}")
+
+# -------------------- REBALANCE THREAD --------------------
+def rebalance_loop():
+    while running:
+        dynamic_rebalance()
+        time.sleep(REBALANCE_INTERVAL)
 
 # -------------------- COINGECKO BUY LIST --------------------
 def generate_buy_list():
@@ -725,6 +740,7 @@ def start_bot():
     global running
     running = True
     threading.Thread(target=grid_cycle, daemon=True).start()
+    threading.Thread(target=rebalance_loop, daemon=True).start()  # New rebalance thread
     status_label.config(text="Status: RUNNING", fg="#00ff00")
     terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT — Profit Mode ON")
     send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated")
@@ -758,7 +774,7 @@ def grid_cycle():
         for sym in buy_list:
             if running and sym in symbol_info:
                 regrid_symbol(sym)
-        dynamic_rebalance()
+        # dynamic_rebalance() removed — handled by separate thread
         time.sleep(180)
 
 # -------------------- MAIN --------------------
