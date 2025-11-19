@@ -1,6 +1,7 @@
 # Check back here weekly for the newest program version. 
  The newest update was on 11-19-2025. 
-```
+
+
 # INFINITY GRID PLATINUM 2025  
 **The Safest & Most Profitable Grid Bot Ever Built**  
 **November 19, 2025 — Aggressive Evening Exit Edition**
@@ -68,8 +69,7 @@ Made with ❤️ by traders who refuse to get deflated overnight
 
 
 
-Result: A completely hands-off, 24/7 grid bot that automatically concentrates capital into the strongest mid/large-cap altcoins while continuously harvesting grid profits.
-```
+Result: A completely hands-off, 24/7 grid bot that automatically concentrates capital into the strongest mid/large-cap altcoins while continuously harvesting grid profits
 ---
 
 ## Setup
