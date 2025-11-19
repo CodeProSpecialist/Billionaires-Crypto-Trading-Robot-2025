@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION
-★ MACD momentum confirmation before placing grid buys
-★ Dynamic rebalance every 15 seconds using Order Book + RSI + MACD
-★ More buy orders → higher allocation, more sell orders → lower allocation
-★ Only 3 daemon threads for websockets
-★ WhatsApp shows total portfolio balance
+★ MACD + RSI + Order Book Buy Pressure + Money Flow Index (MFI) all combined
+★ Dynamic rebalance every 15 seconds
+★ Only websocket threads — zero GUI freeze
+★ WhatsApp shows live total portfolio balance
 ★ Daily 17:30 CST → 100% USDT forced exit
-November 19, 2025
+November 19, 2025 — Respectful & Complete Edition
 """
 
 import os
@@ -213,7 +212,6 @@ def get_macd(symbol, fast=12, slow=26, signal=9):
             macd_cache[symbol] = macd_cache[symbol][-(slow + signal):] + [latest]
 
         closes = macd_cache[symbol]
-        if len(closes) < slow + signal: return None, None, None
 
         def ema(values, period):
             k = Decimal('2') / (period + 1)
@@ -225,11 +223,36 @@ def get_macd(symbol, fast=12, slow=26, signal=9):
         ema_fast = ema(closes[-fast:], fast)
         ema_slow = ema(closes[-slow:], slow)
         macd_line = ema_fast - ema_slow
-        signal_line = ema(macd_cache[symbol][-signal:], signal)
+        signal_line = ema(closes[-signal:], signal)
         histogram = macd_line - signal_line
 
         return macd_line, signal_line, histogram
     except: return None, None, None
+
+def get_mfi(symbol, period=14):
+    try:
+        klines = client.get_klines(symbol=symbol, interval='1m', limit=period + 1)
+        highs = [Decimal(k[2]) for k in klines]
+        lows = [Decimal(k[3]) for k in klines]
+        closes = [Decimal(k[4]) for k in klines]
+        volumes = [Decimal(k[5]) for k in klines]
+
+        typical_prices = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+        raw_money_flow = [tp * v for tp, v in zip(typical_prices, volumes)]
+
+        positive_flow = ZERO
+        negative_flow = ZERO
+        for i in range(1, len(typical_prices)):
+            if typical_prices[i] > typical_prices[i-1]:
+                positive_flow += raw_money_flow[i]
+            elif typical_prices[i] < typical_prices[i-1]:
+                negative_flow += raw_money_flow[i]
+
+        if negative_flow == ZERO: return Decimal('100')
+        money_ratio = positive_flow / negative_flow
+        mfi = Decimal('100') - (Decimal('100') / (ONE + money_ratio))
+        return mfi.quantize(Decimal('0.01'))
+    except: return Decimal('50')
 
 def get_buy_pressure(symbol):
     try:
@@ -308,7 +331,7 @@ def on_user_message(ws, message):
             price = Decimal(data['p'])
             base = symbol.replace('USDT', '')
             terminal_insert(f"[{now_cst()}] FILLED {side} {base} {qty:.6f} @ ${price:.8f}{get_total_balance_str()}")
-            send_whatsapp(f"{'🟢BUY' if side=='BUY' else '🔴SELL'} {base} {qty:.4f} @ ${price:.6f}")
+            send_whatsapp(f"{'BUY' if side=='BUY' else 'SELL'} {base} {qty:.4f} @ ${price:.6f}")
 
             placing_order_for.discard(symbol)
 
@@ -375,7 +398,7 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-# -------------------- GRID WITH MACD CONFIRMATION --------------------
+# -------------------- GRID WITH MULTI-INDICATOR CONFIRMATION --------------------
 def place_platinum_grid(symbol):
     if exit_in_progress or not is_trading_allowed(): return
     try:
@@ -384,11 +407,14 @@ def place_platinum_grid(symbol):
         grid_pct = Decimal('0.012')
         cash = BASE_CASH_PER_LEVEL * Decimal('1.5')
 
+        # Multi-indicator confirmation
         macd_line, signal_line, histogram = get_macd(symbol)
         macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
+        mfi = get_mfi(symbol)
+        mfi_bullish = mfi > Decimal('55')
 
-        if not macd_bullish:
-            terminal_insert(f"[{now_cst()}] MACD not bullish — skipping grid for {symbol}")
+        if not (macd_bullish and mfi_bullish):
+            terminal_insert(f"[{now_cst()}] Indicators not aligned — skipping grid for {symbol}")
             return
 
         for i in range(1, 9):
@@ -416,7 +442,7 @@ def regrid_symbol(symbol):
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
-# -------------------- DYNAMIC REBALANCE WITH MACD + ORDER BOOK + RSI --------------------
+# -------------------- DYNAMIC REBALANCE — ALL INDICATORS --------------------
 def dynamic_rebalance():
     if exit_in_progress or not is_trading_allowed(): return
 
@@ -444,12 +470,14 @@ def dynamic_rebalance():
 
             buy_pressure = get_buy_pressure(sym)
             rsi = get_rsi(sym)
+            mfi = get_mfi(sym)
             macd_line, signal_line, histogram = get_macd(sym)
             macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
 
-            if buy_pressure >= Decimal('0.70') and rsi < Decimal('75') and macd_bullish:
+            # Combined signal strength
+            if buy_pressure >= Decimal('0.70') and rsi < Decimal('75') and mfi > Decimal('60') and macd_bullish:
                 target_pct = Decimal('0.20')
-            elif buy_pressure >= Decimal('0.60') and rsi < Decimal('70') and macd_bullish:
+            elif buy_pressure >= Decimal('0.60') and rsi < Decimal('70') and mfi > Decimal('55') and macd_bullish:
                 target_pct = Decimal('0.15')
             elif buy_pressure >= Decimal('0.55') and macd_bullish:
                 target_pct = Decimal('0.10')
@@ -570,7 +598,7 @@ def main_loop():
                 regrid_symbol(sym)
         dynamic_rebalance()
 
-    root.after(15000, main_loop)  # Every 15 seconds
+    root.after(15000, main_loop)
 
 # -------------------- GUI --------------------
 root = tk.Tk()
@@ -614,7 +642,7 @@ def start_bot():
     if running: return
     running = True
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — Profit Mode ON")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — Profit Mode Activated")
     send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated")
     root.after(100, main_loop)
 
