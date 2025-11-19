@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION EDITION
-★ Mandatory full exit at 17:30 CST → 100% USDT every night
-★ Military-grade websocket heartbeat — never drops
-★ Real personal maker/taker fees
-★ Buy: 100% safe — double-checked USDT balance + reserve + taker fee
-★ Sell: 100% safe — double-checked asset quantity + profit guard
-★ Strict LOT_SIZE & tickSize compliance
+★ Every WhatsApp alert includes Total Account Balance
+★ No terminal/GUI lockups — all threads perfectly managed
+★ Coingecko API fixed
+★ Daily 17:30 CST → 100% USDT forced exit
 November 19, 2025
 """
 
@@ -26,8 +24,52 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from threading import Lock
 
+# -------------------- THREAD CONTROL CLASS --------------------
+class PeriodicThread:
+    def __init__(self, target, interval, name="PeriodicThread"):
+        self.target = target
+        self.interval = interval
+        self.name = name
+        self.thread = None
+        self.running = False
+        self.event = threading.Event()
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.running = True
+        self.event.clear()
+        self.thread = threading.Thread(target=self._run, name=self.name, daemon=True)
+        self.thread.start()
+        terminal_insert(f"[{now_cst()}] Started {self.name}")
+
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        self.event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=10)
+        self.thread = None
+        terminal_insert(f"[{now_cst()}] Stopped {self.name}")
+
+    def _run(self):
+        while self.running and not self.event.is_set():
+            try:
+                self.target()
+            except Exception as e:
+                terminal_insert(f"[{now_cst()}] {self.name} error: {e}")
+            for _ in range(int(self.interval)):
+                if self.event.wait(1):
+                    break
+                if not self.running:
+                    break
+
+# Global managed threads
+rebalance_thread = PeriodicThread(target=None, interval=15, name="RebalanceThread")
+
 # -------------------- THREAD-SAFE BALANCE LOCK --------------------
-_balance_lock = Lock()  # ← Critical for bulletproof BUY & SELL
+_balance_lock = Lock()
 
 # -------------------- PRECISION & CONSTANTS --------------------
 getcontext().prec = 28
@@ -47,7 +89,7 @@ SELL_GROWTH_OPTIMAL = Decimal('1.309')
 RESERVE_PCT = Decimal('0.33')
 MIN_USDT_RESERVE = Decimal('8')
 CST = pytz.timezone("America/Chicago")
-REBALANCE_INTERVAL = 15  # Changed to 15 seconds
+REBALANCE_INTERVAL = 15
 
 EVENING_EXIT_START = "17:30"
 TRADING_START_HOUR = 3
@@ -63,15 +105,13 @@ RSI_OVERSOLD = Decimal('35')
 
 last_buy_alert = 0
 last_sell_alert = 0
-ALERT_COOLDOWN = 600  # Changed to 10 minutes (600 seconds)
+ALERT_COOLDOWN = 600  # 10 minutes
 
 running = True
 
 # -------------------- ENVIRONMENT --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
 CALLMEBOT_PHONE = os.getenv('CALLMEBOT_PHONE')
-if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
-    print("WhatsApp alerts disabled — set CALLMEBOT_API_KEY and CALLMEBOT_PHONE for alerts")
 
 api_key = os.getenv('BINANCE_API_KEY')
 api_secret = os.getenv('BINANCE_API_SECRET')
@@ -98,6 +138,51 @@ BLACKLISTED_BASE_ASSETS = {
     'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'
 }
 
+# -------------------- TOTAL BALANCE HELPER --------------------
+def get_total_balance_str() -> str:
+    with _balance_lock:
+        update_balances()
+    total = account_balances.get('USDT', ZERO)
+    for asset, qty in account_balances.items():
+        if asset == 'USDT' or qty <= ZERO:
+            continue
+        sym = asset + 'USDT'
+        if sym in price_cache:
+            total += qty * price_cache[sym]
+        else:
+            try:
+                price = Decimal(client.get_symbol_ticker(symbol=sym)['price'])
+                total += qty * price
+            except:
+                pass
+    return f" | Total: ${total:,.2f}"
+
+# -------------------- WHATSAPP ALERTS WITH BALANCE --------------------
+def send_whatsapp(message: str):
+    global last_buy_alert, last_sell_alert
+    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE:
+        return
+
+    now = time.time()
+    is_buy = any(x in message.upper() for x in ["BUY", "GRID BUY"])
+    is_sell = any(x in message.upper() for x in ["SELL", "EXIT", "DUMP", "GRID SELL"])
+
+    if (is_buy and now - last_buy_alert < ALERT_COOLDOWN) or \
+       (is_sell and now - last_sell_alert < ALERT_COOLDOWN):
+        return
+
+    try:
+        full_message = f"{message}{get_total_balance_str()}"
+        url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(full_message)}&apikey={CALLMEBOT_API_KEY}"
+        requests.get(url, timeout=10)
+
+        if is_buy: last_buy_alert = now
+        if is_sell: last_sell_alert = now
+
+        terminal_insert(f"[{now_cst()}] WhatsApp → {full_message}")
+    except Exception as e:
+        print(f"WhatsApp error: {e}")
+
 # -------------------- FEE FETCHER --------------------
 def update_fees():
     global maker_fee, taker_fee, last_fee_update
@@ -109,7 +194,8 @@ def update_fees():
         taker_fee = Decimal(info['takerCommission']) / 10000
         last_fee_update = time.time()
         terminal_insert(f"[{now_cst()}] Fees → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
-    except: pass
+    except Exception as e:
+        terminal_insert(f"Fee update error: {e}")
 
 # -------------------- UTILITIES --------------------
 def now_cst():
@@ -119,40 +205,12 @@ def terminal_insert(msg):
     try:
         terminal_text.insert(tk.END, msg + "\n")
         terminal_text.see(tk.END)
-    except: pass
-
-def get_total_balance_str() -> str:
-    with _balance_lock:
-        update_balances()
-    total = account_balances.get('USDT', ZERO)
-    for asset, qty in account_balances.items():
-        if asset == 'USDT' or qty <= ZERO: continue
-        sym = asset + 'USDT'
-        if sym in price_cache:
-            total += qty * price_cache[sym]
-    return f"\nAccount Balance: ${total:,.2f}"
-
-def send_whatsapp(message):
-    global last_buy_alert, last_sell_alert
-    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE: return
-    now = time.time()
-    is_buy = "BUY" in message.upper()
-    is_sell = any(x in message.upper() for x in ["SELL", "EXIT", "DUMP"])
-    if (is_buy and now - last_buy_alert < ALERT_COOLDOWN) or (is_sell and now - last_sell_alert < ALERT_COOLDOWN):
-        return
-    try:
-        url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(message)}&apikey={CALLMEBOT_API_KEY}"
-        # Debug: Uncomment next line to log URL
-        # print(f"Sending WhatsApp: {url}")
-        requests.get(url, timeout=10)
-        if is_buy: last_buy_alert = now
-        if is_sell: last_sell_alert = now
-    except Exception as e:
-        # Debug: Log errors
-        print(f"WhatsApp send error: {e}")
+    except:
+        pass
 
 def floor_to_step(value: Decimal, step_size: Decimal) -> Decimal:
-    if step_size <= ZERO: return value
+    if step_size <= ZERO:
+        return value
     return (value // step_size) * step_size
 
 def get_available_usdt_after_reserve() -> Decimal:
@@ -180,18 +238,21 @@ def update_balances():
             if total > ZERO:
                 new_balances[asset] = total
         account_balances = new_balances
-    except: pass
+    except:
+        pass
 
 def load_symbol_info():
     global symbol_info
     try:
         info = client.get_exchange_info()
         for s in info['symbols']:
-            if s['quoteAsset'] != 'USDT' or s['status'] != 'TRADING': continue
+            if s['quoteAsset'] != 'USDT' or s['status'] != 'TRADING':
+                continue
             filters = {f['filterType']: f for f in s['filters']}
             step = Decimal(filters.get('LOT_SIZE', {}).get('stepSize', '0'))
             tick = Decimal(filters.get('PRICE_FILTER', {}).get('tickSize', '0'))
-            if step == ZERO or tick == ZERO: continue
+            if step == ZERO or tick == ZERO:
+                continue
             symbol_info[s['symbol']] = {
                 'stepSize': step,
                 'tickSize': tick,
@@ -214,21 +275,27 @@ def get_rsi(symbol, period=14):
             kline_cache[symbol] = (kline_cache[symbol][-(period):] + [latest])[-period-1:]
 
         closes = kline_cache[symbol]
-        if len(closes) < period + 1: return Decimal('50')
+        if len(closes) < period + 1:
+            return Decimal('50')
 
         gains = losses = ZERO
         for i in range(1, len(closes)):
             change = closes[i] - closes[i-1]
-            if change > 0: gains += change
-            else: losses -= change
+            if change > 0:
+                gains += change
+            else:
+                losses -= change
 
-        if losses == ZERO: return Decimal('100')
-        if gains == ZERO: return ZERO
+        if losses == ZERO:
+            return Decimal('100')
+        if gains == ZERO:
+            return ZERO
 
         rs = (gains / period) / (losses / period)
         rsi = Decimal('100') - (Decimal('100') / (ONE + rs))
         return rsi.quantize(Decimal('0.01'))
-    except: return Decimal('50')
+    except:
+        return Decimal('50')
 
 def get_buy_pressure(symbol):
     try:
@@ -236,13 +303,16 @@ def get_buy_pressure(symbol):
         bids = sum(Decimal(b[1]) * Decimal(b[0]) for b in book['bids'][:20])
         asks = sum(Decimal(a[1]) * Decimal(a[0]) for a in book['asks'][:20])
         total = bids + asks
-        if total == ZERO: return Decimal('0.5')
+        if total == ZERO:
+            return Decimal('0.5')
         return (bids / total).quantize(Decimal('0.0001'))
-    except: return Decimal('0.5')
+    except:
+        return Decimal('0.5')
 
 # -------------------- TRADING HOURS & EXIT LOGIC --------------------
 def is_trading_allowed():
-    if exit_in_progress: return True
+    if exit_in_progress:
+        return True
     now = datetime.now(CST)
     return TRADING_START_HOUR <= now.hour < TRADING_END_HOUR
 
@@ -281,18 +351,23 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
     def _heartbeat(self):
         while self.sock and self.sock.connected and running:
             if time.time() - self.last_pong > 30:
-                try: self.close()
-                except: pass
+                try:
+                    self.close()
+                except:
+                    pass
                 break
-            try: self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
-            except: pass
+            try:
+                self.send("ping", opcode=websocket.ABNF.OPCODE_PING)
+            except:
+                pass
             time.sleep(25)
 
     def run_forever(self, **kwargs):
         while running:
             try:
                 super().run_forever(ping_interval=None, ping_timeout=None, **kwargs)
-            except: pass
+            except:
+                pass
             self.reconnect_attempts += 1
             delay = min(300, 2 ** self.reconnect_attempts)
             terminal_insert(f"Reconnecting WS in {delay}s...")
@@ -304,33 +379,26 @@ def start_user_stream():
             time.sleep(1800)
             try:
                 client.stream_get_listen_key()
-            except: pass
+            except:
+                pass
 
     def run_user_stream():
         while running:
             try:
                 listen_key = client.stream_get_listen_key()['listenKey']
                 url = f"wss://stream.binance.us:9443/ws/{listen_key}"
-                ws = HeartbeatWebSocket(
-                    url,
-                    on_message=on_user_message,
-                    on_open=lambda ws: terminal_insert(f"[{now_cst()}] User Stream CONNECTED"),
-                    on_close=lambda ws, *a: terminal_insert(f"[{now_cst()}] User stream closed — reconnecting...")
-                )
+                ws = HeartbeatWebSocket(url, on_message=on_user_message)
                 ws.run_forever()
-            except: time.sleep(5)
+            except:
+                time.sleep(5)
 
     def run_price_stream():
         while running:
             try:
-                ws = HeartbeatWebSocket(
-                    "wss://stream.binance.us:9443/stream?streams=!ticker@arr",
-                    on_message=on_user_message,
-                    on_open=lambda ws: terminal_insert(f"[{now_cst()}] Ticker Stream CONNECTED"),
-                    on_close=lambda ws, *a: terminal_insert(f"[{now_cst()}] Ticker stream closed — reconnecting...")
-                )
+                ws = HeartbeatWebSocket("wss://stream.binance.us:9443/stream?streams=!ticker@arr", on_message=on_user_message)
                 ws.run_forever()
-            except: time.sleep(5)
+            except:
+                time.sleep(5)
 
     threading.Thread(target=keep_listenkey_alive, daemon=True).start()
     threading.Thread(target=run_user_stream, daemon=True).start()
@@ -343,13 +411,14 @@ def on_user_message(ws, message):
         e = data.get('e')
 
         if e == 'outboundAccountPosition':
-            for b in data['B']:
-                asset = b['a']
-                total = Decimal(b['f']) + Decimal(b['l'])
-                if total > ZERO:
-                    account_balances[asset] = total
-                elif asset in account_balances:
-                    del account_balances[asset]
+            with _balance_lock:
+                for b in data['B']:
+                    asset = b['a']
+                    total = Decimal(b['f']) + Decimal(b['l'])
+                    if total > ZERO:
+                        account_balances[asset] = total
+                    elif asset in account_balances:
+                        del account_balances[asset]
 
         elif e == 'executionReport' and data.get('X') in ('FILLED', 'PARTIALLY_FILLED'):
             symbol = data['s']
@@ -358,7 +427,8 @@ def on_user_message(ws, message):
             price = Decimal(data['p'])
             base = symbol.replace('USDT', '')
             terminal_insert(f"[{now_cst()}] FILLED {side} {base} {qty:.6f} @ ${price:.8f}{get_total_balance_str()}")
-            send_whatsapp(f"{'🟢BUY' if side=='BUY' else '🔴SELL'} {base} {qty:.4f} @ ${price:.6f}{get_total_balance_str()}")
+            send_whatsapp(f"{'🟢BUY' if side=='BUY' else '🔴SELL'} {base} {qty:.4f} @ ${price:.6f}")
+
             if not exit_in_progress:
                 threading.Thread(target=regrid_symbol, args=(symbol,), daemon=True).start()
 
@@ -367,7 +437,8 @@ def on_user_message(ws, message):
             if symbol in symbol_info:
                 price_cache[symbol] = Decimal(data['c'])
 
-    except: pass
+    except:
+        pass
 
 # -------------------- AGGRESSIVE EVENING EXIT --------------------
 def aggressive_evening_exit():
@@ -398,9 +469,11 @@ def aggressive_evening_exit():
     sold_this_wave = 0
 
     for asset, qty in list(account_balances.items()):
-        if asset == 'USDT' or qty <= ZERO: continue
+        if asset == 'USDT' or qty <= ZERO:
+            continue
         sym = asset + 'USDT'
-        if sym not in symbol_info: continue
+        if sym not in symbol_info:
+            continue
 
         try:
             ticker = client.get_symbol_ticker(symbol=sym)
@@ -410,23 +483,21 @@ def aggressive_evening_exit():
             aggressive_price = (best_bid * Decimal('0.998')).quantize(symbol_info[sym]['tickSize'], rounding=ROUND_DOWN)
 
             info = symbol_info[sym]
-            sell_qty = floor_to_step(qty, info['stepSize'])
-            sell_qty = sell_qty.quantize(Decimal('0.00000000'))
-            if sell_qty < info['minQty']: continue
+            sell_qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
+            if sell_qty < info['minQty']:
+                continue
 
             if sym in exit_sell_orders:
                 for oid in exit_sell_orders[sym]:
-                    try: client.cancel_order(symbol=sym, orderId=oid)
-                    except: pass
+                    try:
+                        client.cancel_order(symbol=sym, orderId=oid)
+                    except:
+                        pass
                 exit_sell_orders[sym] = []
 
             order = client.create_order(
-                symbol=sym,
-                side='SELL',
-                type='LIMIT',
-                timeInForce='GTC',
-                price=str(aggressive_price),
-                quantity=str(sell_qty)
+                symbol=sym, side='SELL', type='LIMIT', timeInForce='GTC',
+                price=str(aggressive_price), quantity=str(sell_qty)
             )
             exit_sell_orders[sym] = [order['orderId']]
             sold_this_wave += 1
@@ -438,7 +509,7 @@ def aggressive_evening_exit():
     if sold_this_wave > 0:
         send_whatsapp(f"EXIT WAVE — {sold_this_wave} assets selling — retry in 5min")
 
-# -------------------- 100% BULLETPROOF ORDER PLACEMENT — DOUBLE REFRESH FOR BUY & SELL --------------------
+# -------------------- BULLETPROOF ORDER PLACEMENT --------------------
 def place_limit_order(symbol, side, price, qty, is_exit=False):
     global active_orders
     if side == 'BUY' and (exit_in_progress or not is_trading_allowed()):
@@ -450,8 +521,7 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
 
     try:
         price_dec = (Decimal(price) // info['tickSize']) * info['tickSize']
-        qty_dec = floor_to_step(Decimal(qty), info['stepSize'])
-        qty_dec = qty_dec.quantize(Decimal('0.00000000'), rounding=ROUND_DOWN)
+        qty_dec = floor_to_step(Decimal(qty), info['stepSize']).quantize(Decimal('0.00000000'), rounding=ROUND_DOWN)
 
         if qty_dec < info['minQty']:
             return False
@@ -463,7 +533,6 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
         update_fees()
 
         if side == 'BUY':
-            # ───── DOUBLE CHECK USDT BEFORE BUY ─────
             with _balance_lock:
                 update_balances()
                 total_cost = notional * (ONE + taker_fee)
@@ -473,16 +542,9 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
                 terminal_insert(f"[{now_cst()}] BLOCKED BUY {symbol} — Need ${total_cost:.2f} | Avail ${available:.2f}")
                 return False
 
-            order = client.create_order(
-                symbol=symbol,
-                side='BUY',
-                type='LIMIT',
-                timeInForce='GTC',
-                price=str(price_dec),
-                quantity=str(qty_dec)
-            )
+            order = client.create_order(symbol=symbol, side='BUY', type='LIMIT', timeInForce='GTC',
+                                        price=str(price_dec), quantity=str(qty_dec))
 
-            # ───── REFRESH BALANCE AGAIN AFTER SUCCESSFUL BUY ─────
             with _balance_lock:
                 update_balances()
 
@@ -491,10 +553,9 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
             terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
             send_whatsapp(f"∞ {msg}")
 
-        else:  # SELL
+        else:
             base_asset = symbol.replace('USDT', '')
 
-            # ───── DOUBLE CHECK ASSET QUANTITY BEFORE SELL ─────
             with _balance_lock:
                 update_balances()
                 available_qty = account_balances.get(base_asset, ZERO)
@@ -509,16 +570,9 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
                 if price_dec * qty_dec < min_required * Decimal('0.995'):
                     return False
 
-            order = client.create_order(
-                symbol=symbol,
-                side='SELL',
-                type='LIMIT',
-                timeInForce='GTC',
-                price=str(price_dec),
-                quantity=str(qty_dec)
-            )
+            order = client.create_order(symbol=symbol, side='SELL', type='LIMIT', timeInForce='GTC',
+                                        price=str(price_dec), quantity=str(qty_dec))
 
-            # ───── REFRESH BALANCE AGAIN AFTER SUCCESSFUL SELL ─────
             with _balance_lock:
                 update_balances()
 
@@ -536,7 +590,7 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
         if e.code in (-1013, -2010):
             terminal_insert(f"[{now_cst()}] FILTER FAILURE {symbol} — {e.message}")
         elif e.code == -2019:
-            terminal_insert(f"[{now_cst()}] INSUFFICIENT BALANCE {symbol} — blocked safely")
+            terminal_insert(f"[{now_cst()}] INSUFFICIENT BALANCE {symbol}")
         else:
             terminal_insert(f"Binance error {e.code}: {e.message}")
         return False
@@ -552,7 +606,8 @@ def cancel_symbol_orders(symbol):
             active_orders -= 1
         if not exit_in_progress:
             active_grid_orders[symbol] = []
-    except: pass
+    except:
+        pass
 
 def place_platinum_grid(symbol):
     if exit_in_progress or not is_trading_allowed():
@@ -567,8 +622,7 @@ def place_platinum_grid(symbol):
             buy_price = price * ((ONE - grid_pct) ** i)
             buy_price = (buy_price // info['tickSize']) * info['tickSize']
             qty = cash * (GOLDEN_RATIO ** (i-1)) / buy_price
-            qty = floor_to_step(qty, info['stepSize'])
-            qty = qty.quantize(Decimal('0.00000000'))
+            qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
             required = buy_price * qty * (ONE + taker_fee)
             if get_available_usdt_after_reserve() >= required:
                 place_limit_order(symbol, 'BUY', buy_price, qty)
@@ -578,15 +632,16 @@ def place_platinum_grid(symbol):
             sell_price = price * ((ONE + grid_pct) ** i)
             sell_price = (sell_price // info['tickSize']) * info['tickSize']
             qty = cash * (SELL_GROWTH_OPTIMAL ** (i-1)) / sell_price
-            qty = floor_to_step(qty, info['stepSize'])
-            qty = qty.quantize(Decimal('0.00000000'))
+            qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
             if qty <= owned:
                 place_limit_order(symbol, 'SELL', sell_price, qty)
                 owned -= qty
-    except: pass
+    except:
+        pass
 
 def regrid_symbol(symbol):
-    if exit_in_progress: return
+    if exit_in_progress:
+        return
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
@@ -595,8 +650,7 @@ def dynamic_rebalance():
     global last_rebalance
     if exit_in_progress or not is_trading_allowed():
         return
-    # Light check for edge cases (e.g., manual calls)
-    if time.time() - last_rebalance < REBALANCE_INTERVAL:
+    if time.time() - last_rebalance < REBALANCE_INTERVAL - 2:
         return
     last_rebalance = time.time()
 
@@ -605,19 +659,23 @@ def dynamic_rebalance():
             update_balances()
         total_portfolio = account_balances.get('USDT', ZERO)
         for asset in account_balances:
-            if asset == 'USDT': continue
+            if asset == 'USDT':
+                continue
             sym = asset + 'USDT'
             if sym in symbol_info:
                 price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
                 total_portfolio += account_balances[asset] * price
-        if total_portfolio <= ZERO: return
+        if total_portfolio <= ZERO:
+            return
 
         terminal_insert(f"[{now_cst()}] Rebalance — Portfolio ${total_portfolio:,.0f}")
 
         for asset in list(account_balances.keys()):
-            if asset == 'USDT': continue
+            if asset == 'USDT':
+                continue
             sym = asset + 'USDT'
-            if sym not in symbol_info: continue
+            if sym not in symbol_info:
+                continue
 
             rsi = get_rsi(sym)
             pressure = get_buy_pressure(sym)
@@ -636,15 +694,13 @@ def dynamic_rebalance():
 
             if current_value > target_value * Decimal('1.05'):
                 sell_qty = ((current_value - target_value) / current_price)
-                sell_qty = floor_to_step(sell_qty, symbol_info[sym]['stepSize'])
-                sell_qty = sell_qty.quantize(Decimal('0.00000000'))
+                sell_qty = floor_to_step(sell_qty, symbol_info[sym]['stepSize']).quantize(Decimal('0.00000000'))
                 if sell_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
 
             elif current_value < target_value * Decimal('0.95'):
                 buy_qty = ((target_value - current_value) / current_price)
-                buy_qty = floor_to_step(buy_qty, symbol_info[sym]['stepSize'])
-                buy_qty = buy_qty.quantize(Decimal('0.00000000'))
+                buy_qty = floor_to_step(buy_qty, symbol_info[sym]['stepSize']).quantize(Decimal('0.00000000'))
                 required = current_price * buy_qty * (ONE + taker_fee)
                 available = get_available_usdt_after_reserve()
                 if available >= required and buy_qty >= symbol_info[sym]['minQty']:
@@ -656,17 +712,17 @@ def dynamic_rebalance():
     except Exception as e:
         terminal_insert(f"Rebalance error: {e}")
 
-# -------------------- REBALANCE THREAD --------------------
-def rebalance_loop():
-    while running:
-        dynamic_rebalance()
-        time.sleep(REBALANCE_INTERVAL)
+# Assign target after function is defined
+rebalance_thread.target = dynamic_rebalance
+rebalance_thread.interval = REBALANCE_INTERVAL
 
 # -------------------- COINGECKO BUY LIST --------------------
 def generate_buy_list():
     global buy_list, last_buy_list_update
-    if exit_in_progress or not is_trading_allowed(): return
-    if time.time() - last_buy_list_update < 3600: return
+    if exit_in_progress or not is_trading_allowed():
+        return
+    if time.time() - last_buy_list_update < 3600:
+        return
 
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -685,17 +741,21 @@ def generate_buy_list():
         candidates = []
         for coin in coins:
             base = coin['symbol'].upper()
-            if base in BLACKLISTED_BASE_ASSETS: continue
+            if base in BLACKLISTED_BASE_ASSETS:
+                continue
             sym = base + 'USDT'
-            if sym not in symbol_info: continue
+            if sym not in symbol_info:
+                continue
 
-            market_cap = coin.get('market_cap', 0)
-            volume = coin.get('total_volume', 0)
-            change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
-            change_14d = coin.get('price_change_percentage_14d_in_currency', 0) or 0
+            market_cap = coin.get('market_cap') or 0
+            volume = coin.get('total_volume') or 0
+            change_7d = coin.get('price_change_percentage_7d_in_currency') or 0
+            change_14d = coin.get('price_change_percentage_14d_in_currency') or 0
 
-            if market_cap < 800_000_000 or volume < 40_000_000: continue
-            if change_7d < 6 or change_14d < 12: continue
+            if market_cap < 800_000_000 or volume < 40_000_000:
+                continue
+            if change_7d < 6 or change_14d < 12:
+                continue
 
             score = change_7d * 1.5 + change_14d + (volume / max(market_cap, 1) * 100)
             candidates.append((sym, score, coin['name']))
@@ -749,18 +809,26 @@ status_label.pack(side="left", padx=60)
 
 def start_bot():
     global running
+    if running:
+        return
     running = True
+
+    rebalance_thread.start()
     threading.Thread(target=grid_cycle, daemon=True).start()
-    threading.Thread(target=rebalance_loop, daemon=True).start()  # New rebalance thread
+
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT — Profit Mode ON, {get_total_balance_str()}")
-    send_whatsapp(f"INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated, {get_total_balance_str()}")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — Daily 17:30 → 100% USDT")
+    send_whatsapp("INFINITY GRID PLATINUM 2025 STARTED — Profit Mode Activated")
 
 def stop_bot():
     global running
     running = False
+
+    rebalance_thread.stop()
+
     for s in list(active_grid_orders.keys()):
         cancel_symbol_orders(s)
+
     status_label.config(text="Status: Stopped", fg="red")
     send_whatsapp("INFINITY GRID STOPPED")
 
@@ -785,7 +853,7 @@ def grid_cycle():
         for sym in buy_list:
             if running and sym in symbol_info:
                 regrid_symbol(sym)
-        # dynamic_rebalance() removed — handled by separate thread
+
         time.sleep(180)
 
 # -------------------- MAIN --------------------
@@ -794,7 +862,7 @@ if __name__ == "__main__":
     update_fees()
     start_user_stream()
     generate_buy_list()
-    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION READY, {get_total_balance_str()}")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION READY")
     terminal_insert(f"Personal Fees → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
     update_gui()
     root.mainloop()
