@@ -32,7 +32,7 @@ ONE = Decimal('1')
 
 maker_fee = Decimal('0.0010')
 taker_fee = Decimal('0.0020')
-last_fee_update =  = 0
+last_fee_update = 0
 FEE_UPDATE_INTERVAL = 21600
 
 MIN_SELL_PROFIT_PCT = Decimal('0.003')
