@@ -1,6 +1,6 @@
 # Check back here weekly for the newest program version. 
  The newest update was on 11-19-2025. 
-
+```
 Infinity Grid Platinum 2025
 Ultra-Fast 30-Second RSI + Order-Book Rebalance Edition November 19, 2025 — Current Version
 Core Philosophy
@@ -56,6 +56,7 @@ Perfect for traders who want “set it and forget it” performance with whale-l
 
 
 Result: A completely hands-off, 24/7 grid bot that automatically concentrates capital into the strongest mid/large-cap altcoins while continuously harvesting grid profits.
+```
 ---
 
 ## Setup
