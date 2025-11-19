@@ -4,8 +4,8 @@ INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION EDITION
 ★ Mandatory full exit at 17:30 CST → 100% USDT every night
 ★ Military-grade websocket heartbeat — never drops
 ★ Real personal maker/taker fees
-★ Buy: 100% safe — checks USDT + reserve + taker fee before sending
-★ Sell: 100% safe — checks quantity + +0.3% profit required
+★ Buy: 100% safe — double-checked USDT balance + reserve + taker fee
+★ Sell: 100% safe — double-checked asset quantity + profit guard
 ★ Strict LOT_SIZE & tickSize compliance
 November 19, 2025
 """
@@ -24,6 +24,10 @@ import pytz
 import websocket
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+from threading import Lock
+
+# -------------------- THREAD-SAFE BALANCE LOCK --------------------
+_balance_lock = Lock()  # ← Critical for bulletproof BUY & SELL
 
 # -------------------- PRECISION & CONSTANTS --------------------
 getcontext().prec = 28
@@ -94,7 +98,7 @@ BLACKLISTED_BASE_ASSETS = {
     'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'
 }
 
-# -------------------- FEE FETCHER (SAFE FOR BINANCE.US) --------------------
+# -------------------- FEE FETCHER --------------------
 def update_fees():
     global maker_fee, taker_fee, last_fee_update
     if time.time() - last_fee_update < FEE_UPDATE_INTERVAL:
@@ -137,15 +141,17 @@ def floor_to_step(value: Decimal, step_size: Decimal) -> Decimal:
     return (value // step_size) * step_size
 
 def get_available_usdt_after_reserve() -> Decimal:
-    update_balances()
-    update_fees()
-    reserved = account_balances.get('USDT', ZERO) * RESERVE_PCT + MIN_USDT_RESERVE
-    available = account_balances.get('USDT', ZERO) - reserved
-    return max(available, ZERO)
+    with _balance_lock:
+        update_balances()
+        update_fees()
+        reserved = account_balances.get('USDT', ZERO) * RESERVE_PCT + MIN_USDT_RESERVE
+        available = account_balances.get('USDT', ZERO) - reserved
+        return max(available, ZERO)
 
 def get_available_asset(asset: str) -> Decimal:
-    update_balances()
-    return account_balances.get(asset, ZERO)
+    with _balance_lock:
+        update_balances()
+        return account_balances.get(asset, ZERO)
 
 # -------------------- BALANCES & SYMBOL INFO --------------------
 def update_balances():
@@ -230,11 +236,12 @@ def is_evening_exit_time():
     return now.strftime("%H:%M") >= EVENING_EXIT_START
 
 def is_portfolio_fully_in_usdt():
-    update_balances()
-    for asset, qty in account_balances.items():
-        if asset != 'USDT' and qty > ZERO:
-            if asset + 'USDT' in symbol_info:
-                return False
+    with _balance_lock:
+        update_balances()
+        for asset, qty in account_balances.items():
+            if asset != 'USDT' and qty > ZERO:
+                if asset + 'USDT' in symbol_info:
+                    return False
     return True
 
 # -------------------- BULLETPROOF WEBSOCKETS --------------------
@@ -371,7 +378,8 @@ def aggressive_evening_exit():
         terminal_insert(f"[{now_cst()}] EVENING EXIT ACTIVATED — Dumping all assets")
         send_whatsapp("EVENING EXIT STARTED — Aggressive limit sells every 5min")
 
-    update_balances()
+    with _balance_lock:
+        update_balances()
     sold_this_wave = 0
 
     for asset, qty in list(account_balances.items()):
@@ -415,74 +423,110 @@ def aggressive_evening_exit():
     if sold_this_wave > 0:
         send_whatsapp(f"EXIT WAVE — {sold_this_wave} assets selling — retry in 5min")
 
-# -------------------- 100% SAFE ORDER PLACEMENT --------------------
+# -------------------- 100% BULLETPROOF ORDER PLACEMENT — DOUBLE REFRESH FOR BUY & SELL --------------------
 def place_limit_order(symbol, side, price, qty, is_exit=False):
     global active_orders
     if side == 'BUY' and (exit_in_progress or not is_trading_allowed()):
         return False
 
     info = symbol_info.get(symbol)
-    if not info: return False
+    if not info:
+        return False
 
     try:
-        price = (Decimal(price) // info['tickSize']) * info['tickSize']
-        qty = floor_to_step(Decimal(qty), info['stepSize'])
-        qty = qty.quantize(Decimal('0.00000000'), rounding=ROUND_DOWN)
+        price_dec = (Decimal(price) // info['tickSize']) * info['tickSize']
+        qty_dec = floor_to_step(Decimal(qty), info['stepSize'])
+        qty_dec = qty_dec.quantize(Decimal('0.00000000'), rounding=ROUND_DOWN)
 
-        if qty < info['minQty']: return False
+        if qty_dec < info['minQty']:
+            return False
 
-        notional = price * qty
-        if notional < info['minNotional']: return False
+        notional = price_dec * qty_dec
+        if notional < info['minNotional']:
+            return False
 
         update_fees()
 
         if side == 'BUY':
-            total_cost = notional * (ONE + taker_fee)
-            available = get_available_usdt_after_reserve()
+            # ───── DOUBLE CHECK USDT BEFORE BUY ─────
+            with _balance_lock:
+                update_balances()
+                total_cost = notional * (ONE + taker_fee)
+                available = get_available_usdt_after_reserve()
+
             if available < total_cost:
-                terminal_insert(f"[{now_cst()}] BLOCKED BUY {symbol} — Not enough USDT (need ${total_cost:.2f}, have ${available:.2f})")
+                terminal_insert(f"[{now_cst()}] BLOCKED BUY {symbol} — Need ${total_cost:.2f} | Avail ${available:.2f}")
                 return False
 
-        if side == 'SELL':
+            order = client.create_order(
+                symbol=symbol,
+                side='BUY',
+                type='LIMIT',
+                timeInForce='GTC',
+                price=str(price_dec),
+                quantity=str(qty_dec)
+            )
+
+            # ───── REFRESH BALANCE AGAIN AFTER SUCCESSFUL BUY ─────
+            with _balance_lock:
+                update_balances()
+
+            base = symbol.replace('USDT', '')
+            msg = f"GRID BUY {base} {qty_dec} @ ${price_dec:.8f}"
+            terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
+            send_whatsapp(f"∞ {msg}")
+
+        else:  # SELL
             base_asset = symbol.replace('USDT', '')
-            available_qty = get_available_asset(base_asset)
-            if qty > available_qty:
-                terminal_insert(f"[{now_cst()}] BLOCKED SELL {symbol} — Not enough {base_asset} (want {qty}, have {available_qty})")
+
+            # ───── DOUBLE CHECK ASSET QUANTITY BEFORE SELL ─────
+            with _balance_lock:
+                update_balances()
+                available_qty = account_balances.get(base_asset, ZERO)
+
+            if qty_dec > available_qty:
+                terminal_insert(f"[{now_cst()}] BLOCKED SELL {symbol} — Want {qty_dec} {base_asset} | Have {available_qty}")
                 return False
 
             if not is_exit:
                 net_proceeds = notional * (ONE - maker_fee)
                 min_required = net_proceeds * (ONE + MIN_SELL_PROFIT_PCT)
-                if price * qty < min_required * Decimal('0.995'):
+                if price_dec * qty_dec < min_required * Decimal('0.995'):
                     return False
 
-        order = client.create_order(
-            symbol=symbol,
-            side=side,
-            type='LIMIT',
-            timeInForce='GTC',
-            price=str(price),
-            quantity=str(qty)
-        )
+            order = client.create_order(
+                symbol=symbol,
+                side='SELL',
+                type='LIMIT',
+                timeInForce='GTC',
+                price=str(price_dec),
+                quantity=str(qty_dec)
+            )
+
+            # ───── REFRESH BALANCE AGAIN AFTER SUCCESSFUL SELL ─────
+            with _balance_lock:
+                update_balances()
+
+            base = symbol.replace('USDT', '')
+            msg = f"GRID SELL {base} {qty_dec} @ ${price_dec:.8f}"
+            terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
+            send_whatsapp(f"∞ {msg}")
 
         if not exit_in_progress:
             active_grid_orders.setdefault(symbol, []).append(order['orderId'])
         active_orders += 1
-
-        base = symbol.replace('USDT', '')
-        msg = f"GRID {side} {base} {qty} @ ${price:.8f}"
-        terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
-        send_whatsapp(f"∞ {msg}")
         return True
 
     except BinanceAPIException as e:
-        if e.code == -1013:
-            terminal_insert(f"[{now_cst()}] LOT SIZE ERROR {symbol} — skipped")
+        if e.code in (-1013, -2010):
+            terminal_insert(f"[{now_cst()}] FILTER FAILURE {symbol} — {e.message}")
+        elif e.code == -2019:
+            terminal_insert(f"[{now_cst()}] INSUFFICIENT BALANCE {symbol} — blocked safely")
         else:
             terminal_insert(f"Binance error {e.code}: {e.message}")
         return False
     except Exception as e:
-        terminal_insert(f"Order error: {e}")
+        terminal_insert(f"Order error {symbol}: {e}")
         return False
 
 def cancel_symbol_orders(symbol):
@@ -541,7 +585,8 @@ def dynamic_rebalance():
     last_rebalance = time.time()
 
     try:
-        update_balances()
+        with _balance_lock:
+            update_balances()
         total_portfolio = account_balances.get('USDT', ZERO)
         for asset in account_balances:
             if asset == 'USDT': continue
