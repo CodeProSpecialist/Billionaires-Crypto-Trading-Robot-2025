@@ -555,9 +555,10 @@ def regrid_symbol(symbol):
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
-# -------------------- SMARTER REBALANCING --------------------
+# -------------------- SMARTER REBALANCING (NO MISSING METHOD) --------------------
 def dynamic_rebalance():
-    if exit_in_progress or not is_trading_allowed(): return
+    if exit_in_progress or not is_trading_allowed(): 
+        return
 
     try:
         update_balances()
@@ -567,15 +568,19 @@ def dynamic_rebalance():
                 total_portfolio += qty
                 continue
             sym = asset + 'USDT'
-            if sym not in symbol_info: continue
+            if sym not in symbol_info: 
+                continue
             price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
             total_portfolio += qty * price
-        if total_portfolio <= ZERO: return
+        if total_portfolio <= ZERO: 
+            return
 
         for asset in list(account_balances.keys()):
-            if asset == 'USDT': continue
+            if asset == 'USDT': 
+                continue
             sym = asset + 'USDT'
-            if sym not in symbol_info: continue
+            if sym not in symbol_info: 
+                continue
 
             current_price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
             current_qty = account_balances.get(asset, ZERO)
@@ -587,11 +592,15 @@ def dynamic_rebalance():
             macd_line, signal_line, histogram = get_macd(sym)
             macd_bullish = histogram is not None and histogram > ZERO
 
-            binance_stats = client.get_ticker_24hr(symbol=sym)
-            volume_24h = Decimal(binance_stats['quoteVolume'])
+            # SAFE volume from websocket cache (always up-to-date, no REST call)
+            volume_24h = Decimal('0')
+            if sym in ticker_24hr_cache:
+                volume_24h = Decimal(ticker_24hr_cache[sym].get('quoteVolume', '0'))
 
-            # Strong signal → 20%, decent → 12%, weak → 4%
-            if pressure >= Decimal('0.70') and rsi < Decimal('75') and mfi > Decimal('62') and macd_bullish and volume_24h > Decimal('100_000_000'):
+            # Signal strength tiers
+            if (pressure >= Decimal('0.70') and rsi < Decimal('75') and 
+                mfi > Decimal('62') and macd_bullish and 
+                volume_24h > Decimal('100000000')):
                 target_pct = Decimal('0.20')
             elif pressure >= Decimal('0.60') and rsi < Decimal('72') and macd_bullish:
                 target_pct = Decimal('0.12')
@@ -602,18 +611,17 @@ def dynamic_rebalance():
 
             target_value = total_portfolio * target_pct
 
-            # Wider tolerance: ±12% instead of ±8%
-            if current_value > target_value * Decimal('1.12') and volume_24h > Decimal('30_000_000'):
-                sell_qty = ((current_value - target_value) / current_price)
-                sell_qty = floor_to_step(sell_qty, symbol_info[sym]['stepSize'])
+            # ±12% tolerance + only sell if decent volume (no forced dumps on illiquid coins)
+            if current_value > target_value * Decimal('1.12') and volume_24h > Decimal('30000000'):
+                sell_qty = floor_to_step((current_value - target_value) / current_price, symbol_info[sym]['stepSize'])
                 if sell_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
 
             elif current_value < target_value * Decimal('0.88'):
-                buy_qty = ((target_value - current_value) / current_price)
-                buy_qty = floor_to_step(buy_qty, symbol_info[sym]['stepSize'])
+                buy_qty = floor_to_step((target_value - current_value) / current_price, symbol_info[sym]['stepSize'])
                 required = current_price * buy_qty * (ONE + taker_fee)
-                if get_available_usdt_after_reserve() >= required and buy_qty >= symbol_info[sym]['minQty']:
+                if (get_available_usdt_after_reserve() >= required and 
+                    buy_qty >= symbol_info[sym]['minQty']):
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
 
     except Exception as e:
