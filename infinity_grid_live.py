@@ -664,7 +664,7 @@ tk.Label(root, text="PLATINUM 2025", font=title_font, fg="#ffffff", bg="#0d1117"
 
 stats = tk.Frame(root, bg="#0d1117")
 stats.pack(padx=40, fill="x", pady=20)
-usdt_label = tk.Label(d stats, text="USDT Balance: $0.00", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
+usdt_label = tk.Label(stats, text="USDT Balance: $0.00", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
 usdt_label.pack(fill="x", pady=5)
 orders_label = tk.Label(stats, text="Active Orders: 0", font=big_font, fg="#39d353", bg="#0d1117", anchor="w")
 orders_label.pack(fill="x", pady=5)
