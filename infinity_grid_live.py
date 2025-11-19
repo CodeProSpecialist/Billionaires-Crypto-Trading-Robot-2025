@@ -121,6 +121,17 @@ def terminal_insert(msg):
         terminal_text.see(tk.END)
     except: pass
 
+def get_total_balance_str() -> str:
+    with _balance_lock:
+        update_balances()
+    total = account_balances.get('USDT', ZERO)
+    for asset, qty in account_balances.items():
+        if asset == 'USDT' or qty <= ZERO: continue
+        sym = asset + 'USDT'
+        if sym in price_cache:
+            total += qty * price_cache[sym]
+    return f"\nAccount Balance: ${total:,.2f}"
+
 def send_whatsapp(message):
     global last_buy_alert, last_sell_alert
     if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE: return
