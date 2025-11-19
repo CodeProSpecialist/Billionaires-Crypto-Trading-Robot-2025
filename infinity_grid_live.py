@@ -668,6 +668,54 @@ def aggressive_evening_exit():
         except: pass
 
 
+# -------------------- SMART HEALTHY COIN SCANNER --------------------
+def scan_and_grid_healthy_coins():
+    """Go through the big buy_list and only grid coins that are currently healthy (no whale wall + good signals)"""
+    if not buy_list:
+        return
+
+    # Shuffle a little so we don't always hit the same coins first
+    import random
+    candidates = buy_list[:]
+    random.shuffle(candidates)
+
+    added = 0
+    for sym in candidates:
+        if added >= 12:  # max 12 concurrent grids (adjust if you want more/fewer)
+            break
+        if sym in placing_order_for:
+            continue
+        if sym in active_grid_orders and active_grid_orders[sym]:
+            continue  # already have a grid on this coin
+
+        # Fast pre-check: whale wall?
+        if is_whale_wall_danger(sym):
+            continue
+
+        # Full indicator check
+        try:
+            price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
+            rsi = get_rsi(sym)
+            mfi = get_mfi(sym)
+            macd_line, signal_line, histogram = get_macd(sym)
+            macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
+            pressure, _ = get_buy_pressure_and_slippage(sym)
+
+            if (Decimal('60') <= rsi <= Decimal('74') and
+                Decimal('50') < mfi < Decimal('82') and
+                macd_bullish and
+                pressure > Decimal('0.58')):
+
+                terminal_insert(f"[{now_cst()}] 🚀 Healthy rocket found → placing grid on {sym}")
+                regrid_symbol(sym)
+                added += 1
+        except:
+            continue
+
+    if added == 0:
+        terminal_insert(f"[{now_cst()}] No healthy coins right now — waiting for whale walls to clear...")
+
+
 # -------------------- MAIN LOOP (SMART COIN ROTATION) --------------------
 def main_loop():
     if not running: return
