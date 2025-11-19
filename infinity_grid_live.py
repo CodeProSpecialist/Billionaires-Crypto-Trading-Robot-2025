@@ -435,7 +435,7 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-# -------------------- PERFECTED MOMENTUM BUY LIST (NO BINANCE 24HR CALL) --------------------
+# -------------------- PERFECTED MOMENTUM BUY LIST (NO DECIMAL ERRORS) --------------------
 def generate_buy_list():
     global buy_list, last_buy_list_update
     if exit_in_progress or not is_trading_allowed(): 
@@ -462,27 +462,34 @@ def generate_buy_list():
                 
             sym = base + 'USDT'
             
-            # Critical: only coins that actually exist & trade on Binance.US
+            # Must exist on Binance.US
             if sym not in symbol_info: 
                 continue
 
-            volume_24h = Decimal(str(coin.get('total_volume') or 0))
-            change_24h = Decimal(str(coin.get('price_change_percentage_24h') or 0))
-            market_cap = Decimal(str(coin.get('market_cap') or 1))
+            # === SAFE DECIMAL CONVERSION ===
+            raw_volume = coin.get('total_volume') or 0
+            raw_change_24h = coin.get('price_change_percentage_24h') or 0
+            raw_market_cap = coin.get('market_cap') or 0
 
-            # Filters: decent liquidity + pumping today + not a dead coin
-            if volume_24h < Decimal('40_000_000'): 
+            # Force everything to string first → Decimal (this never fails)
+            volume_24h   = Decimal(str(raw_volume))
+            change_24h   = Decimal(str(raw_change_24h))
+            market_cap   = Decimal(str(raw_market_cap))
+
+            # Filters — now completely safe
+            if volume_24h < Decimal('40000000'): 
                 continue
-            if change_24h < Decimal('3.0'):  # must be up today
+            if change_24h < Decimal('3'):  
                 continue
-            if market_cap < Decimal('500_000_000'): 
+            if market_cap < Decimal('500000000'): 
                 continue
 
-            # Score: high volume + strong 24h pump = rocket
-            score = float(volume_24h / 1_000_000) * (1 + float(change_24h) / 100)
-            candidates.append((sym, score, f"{base} +{change_24h:.2f}% vol ${volume_24h/1e6:.0f}M"))
+            # Score: volume + momentum
+            score = float(volume_24h / Decimal('1000000')) * (1 + float(change_24h) / 100)
+            pretty_name = f"{base} +{change_24h:.2f}% ${volume_24h/Decimal('1000000'):.0f}M vol"
+            candidates.append((sym, score, pretty_name))
 
-        # Top 15 rockets only
+        # Top 15 only
         candidates.sort(key=lambda x: -x[1])
         buy_list = [x[0] for x in candidates[:15]]
         
@@ -492,10 +499,9 @@ def generate_buy_list():
         send_whatsapp(f"🚀 New rocket list ({len(buy_list)}): {', '.join(names)}")
 
     except Exception as e:
-        terminal_insert(f"Buy list failed: {e}")
-        # Super safe fallback
+        terminal_insert(f"Buy list error (safe fallback): {e}")
         buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT', 
-                    'AAVEUSDT', 'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT']
+                    'AAVEUSDT', 'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT', 'ARBUSDT']
 
 # -------------------- MID-MOVE GRID (NO TOPS, NO BOTTOMS) --------------------
 def place_platinum_grid(symbol):
