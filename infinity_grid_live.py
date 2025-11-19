@@ -135,22 +135,23 @@ class HeartbeatWebSocket(websocket.WebSocketApp):
             terminal_insert(f"Reconnecting WS in {delay}s...")
             time.sleep(delay)
 
-# -------------------- FIXED FEE FETCHER --------------------
+# -------------------- FIXED FEE FETCHER FOR BINANCE.US (NO _request_margin) --------------------
 def update_fees():
     global maker_fee, taker_fee, last_fee_update
     if time.time() - last_fee_update < FEE_UPDATE_INTERVAL:
         return
     try:
-        response = client._request_margin('get', 'tradeFee', signed=True)
-        text = response.text.strip()
-        parts = text.split()
-        if len(parts) >= 2:
-            maker_fee = Decimal(parts[0])
-            taker_fee = Decimal(parts[1])
-        last_fee_update = time.time()
-        terminal_insert(f"[{now_cst()}] Fees → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
+        # Binance.US returns fees in account info under tradeFee
+        info = client.get_account()
+        if 'makerCommission' in info and 'takerCommission' in info:
+            maker_fee = Decimal(info['makerCommission']) / 10000
+            taker_fee = Decimal(info['takerCommission']) / 10000
+            last_fee_update = time.time()
+            terminal_insert(f"[{now_cst()}] Fees → Maker {maker_fee*100:.4f}% | Taker {taker_fee*100:.4f}%")
+        else:
+            terminal_insert(f"[{now_cst()}] Fee info not available — using defaults")
     except Exception as e:
-        terminal_insert(f"Fee update failed: {e}")
+        terminal_insert(f"Fee update failed: {e} — using defaults")
 
 # -------------------- UTILITIES --------------------
 def now_cst():
