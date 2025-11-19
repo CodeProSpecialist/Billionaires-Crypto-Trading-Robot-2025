@@ -667,20 +667,18 @@ def aggressive_evening_exit():
                 place_limit_order(sym, 'SELL', sell_price, sell_qty, is_exit=True)
         except: pass
 
-# -------------------- MAIN LOOP --------------------
+
+# -------------------- MAIN LOOP (SMART COIN ROTATION) --------------------
 def main_loop():
     if not running: return
 
     aggressive_evening_exit()
 
     if not exit_in_progress and is_trading_allowed():
-        generate_buy_list()
-        for sym in buy_list:
-            if sym in symbol_info and sym not in placing_order_for:
-                regrid_symbol(sym)
-        dynamic_rebalance()
+        generate_buy_list()                    # refresh big candidate list every 30 min
+        scan_and_grid_healthy_coins()          # ← NEW: only grid coins without whale walls
 
-    root.after(15000, main_loop)
+    root.after(15000, main_loop)   # still 15-second cycle
 
 # -------------------- GUI --------------------
 root = tk.Tk()
