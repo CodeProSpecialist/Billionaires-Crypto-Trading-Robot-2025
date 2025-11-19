@@ -452,7 +452,7 @@ def generate_buy_list():
         params = {
             'vs_currency': 'usd',
             'order': 'market_cap_desc',
-            'per_page': 150,
+            'per_page': 250,
             'page': 1,
             'price_change_percentage': '24h,7d'
         }
@@ -493,9 +493,9 @@ def generate_buy_list():
             pretty_name = f"{base} +{change_24h:.2f}% ${volume_24h/Decimal('1000000'):.0f}M vol"
             candidates.append((sym, score, pretty_name))
 
-        # Top 15 only
+        # Top 80 only
         candidates.sort(key=lambda x: -x[1])
-        buy_list = [x[0] for x in candidates[:15]]
+        buy_list = [x[0] for x in candidates[:80]]
         
         last_buy_list_update = time.time()
         names = [x[2].split()[0] for x in candidates[:15]]
