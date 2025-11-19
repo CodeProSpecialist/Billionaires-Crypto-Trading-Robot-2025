@@ -12,7 +12,7 @@
 
 ### Core Philosophy – Why This Bot Exists
 
-On **Binance.US** (and almost every altcoin market), the period between **18:00 CST and 08:00 CST** is statistically the most dangerous time of the entire day.
+On **Cryptocurrency exchanges** (and almost every altcoin market), the period between **18:00 CST and 08:00 CST** is statistically the most dangerous time of the entire day.
 
 During U.S. night + Asian morning session:
 - Almost zero real buying volume
