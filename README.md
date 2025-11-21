@@ -198,7 +198,10 @@ export CALLMEBOT_PHONE="your_phone_number_here"  # E.g., +1234567890
 Run Program: 
 
 ```bash
-conda activate 
+conda activate
+
+pip3 install numpy TA-Lib python-binance requests websocket-client pytz tkinter
+
 python3 infinity_grid_live.py
 ```
 
