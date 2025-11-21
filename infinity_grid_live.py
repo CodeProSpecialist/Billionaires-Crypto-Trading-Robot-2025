@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION (Nov 19, 2025)
-★ All upgrades applied: whale protection, perfect momentum list, mid-move entry, smart rebalance
+INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION + TA-LIB (November 21, 2025)
+★ Legacy backbone 100% preserved
+★ All indicators replaced with real TA-Lib on 500 daily klines
+★ RSI, MACD + crossover, MFI, SMA200, candlestick patterns, volume spike, bullish momentum
 """
 
 import os
 import sys
 import time
 import json
+import random
 import requests
+import threading
+import numpy as np
+import talib
 from datetime import datetime
 from decimal import Decimal, getcontext, ROUND_DOWN
-import tkinter as tk
-from tkinter import font as tkfont, messagebox, scrolledtext
+
 import pytz
 import websocket
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-import threading
+
+import tkinter as tk
+from tkinter import font as tkfont, messagebox, scrolledtext
 
 # -------------------- PRECISION & CONSTANTS --------------------
 getcontext().prec = 28
@@ -69,11 +76,11 @@ active_orders = 0
 price_cache = {}
 buy_list = []
 last_buy_list_update = 0
-kline_cache = {}
-macd_cache = {}
+daily_klines_cache = {}      # symbol -> dict with np arrays + talib outputs
+last_kline_update = {}       # symbol -> timestamp
 placing_order_for = set()
 last_whale_check = {}
-WHALE_CHECK_INTERVAL = 60  # seconds
+WHALE_CHECK_INTERVAL = 60
 
 BLACKLISTED_BASE_ASSETS = {
     'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'BCH', 'LTC', 'DOGE', 'PEPE', 'SHIB',
@@ -182,125 +189,123 @@ def load_symbol_info():
     except Exception as e:
         terminal_insert(f"Symbol load error: {e}")
 
-# -------------------- INDICATORS --------------------
-def get_rsi(symbol, period=14):
+# -------------------- TA-LIB INDICATORS ON 500 DAILY KLINES --------------------
+def get_daily_ohlcv(symbol, limit=500):
+    now = time.time()
+    if symbol in daily_klines_cache and symbol in last_kline_update:
+        if now - last_kline_update[symbol] < 3600:
+            return daily_klines_cache[symbol]
+
     try:
-        klines = client.get_klines(symbol=symbol, interval='1m', limit=period + 1)
-        closes = [Decimal(k[4]) for k in klines]
-        gains = losses = ZERO
-        for i in range(1, len(closes)):
-            change = closes[i] - closes[i-1]
-            if change > 0: gains += change
-            else: losses -= change
-        if losses == ZERO: return Decimal('100')
-        if gains == ZERO: return ZERO
-        rs = (gains / period) / (losses / period)
-        rsi = Decimal('100') - (Decimal('100') / (ONE + rs))
-        return rsi.quantize(Decimal('0.01'))
-    except: return Decimal('50')
+        klines = client.get_klines(symbol=symbol, interval='1d', limit=limit)
+        if len(klines) < 220:
+            return None
 
-def get_macd(symbol, fast=12, slow=26, signal=9):
-    try:
-        if symbol not in macd_cache or len(macd_cache[symbol]) < slow + signal:
-            klines = client.get_klines(symbol=symbol, interval='1m', limit=slow + signal + 10)
-            closes = [Decimal(k[4]) for k in klines]
-            macd_cache[symbol] = closes
-        else:
-            latest = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
-            macd_cache[symbol] = macd_cache[symbol][-(slow + signal):] + [latest]
+        o = np.array([float(k[1]) for k in klines], dtype=float)
+        h = np.array([float(k[2]) for k in klines], dtype=float)
+        l = np.array([float(k[3]) for k in klines], dtype=float)
+        c = np.array([float(k[4]) for k in klines], dtype=float)
+        v = np.array([float(k[5]) for k in klines], dtype=float)
 
-        closes = macd_cache[symbol]
+        rsi = talib.RSI(c, timeperiod=14)
+        macd, signal, hist = talib.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
+        mfi = talib.MFI(h, l, c, v, timeperiod=14)
+        sma200 = talib.SMA(c, timeperiod=200)
+        atr = talib.ATR(h, l, c, timeperiod=14)
+        hammer = talib.CDLHAMMER(o, h, l, c)
+        engulfing = talib.CDLENGULFING(o, h, l, c)
+        morningstar = talib.CDLMORNINGSTAR(o, h, l, c)
 
-        def ema(values, period):
-            k = Decimal('2') / (period + 1)
-            ema_val = values[0]
-            for price in values[1:]:
-                ema_val = price * k + ema_val * (ONE - k)
-            return ema_val
+        data = {
+            'open': o, 'high': h, 'low': l, 'close': c, 'volume': v,
+            'rsi': rsi, 'macd': macd, 'signal': signal, 'hist': hist,
+            'mfi': mfi, 'sma200': sma200, 'atr': atr,
+            'hammer': hammer, 'engulfing': engulfing, 'morningstar': morningstar
+        }
+        daily_klines_cache[symbol] = data
+        last_kline_update[symbol] = now
+        return data
+    except Exception as e:
+        terminal_insert(f"TA-Lib data error {symbol}: {e}")
+        return None
 
-        ema_fast = ema(closes[-fast:], fast)
-        ema_slow = ema(closes[-slow:], slow)
-        macd_line = ema_fast - ema_slow
-        signal_line = ema(closes[-signal:], signal)
-        histogram = macd_line - signal_line
+def get_indicators(symbol):
+    data = get_daily_ohlcv(symbol)
+    if not data:
+        return None
 
-        return macd_line, signal_line, histogram
-    except: return None, None, None
+    i = -1
+    p = -2
 
-def get_mfi(symbol, period=14):
-    try:
-        klines = client.get_klines(symbol=symbol, interval='1m', limit=period + 1)
-        highs = [Decimal(k[2]) for k in klines]
-        lows = [Decimal(k[3]) for k in klines]
-        closes = [Decimal(k[4]) for k in klines]
-        volumes = [Decimal(k[5]) for k in klines]
+    return {
+        'price': Decimal(str(data['close'][i])),
+        'rsi': Decimal(str(data['rsi'][i])) if not np.isnan(data['rsi'][i]) else Decimal('50'),
+        'mfi': Decimal(str(data['mfi'][i])) if not np.isnan(data['mfi'][i]) else Decimal('50'),
+        'sma200': Decimal(str(data['sma200'][i])) if not np.isnan(data['sma200'][i]) else ZERO,
+        'macd_line': Decimal(str(data['macd'][i])) if not np.isnan(data['macd'][i]) else ZERO,
+        'signal_line': Decimal(str(data['signal'][i])) if not np.isnan(data['signal'][i]) else ZERO,
+        'histogram': Decimal(str(data['hist'][i])) if not np.isnan(data['hist'][i]) else ZERO,
+        'macd_bullish': data['macd'][i] > data['signal'][i] and data['hist'][i] > ZERO,
+        'macd_cross_bull': data['macd'][i] > data['signal'][i] and data['macd'][p] <= data['signal'][p],
+        'above_sma200': data['close'][i] > data['sma200'][i],
+        'volume_spike': data['volume'][i] > np.mean(data['volume'][-20:]) * 2,
+        'bullish_pattern': data['hammer'][i] == 100 or data['engulfing'][i] == 100 or data['morningstar'][i] == 100
+    }
 
-        typical_prices = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
-        raw_money_flow = [tp * v for tp, v in zip(typical_prices, volumes)]
+# Override legacy functions to use TA-Lib
+def get_rsi(symbol):
+    ind = get_indicators(symbol)
+    return ind['rsi'] if ind else Decimal('50')
 
-        positive_flow = negative_flow = ZERO
-        for i in range(1, len(typical_prices)):
-            if typical_prices[i] > typical_prices[i-1]:
-                positive_flow += raw_money_flow[i]
-            elif typical_prices[i] < typical_prices[i-1]:
-                negative_flow += raw_money_flow[i]
+def get_macd(symbol):
+    ind = get_indicators(symbol)
+    if not ind: return None, None, None
+    return ind['macd_line'], ind['signal_line'], ind['histogram']
 
-        if negative_flow == ZERO: return Decimal('100')
-        money_ratio = positive_flow / negative_flow
-        mfi = Decimal('100') - (Decimal('100') / (ONE + money_ratio))
-        return mfi.quantize(Decimal('0.01'))
-    except: return Decimal('50')
+def get_mfi(symbol):
+    ind = get_indicators(symbol)
+    return ind['mfi'] if ind else Decimal('50')
 
+# -------------------- WHALE WALL PROTECTION --------------------
 def get_buy_pressure_and_slippage(symbol):
-    """Returns (buy_pressure, estimated_slippage_pct_for_10k_usdt)"""
     try:
         book = client.get_order_book(symbol=symbol, limit=50)
         bids = book['bids']
         asks = book['asks']
-        
         bid_vol = sum(Decimal(b[1]) for b in bids)
         ask_vol = sum(Decimal(a[1]) for a in asks)
         total = bid_vol + ask_vol
         buy_pressure = (bid_vol / total) if total > ZERO else Decimal('0.5')
-
-        # Estimate slippage for ~$10k buy
         target_usdt = Decimal('10000')
         accumulated = ZERO
-        slippage_price = ZERO
         for price_str, qty_str in bids:
             price = Decimal(price_str)
             qty = Decimal(qty_str)
             cost = price * qty
             if accumulated + cost >= target_usdt:
-                remaining = target_usdt - accumulated
                 slippage_price = price
                 break
             accumulated += cost
         else:
-            slippage_price = Decimal(bids[-1][0])  # worst case
-
+            slippage_price = Decimal(bids[-1][0])
         current_price = Decimal(client.get_symbol_ticker(symbol=symbol)['price'])
         slippage_pct = (current_price - slippage_price) / current_price * 100
         return buy_pressure.quantize(Decimal('0.0001')), slippage_pct.quantize(Decimal('0.01'))
     except:
         return Decimal('0.5'), Decimal('10')
 
-# -------------------- WHALE WALL PROTECTION (FIXED) --------------------
 def is_whale_wall_danger(symbol) -> bool:
     now = time.time()
     if symbol in last_whale_check:
         last_time, danger = last_whale_check[symbol]
         if now - last_time < WHALE_CHECK_INTERVAL:
-            return danger  # return cached danger result
-
+            return danger
     pressure, slippage = get_buy_pressure_and_slippage(symbol)
     danger = (
         pressure < Decimal('0.40') or
         slippage > Decimal('1.2') or
         (pressure < Decimal('0.55') and slippage > Decimal('0.8'))
     )
-    
-    # Store both timestamp and result
     last_whale_check[symbol] = (now, danger)
     return danger
 
@@ -321,10 +326,7 @@ def is_portfolio_fully_in_usdt():
     return True
 
 # -------------------- WEBSOCKETS --------------------
-# (unchanged - still perfect)
 def start_user_stream():
-    import threading
-
     def keep_listenkey_alive():
         while running:
             time.sleep(1800)
@@ -355,7 +357,6 @@ def on_user_message(ws, message):
     try:
         data = json.loads(message)
         e = data.get('e')
-
         if e == 'outboundAccountPosition':
             for b in data['B']:
                 asset = b['a']
@@ -364,7 +365,6 @@ def on_user_message(ws, message):
                     account_balances[asset] = total
                 elif asset in account_balances:
                     del account_balances[asset]
-
         elif e == 'executionReport' and data.get('X') in ('FILLED', 'PARTIALLY_FILLED'):
             symbol = data['s']
             side = data['S']
@@ -373,14 +373,11 @@ def on_user_message(ws, message):
             base = symbol.replace('USDT', '')
             terminal_insert(f"[{now_cst()}] FILLED {side} {base} {qty:.6f} @ ${price:.8f}{get_total_balance_str()}")
             send_whatsapp(f"{'BUY' if side=='BUY' else 'SELL'} {base} {qty:.4f} @ ${price:.6f}")
-
             placing_order_for.discard(symbol)
-
         elif e == '24hrTicker':
             symbol = data['s']
             if symbol in symbol_info:
                 price_cache[symbol] = Decimal(data['c'])
-
     except: pass
 
 # -------------------- ORDER PLACEMENT --------------------
@@ -388,19 +385,15 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
     global active_orders
     if symbol in placing_order_for: return False
     placing_order_for.add(symbol)
-
     try:
         info = symbol_info[symbol]
         price_dec = (Decimal(price) // info['tickSize']) * info['tickSize']
         qty_dec = floor_to_step(Decimal(qty), info['stepSize']).quantize(Decimal('0.00000000'), ROUND_DOWN)
-
         if qty_dec < info['minQty'] or price_dec * qty_dec < info['minNotional']:
             placing_order_for.discard(symbol)
             return False
-
         update_fees()
         update_balances()
-
         if side == 'BUY':
             cost = price_dec * qty_dec * (ONE + taker_fee)
             if get_available_usdt_after_reserve() < cost:
@@ -411,15 +404,12 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
             if qty_dec > account_balances.get(base, ZERO):
                 placing_order_for.discard(symbol)
                 return False
-
         order = client.create_order(symbol=symbol, side=side, type='LIMIT', timeInForce='GTC',
                                     price=str(price_dec), quantity=str(qty_dec))
-
         base = symbol.replace('USDT', '')
         msg = f"GRID {side} {base} {qty_dec} @ ${price_dec:.8f}"
         terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
         send_whatsapp(f"∞ {msg}")
-
         if not exit_in_progress:
             active_grid_orders.setdefault(symbol, []).append(order['orderId'])
         active_orders += 1
@@ -439,12 +429,12 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-# -------------------- PERFECTED MOMENTUM BUY LIST (NO DECIMAL ERRORS) --------------------
+# -------------------- MOMENTUM BUY LIST --------------------
 def generate_buy_list():
     global buy_list, last_buy_list_update
     if exit_in_progress or not is_trading_allowed(): 
         return
-    if time.time() - last_buy_list_update < 1800:  # every 30 min max
+    if time.time() - last_buy_list_update < 1800:
         return
 
     try:
@@ -463,24 +453,18 @@ def generate_buy_list():
             base = coin['symbol'].upper()
             if base in BLACKLISTED_BASE_ASSETS: 
                 continue
-                
             sym = base + 'USDT'
-            
-            # Must exist on Binance.US
             if sym not in symbol_info: 
                 continue
 
-            # === SAFE DECIMAL CONVERSION ===
             raw_volume = coin.get('total_volume') or 0
             raw_change_24h = coin.get('price_change_percentage_24h') or 0
             raw_market_cap = coin.get('market_cap') or 0
 
-            # Force everything to string first → Decimal (this never fails)
             volume_24h   = Decimal(str(raw_volume))
             change_24h   = Decimal(str(raw_change_24h))
             market_cap   = Decimal(str(raw_market_cap))
 
-            # Filters — now completely safe
             if volume_24h < Decimal('40000000'): 
                 continue
             if change_24h < Decimal('3'):  
@@ -488,12 +472,10 @@ def generate_buy_list():
             if market_cap < Decimal('500000000'): 
                 continue
 
-            # Score: volume + momentum
             score = float(volume_24h / Decimal('1000000')) * (1 + float(change_24h) / 100)
             pretty_name = f"{base} +{change_24h:.2f}% ${volume_24h/Decimal('1000000'):.0f}M vol"
             candidates.append((sym, score, pretty_name))
 
-        # Top 80 only
         candidates.sort(key=lambda x: -x[1])
         buy_list = [x[0] for x in candidates[:80]]
         
@@ -507,59 +489,55 @@ def generate_buy_list():
         buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT', 
                     'AAVEUSDT', 'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT', 'ARBUSDT']
 
-# -------------------- MID-MOVE GRID (NO TOPS, NO BOTTOMS) --------------------
+# -------------------- GRID USING TA-LIB --------------------
 def place_platinum_grid(symbol):
     if exit_in_progress or not is_trading_allowed(): return
     if is_whale_wall_danger(symbol):
         terminal_insert(f"[{now_cst()}] 🐳 Whale wall detected on {symbol} — skipping grid")
         return
 
-    try:
-        price = price_cache.get(symbol, Decimal(client.get_symbol_ticker(symbol=symbol)['price']))
-        info = symbol_info[symbol]
-        grid_pct = Decimal('0.012')
-        cash = BASE_CASH_PER_LEVEL * Decimal('1.5')
+    ind = get_indicators(symbol)
+    if not ind: return
 
-        rsi = get_rsi(symbol)
-        mfi = get_mfi(symbol)
-        macd_line, signal_line, histogram = get_macd(symbol)
-        macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
-        pressure, _ = get_buy_pressure_and_slippage(symbol)
+    price = ind['price']
+    info = symbol_info[symbol]
+    grid_pct = Decimal('0.012')
+    cash = BASE_CASH_PER_LEVEL * Decimal('1.5')
 
-        # Mid-move sweet spot only
-        if not (Decimal('60') <= rsi <= Decimal('74') and
-                Decimal('50') < mfi < Decimal('82') and
-                macd_bullish and
-                pressure > Decimal('0.58')):
-            return
+    rsi_ok = Decimal('60') <= ind['rsi'] <= Decimal('74')
+    mfi_ok = Decimal('50') < ind['mfi'] < Decimal('82')
+    macd_ok = ind['macd_bullish']
+    pressure, _ = get_buy_pressure_and_slippage(symbol)
+    momentum_ok = ind['above_sma200'] and ind['volume_spike']
+    pattern_ok = ind['macd_cross_bull'] or ind['bullish_pattern']
 
-        # Place buys BELOW price (catch dips), sells ABOVE
-        for i in range(1, 9):
-            buy_price = price * ((ONE - grid_pct) ** i)
-            buy_price = (buy_price // info['tickSize']) * info['tickSize']
-            qty = cash * (GOLDEN_RATIO ** (i-1)) / buy_price
-            qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
-            required = buy_price * qty * (ONE + taker_fee)
-            if get_available_usdt_after_reserve() >= required:
-                place_limit_order(symbol, 'BUY', buy_price, qty)
+    if not (rsi_ok and mfi_ok and macd_ok and pressure > Decimal('0.58') and momentum_ok and pattern_ok):
+        return
 
-        owned = account_balances.get(symbol.replace('USDT', ''), ZERO)
-        for i in range(1, 9):
-            sell_price = price * ((ONE + grid_pct) ** i)
-            sell_price = (sell_price // info['tickSize']) * info['tickSize']
-            qty = cash * (SELL_GROWTH_OPTIMAL ** (i-1)) / sell_price
-            qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
-            if qty <= owned:
-                place_limit_order(symbol, 'SELL', sell_price, qty)
-                owned -= qty
-    except: pass
+    for i in range(1, 9):
+        buy_price = price * ((ONE - grid_pct) ** i)
+        buy_price = (buy_price // info['tickSize']) * info['tickSize']
+        qty = cash * (GOLDEN_RATIO ** (i-1)) / buy_price
+        qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
+        required = buy_price * qty * (ONE + taker_fee)
+        if get_available_usdt_after_reserve() >= required:
+            place_limit_order(symbol, 'BUY', buy_price, qty)
+
+    owned = account_balances.get(symbol.replace('USDT', ''), ZERO)
+    for i in range(1, 9):
+        sell_price = price * ((ONE + grid_pct) ** i)
+        sell_price = (sell_price // info['tickSize']) * info['tickSize']
+        qty = cash * (SELL_GROWTH_OPTIMAL ** (i-1)) / sell_price
+        qty = floor_to_step(qty, info['stepSize']).quantize(Decimal('0.00000000'))
+        if qty <= owned:
+            place_limit_order(symbol, 'SELL', sell_price, qty)
+            owned -= qty
 
 def regrid_symbol(symbol):
     if exit_in_progress: return
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
-# -------------------- SMARTER REBALANCING (NO 24HR TICKER CALL) --------------------
 def dynamic_rebalance():
     if exit_in_progress or not is_trading_allowed(): 
         return
@@ -588,37 +566,27 @@ def dynamic_rebalance():
             if sym not in symbol_info: 
                 continue
 
+            ind = get_indicators(sym)
+            if not ind: continue
+
             current_price = price_cache.get(sym) or Decimal(client.get_symbol_ticker(symbol=sym)['price'])
             current_qty = account_balances.get(asset, ZERO)
             current_value = current_qty * current_price
 
-            pressure, slippage = get_buy_pressure_and_slippage(sym)
-            rsi = get_rsi(sym)
-            mfi = get_mfi(sym)
-            macd_line, signal_line, histogram = get_macd(sym)
-            macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
+            pressure, _ = get_buy_pressure_and_slippage(sym)
 
-            # Safe volume estimate: use order book depth as proxy (we already pull it)
-            try:
-                book = client.get_order_book(symbol=sym, limit=20)
-                est_volume_proxy = sum(Decimal(x[1]) * current_price for x in book['bids'] + book['asks'])
-            except:
-                est_volume_proxy = Decimal('50000000')  # assume decent if we can't read
-
-            # Strong = big depth + strong signals
-            if (pressure >= Decimal('0.70') and rsi < Decimal('75') and 
-                mfi > Decimal('62') and macd_bullish and est_volume_proxy > Decimal('100_000_000')):
+            if (pressure >= Decimal('0.70') and ind['rsi'] < Decimal('75') and 
+                ind['mfi'] > Decimal('62') and ind['macd_bullish'] and ind['above_sma200']):
                 target_pct = Decimal('0.20')
-            elif pressure >= Decimal('0.60') and rsi < Decimal('72') and macd_bullish:
+            elif pressure >= Decimal('0.60') and ind['rsi'] < Decimal('72') and ind['macd_bullish']:
                 target_pct = Decimal('0.12')
-            elif pressure >= Decimal('0.50') and macd_bullish:
+            elif pressure >= Decimal('0.50') and ind['macd_bullish']:
                 target_pct = Decimal('0.06')
             else:
                 target_pct = Decimal('0.02')
 
             target_value = total_portfolio * target_pct
 
-            # Wider tolerance (±12%)
             if current_value > target_value * Decimal('1.12'):
                 sell_qty = floor_to_step((current_value - target_value) / current_price, symbol_info[sym]['stepSize'])
                 if sell_qty >= symbol_info[sym]['minQty']:
@@ -633,7 +601,7 @@ def dynamic_rebalance():
     except Exception as e:
         terminal_insert(f"Rebalance error (ignored): {e}")
 
-# -------------------- AGGRESSIVE EVENING EXIT --------------------
+# -------------------- EVENING EXIT & SCANNER --------------------
 def aggressive_evening_exit():
     global exit_in_progress, last_exit_attempt
 
@@ -667,70 +635,60 @@ def aggressive_evening_exit():
                 place_limit_order(sym, 'SELL', sell_price, sell_qty, is_exit=True)
         except: pass
 
-
-# -------------------- SMART HEALTHY COIN SCANNER --------------------
 def scan_and_grid_healthy_coins():
-    """Go through the big buy_list and only grid coins that are currently healthy (no whale wall + good signals)"""
     if not buy_list:
         return
 
-    # Shuffle a little so we don't always hit the same coins first
-    import random
     candidates = buy_list[:]
     random.shuffle(candidates)
 
     added = 0
     for sym in candidates:
-        if added >= 12:  # max 12 concurrent grids (adjust if you want more/fewer)
+        if added >= 12:
             break
         if sym in placing_order_for:
             continue
         if sym in active_grid_orders and active_grid_orders[sym]:
-            continue  # already have a grid on this coin
+            continue
 
-        # Fast pre-check: whale wall?
         if is_whale_wall_danger(sym):
             continue
 
-        # Full indicator check
-        try:
-            price = price_cache.get(sym, Decimal(client.get_symbol_ticker(symbol=sym)['price']))
-            rsi = get_rsi(sym)
-            mfi = get_mfi(sym)
-            macd_line, signal_line, histogram = get_macd(sym)
-            macd_bullish = histogram is not None and histogram > ZERO and macd_line > signal_line
-            pressure, _ = get_buy_pressure_and_slippage(sym)
+        ind = get_indicators(sym)
+        if not ind: continue
 
-            if (Decimal('60') <= rsi <= Decimal('74') and
-                Decimal('50') < mfi < Decimal('82') and
-                macd_bullish and
-                pressure > Decimal('0.58')):
+        pressure, _ = get_buy_pressure_and_slippage(sym)
 
-                terminal_insert(f"[{now_cst()}] 🚀 Healthy rocket found → placing grid on {sym}")
-                regrid_symbol(sym)
-                added += 1
-        except:
-            continue
+        if (Decimal('60') <= ind['rsi'] <= Decimal('74') and
+            Decimal('50') < ind['mfi'] < Decimal('82') and
+            ind['macd_bullish'] and
+            pressure > Decimal('0.58') and
+            ind['above_sma200'] and ind['volume_spike'] and
+            (ind['macd_cross_bull'] or ind['bullish_pattern'])):
+
+            terminal_insert(f"[{now_cst()}] 🚀 Healthy rocket found → placing grid on {sym}")
+            regrid_symbol(sym)
+            added += 1
 
     if added == 0:
         terminal_insert(f"[{now_cst()}] No healthy coins right now — waiting for whale walls to clear...")
 
-
-# -------------------- MAIN LOOP (SMART COIN ROTATION) --------------------
+# -------------------- MAIN LOOP --------------------
 def main_loop():
     if not running: return
 
     aggressive_evening_exit()
 
     if not exit_in_progress and is_trading_allowed():
-        generate_buy_list()                    # refresh big candidate list every 30 min
-        scan_and_grid_healthy_coins()          # ← NEW: only grid coins without whale walls
+        generate_buy_list()
+        scan_and_grid_healthy_coins()
+        dynamic_rebalance()
 
-    root.after(15000, main_loop)   # still 15-second cycle
+    root.after(15000, main_loop)
 
 # -------------------- GUI --------------------
 root = tk.Tk()
-root.title("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION")
+root.title("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION + TA-LIB")
 root.geometry("800x900")
 root.resizable(False, False)
 root.configure(bg="#0d1117")
@@ -770,7 +728,7 @@ def start_bot():
     if running: return
     running = True
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — FINAL PERFECTION ENGAGED")
+    terminal_insert(f"[{now_cst()}] BOT STARTED — FINAL PERFECTION + TA-LIB ENGAGED")
     send_whatsapp("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION STARTED")
     root.after(100, main_loop)
 
@@ -796,6 +754,6 @@ if __name__ == "__main__":
     update_fees()
     start_user_stream()
     generate_buy_list()
-    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION LOADED")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION + TA-LIB LOADED")
     update_gui()
     root.mainloop()
