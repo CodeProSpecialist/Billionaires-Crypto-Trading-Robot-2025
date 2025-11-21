@@ -4,6 +4,7 @@ INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION + TA-LIB (November 21,
 ★ Legacy backbone 100% preserved
 ★ All indicators replaced with real TA-Lib on 500 daily klines
 ★ RSI, MACD + crossover, MFI, SMA200, candlestick patterns, volume spike, bullish momentum
+★ NEW: Large safe fallback list if CoinGecko momentum list ever drops below 25 coins
 """
 
 import os
@@ -429,7 +430,24 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-# -------------------- MOMENTUM BUY LIST --------------------
+
+## -------------------- MOMENTUM BUY LIST --------------------
+# Large proven high-liquidity fallback list (activated only when <25 dynamic coins)
+FALLBACK_BUY_LIST = [
+    'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'MATICUSDT', 'UNIUSDT', 'AAVEUSDT',
+    'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT', 'ARBUSDT', 'HBARUSDT',
+    'VETUSDT', 'ATOMUSDT', 'ALGOUSDT', 'FILUSDT', 'ICPUSDT', 'RUNEUSDT', 'GRTUSDT',
+    'MANAUSDT', 'SANDUSDT', 'AXSUSDT', 'EGLDUSDT', 'FTMUSDT', 'THETAUSDT', 'XTZUSDT',
+    'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'CFXUSDT', 'RNDRUSDT', 'STXUSDT', 'FLOWUSDT',
+    'IMXUSDT', 'MINAUSDT', 'KAVAUSDT', 'ROSEUSDT', 'LRCUSDT', 'ZILUSDT', 'ENJUSDT',
+    'BATUSDT', '1INCHUSDT', 'SNXUSDT', 'COMPUSDT', 'YFIUSDT', 'MKRUSDT', 'CRVUSDT',
+    'BALUSDT', 'SUSHIUSDT', 'KSMUSDT', 'WAVESUSDT', 'DASHUSDT', 'ZECUSDT', 'ONTUSDT',
+    'IOSTUSDT', 'REEFUSDT', 'TRBUSDT', 'EOSUSDT', 'QTUMUSDT', 'ICXUSDT', 'BTGUSDT',
+    'ZENUSDT', 'ONEUSDT', 'KLAYUSDT', 'HNTUSDT', 'ARUSDT', 'CELOUSDT', 'ANKRUSDT',
+    'SKLUSDT', 'DENTUSDT', 'CVCUSDT', 'HOTUSDT', 'BLZUSDT', 'OGNUSDT', 'FLUXUSDT',
+    'AUDIOUSDT', 'BANDUSDT', 'CELRUSDT', 'CHRUSDT', 'COTIUSDT', 'DOCKUSDT', 'LINAUSDT'
+]
+
 def generate_buy_list():
     global buy_list, last_buy_list_update
     if exit_in_progress or not is_trading_allowed(): 
@@ -477,17 +495,29 @@ def generate_buy_list():
             candidates.append((sym, score, pretty_name))
 
         candidates.sort(key=lambda x: -x[1])
-        buy_list = [x[0] for x in candidates[:80]]
+        dynamic_list = [x[0] for x in candidates[:80]]
+
+        # ←←← NEW SAFETY LOGIC ←←←
+        if len(dynamic_list) < 25:
+            terminal_insert(f"[{now_cst()}] ⚠️ Only {len(dynamic_list)} dynamic coins found — activating LARGE FALLBACK LIST ({len(FALLBACK_BUY_LIST)} coins)")
+            send_whatsapp(f"⚠️ Low momentum — switched to safe fallback list ({len(FALLBACK_BUY_LIST)} coins)")
+            buy_list = FALLBACK_BUY_LIST[:]
+        else:
+            buy_list = dynamic_list
+
+        # ←←← END NEW LOGIC ←←←
         
         last_buy_list_update = time.time()
         names = [x[2].split()[0] for x in candidates[:15]]
-        terminal_insert(f"[{now_cst()}] 🚀 Buy list refreshed — {len(buy_list)} coins: {', '.join(names)}")
-        send_whatsapp(f"🚀 New rocket list ({len(buy_list)}): {', '.join(names)}")
+        source = "FALLBACK" if len(dynamic_list) < 25 else "CoinGecko"
+        terminal_insert(f"[{now_cst()}] 🚀 Buy list refreshed ({source}) — {len(buy_list)} coins: {', '.join(names[:15])}")
+        send_whatsapp(f"🚀 New rocket list ({source}, {len(buy_list)} coins): {', '.join(names[:15])}")
 
     except Exception as e:
-        terminal_insert(f"Buy list error (safe fallback): {e}")
-        buy_list = ['ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'UNIUSDT', 
-                    'AAVEUSDT', 'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT', 'ARBUSDT']
+        terminal_insert(f"Buy list error — using SAFE FALLBACK list: {e}")
+        send_whatsapp("🚨 CoinGecko failed — activated safe fallback list")
+        buy_list = FALLBACK_BUY_LIST[:]
+        last_buy_list_update = time.time()
 
 # -------------------- GRID USING TA-LIB --------------------
 def place_platinum_grid(symbol):
