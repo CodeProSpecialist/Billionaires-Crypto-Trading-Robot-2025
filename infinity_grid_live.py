@@ -406,7 +406,7 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
             placing_order_for.discard(symbol)
             return False
         update_fees()
-        update Belonging()
+        update_balances()
         if side == 'BUY':
             cost = price_dec * qty_dec * (ONE + taker_fee)
             if get_available_usdt_after_reserve() < cost:
