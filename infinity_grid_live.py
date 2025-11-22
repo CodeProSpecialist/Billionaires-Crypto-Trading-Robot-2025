@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION + TA-LIB (November 21, 2025)
-★ Legacy backbone 100% preserved
-★ All indicators replaced with real TA-Lib on 500 daily klines
-★ RSI, MACD + crossover, MFI, SMA200, candlestick patterns, volume spike, bullish momentum
-★ NEW: Large safe fallback list if CoinGecko momentum list ever drops below 25 coins
+INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION + TA-LIB + BOLLINGER BANDS
+★ Fixed CoinGecko "Missing parameter vs_currency"
+★ Fallback list ignores whale walls
+★ Real TA-Lib indicators + Bollinger Bands (20,2) with squeeze & breakout detection
+★ RSI, MACD crossover, MFI, SMA200, Volume Spike, Candlestick Patterns
+★ Bollinger Squeeze + Expansion = Nuclear rocket fuel
+★ Full GUI, WhatsApp alerts, evening exit, dynamic rebalance
 """
 
 import os
@@ -56,6 +58,7 @@ last_sell_alert = 0
 ALERT_COOLDOWN = 600
 
 running = True
+using_fallback_list = False  # Critical: disables whale wall in fallback mode
 
 # -------------------- ENVIRONMENT --------------------
 CALLMEBOT_API_KEY = os.getenv('CALLMEBOT_API_KEY')
@@ -77,8 +80,8 @@ active_orders = 0
 price_cache = {}
 buy_list = []
 last_buy_list_update = 0
-daily_klines_cache = {}      # symbol -> dict with np arrays + talib outputs
-last_kline_update = {}       # symbol -> timestamp
+daily_klines_cache = {}
+last_kline_update = {}
 placing_order_for = set()
 last_whale_check = {}
 WHALE_CHECK_INTERVAL = 60
@@ -89,41 +92,20 @@ BLACKLISTED_BASE_ASSETS = {
     'WBTC', 'WETH', 'STETH', 'CBETH', 'RETH'
 }
 
-# -------------------- TOTAL BALANCE & WHATSAPP --------------------
-def get_total_balance_str() -> str:
-    update_balances()
-    total = account_balances.get('USDT', ZERO)
-    for asset, qty in account_balances.items():
-        if asset == 'USDT' or qty <= ZERO: continue
-        sym = asset + 'USDT'
-        price = price_cache.get(sym)
-        if not price:
-            try:
-                price = Decimal(client.get_symbol_ticker(symbol=sym)['price'])
-            except: continue
-        total += qty * price
-    return f" | Total: ${total:,.2f}"
-
-def send_whatsapp(message: str):
-    global last_buy_alert, last_sell_alert
-    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE: return
-
-    now = time.time()
-    is_buy = any(x in message.upper() for x in ["BUY", "GRID BUY"])
-    is_sell = any(x in message.upper() for x in ["SELL", "EXIT", "DUMP", "GRID SELL"])
-
-    if (is_buy and now - last_buy_alert < ALERT_COOLDOWN) or \
-       (is_sell and now - last_sell_alert < ALERT_COOLDOWN):
-        return
-
-    try:
-        full_message = f"{message}{get_total_balance_str()}"
-        url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(full_message)}&apikey={CALLMEBOT_API_KEY}"
-        requests.get(url, timeout=10)
-        if is_buy: last_buy_alert = now
-        if is_sell: last_sell_alert = now
-        terminal_insert(f"[{now_cst()}] WhatsApp → {full_message}")
-    except: pass
+FALLBACK_BUY_LIST = [
+    'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'MATICUSDT', 'UNIUSDT', 'AAVEUSDT',
+    'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT', 'ARBUSDT', 'HBARUSDT',
+    'VETUSDT', 'ATOMUSDT', 'ALGOUSDT', 'FILUSDT', 'ICPUSDT', 'RUNEUSDT', 'GRTUSDT',
+    'MANAUSDT', 'SANDUSDT', 'AXSUSDT', 'EGLDUSDT', 'FTMUSDT', 'THETAUSDT', 'XTZUSDT',
+    'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'CFXUSDT', 'RNDRUSDT', 'STXUSDT', 'FLOWUSDT',
+    'IMXUSDT', 'MINAUSDT', 'KAVAUSDT', 'ROSEUSDT', 'LRCUSDT', 'ZILUSDT', 'ENJUSDT',
+    'BATUSDT', '1INCHUSDT', 'SNXUSDT', 'COMPUSDT', 'YFIUSDT', 'MKRUSDT', 'CRVUSDT',
+    'BALUSDT', 'SUSHIUSDT', 'KSMUSDT', 'WAVESUSDT', 'DASHUSDT', 'ZECUSDT', 'ONTUSDT',
+    'IOSTUSDT', 'REEFUSDT', 'TRBUSDT', 'EOSUSDT', 'QTUMUSDT', 'ICXUSDT', 'BTGUSDT',
+    'ZENUSDT', 'ONEUSDT', 'KLAYUSDT', 'HNTUSDT', 'ARUSDT', 'CELOUSDT', 'ANKRUSDT',
+    'SKLUSDT', 'DENTUSDT', 'CVCUSDT', 'HOTUSDT', 'BLZUSDT', 'OGNUSDT', 'FLUXUSDT',
+    'AUDIOUSDT', 'BANDUSDT', 'CELRUSDT', 'CHRUSDT', 'COTIUSDT', 'DOCKUSDT', 'LINAUSDT'
+]
 
 # -------------------- UTILITIES --------------------
 def now_cst():
@@ -169,6 +151,38 @@ def get_available_usdt_after_reserve() -> Decimal:
     available = account_balances.get('USDT', ZERO) - reserved
     return max(available, ZERO)
 
+def get_total_balance_str() -> str:
+    update_balances()
+    total = account_balances.get('USDT', ZERO)
+    for asset, qty in account_balances.items():
+        if asset == 'USDT' or qty <= ZERO: continue
+        sym = asset + 'USDT'
+        price = price_cache.get(sym)
+        if not price:
+            try:
+                price = Decimal(client.get_symbol_ticker(symbol=sym)['price'])
+            except: continue
+        total += qty * price
+    return f" | Total: ${total:,.2f}"
+
+def send_whatsapp(message: str):
+    global last_buy_alert, last_sell_alert
+    if not CALLMEBOT_API_KEY or not CALLMEBOT_PHONE: return
+    now = time.time()
+    is_buy = any(x in message.upper() for x in ["BUY", "GRID BUY"])
+    is_sell = any(x in message.upper() for x in ["SELL", "EXIT", "DUMP", "GRID SELL"])
+    if (is_buy and now - last_buy_alert < ALERT_COOLDOWN) or \
+       (is_sell and now - last_sell_alert < ALERT_COOLDOWN):
+        return
+    try:
+        full_message = f"{message}{get_total_balance_str()}"
+        url = f"https://api.callmebot.com/whatsapp.php?phone={CALLMEBOT_PHONE}&text={requests.utils.quote(full_message)}&apikey={CALLMEBOT_API_KEY}"
+        requests.get(url, timeout=10)
+        if is_buy: last_buy_alert = now
+        if is_sell: last_sell_alert = now
+        terminal_insert(f"[{now_cst()}] WhatsApp → {full_message}")
+    except: pass
+
 # -------------------- SYMBOL INFO --------------------
 def load_symbol_info():
     global symbol_info
@@ -190,18 +204,15 @@ def load_symbol_info():
     except Exception as e:
         terminal_insert(f"Symbol load error: {e}")
 
-# -------------------- TA-LIB INDICATORS ON 500 DAILY KLINES --------------------
+# -------------------- TA-LIB + BOLLINGER BANDS --------------------
 def get_daily_ohlcv(symbol, limit=500):
     now = time.time()
     if symbol in daily_klines_cache and symbol in last_kline_update:
         if now - last_kline_update[symbol] < 3600:
             return daily_klines_cache[symbol]
-
     try:
         klines = client.get_klines(symbol=symbol, interval='1d', limit=limit)
-        if len(klines) < 220:
-            return None
-
+        if len(klines) < 220: return None
         o = np.array([float(k[1]) for k in klines], dtype=float)
         h = np.array([float(k[2]) for k in klines], dtype=float)
         l = np.array([float(k[3]) for k in klines], dtype=float)
@@ -212,7 +223,7 @@ def get_daily_ohlcv(symbol, limit=500):
         macd, signal, hist = talib.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
         mfi = talib.MFI(h, l, c, v, timeperiod=14)
         sma200 = talib.SMA(c, timeperiod=200)
-        atr = talib.ATR(h, l, c, timeperiod=14)
+        upper, middle, lower = talib.BBANDS(c, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
         hammer = talib.CDLHAMMER(o, h, l, c)
         engulfing = talib.CDLENGULFING(o, h, l, c)
         morningstar = talib.CDLMORNINGSTAR(o, h, l, c)
@@ -220,23 +231,29 @@ def get_daily_ohlcv(symbol, limit=500):
         data = {
             'open': o, 'high': h, 'low': l, 'close': c, 'volume': v,
             'rsi': rsi, 'macd': macd, 'signal': signal, 'hist': hist,
-            'mfi': mfi, 'sma200': sma200, 'atr': atr,
+            'mfi': mfi, 'sma200': sma200,
+            'bb_upper': upper, 'bb_middle': middle, 'bb_lower': lower,
             'hammer': hammer, 'engulfing': engulfing, 'morningstar': morningstar
         }
         daily_klines_cache[symbol] = data
         last_kline_update[symbol] = now
         return data
     except Exception as e:
-        terminal_insert(f"TA-Lib data error {symbol}: {e}")
+        terminal_insert(f"TA-Lib error {symbol}: {e}")
         return None
 
 def get_indicators(symbol):
     data = get_daily_ohlcv(symbol)
-    if not data:
-        return None
-
+    if not data: return None
     i = -1
     p = -2
+
+    # Bollinger Band calculations
+    upper = data['bb_upper'][i] if not np.isnan(data['bb_upper'][i]) else data['close'][i]
+    middle = data['bb_middle'][i] if not np.isnan(data['bb_middle'][i]) else data['close'][i]
+    lower = data['bb_lower'][i] if not np.isnan(data['bb_lower'][i]) else data['close'][i]
+    bandwidth = (upper - lower) / middle if middle != 0 else ZERO
+    prev_bandwidth = (data['bb_upper'][p] - data['bb_lower'][p]) / data['bb_middle'][p] if p >= -len(data['close']) and data['bb_middle'][p] != 0 else bandwidth
 
     return {
         'price': Decimal(str(data['close'][i])),
@@ -250,24 +267,21 @@ def get_indicators(symbol):
         'macd_cross_bull': data['macd'][i] > data['signal'][i] and data['macd'][p] <= data['signal'][p],
         'above_sma200': data['close'][i] > data['sma200'][i],
         'volume_spike': data['volume'][i] > np.mean(data['volume'][-20:]) * 2,
-        'bullish_pattern': data['hammer'][i] == 100 or data['engulfing'][i] == 100 or data['morningstar'][i] == 100
+        'bullish_pattern': data['hammer'][i] == 100 or data['engulfing'][i] == 100 or data['morningstar'][i] == 100,
+
+        # BOLLINGER BANDS
+        'bb_upper': Decimal(str(upper)),
+        'bb_lower': Decimal(str(lower)),
+        'bb_middle': Decimal(str(middle)),
+        'bb_bandwidth': Decimal(str(bandwidth)),
+        'bb_prev_bandwidth': Decimal(str(prev_bandwidth)),
+        'bb_squeeze': bandwidth < Decimal('0.06'),
+        'bb_expanding': bandwidth > prev_bandwidth * Decimal('1.2'),
+        'price_near_lower': data['close'][i] <= lower * Decimal('1.005'),
+        'price_bounce': data['close'][i] > data['close'][p] and data['close'][p] <= data['bb_lower'][p]
     }
 
-# Override legacy functions to use TA-Lib
-def get_rsi(symbol):
-    ind = get_indicators(symbol)
-    return ind['rsi'] if ind else Decimal('50')
-
-def get_macd(symbol):
-    ind = get_indicators(symbol)
-    if not ind: return None, None, None
-    return ind['macd_line'], ind['signal_line'], ind['histogram']
-
-def get_mfi(symbol):
-    ind = get_indicators(symbol)
-    return ind['mfi'] if ind else Decimal('50')
-
-# -------------------- WHALE WALL PROTECTION --------------------
+# -------------------- WHALE WALL (DISABLED IN FALLBACK MODE) --------------------
 def get_buy_pressure_and_slippage(symbol):
     try:
         book = client.get_order_book(symbol=symbol, limit=50)
@@ -296,17 +310,15 @@ def get_buy_pressure_and_slippage(symbol):
         return Decimal('0.5'), Decimal('10')
 
 def is_whale_wall_danger(symbol) -> bool:
+    if using_fallback_list:
+        return False  # Whale protection OFF in fallback mode
     now = time.time()
     if symbol in last_whale_check:
         last_time, danger = last_whale_check[symbol]
         if now - last_time < WHALE_CHECK_INTERVAL:
             return danger
     pressure, slippage = get_buy_pressure_and_slippage(symbol)
-    danger = (
-        pressure < Decimal('0.40') or
-        slippage > Decimal('1.2') or
-        (pressure < Decimal('0.55') and slippage > Decimal('0.8'))
-    )
+    danger = pressure < Decimal('0.40') or slippage > Decimal('1.2') or (pressure < Decimal('0.55') and slippage > Decimal('0.8'))
     last_whale_check[symbol] = (now, danger)
     return danger
 
@@ -394,13 +406,14 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
             placing_order_for.discard(symbol)
             return False
         update_fees()
-        update_balances()
+        update Belonging()
         if side == 'BUY':
             cost = price_dec * qty_dec * (ONE + taker_fee)
             if get_available_usdt_after_reserve() < cost:
                 placing_order_for.discard(symbol)
                 return False
         else:
+ Hohenzollern
             base = symbol.replace('USDT', '')
             if qty_dec > account_balances.get(base, ZERO):
                 placing_order_for.discard(symbol)
@@ -410,7 +423,7 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
         base = symbol.replace('USDT', '')
         msg = f"GRID {side} {base} {qty_dec} @ ${price_dec:.8f}"
         terminal_insert(f"[{now_cst()}] SUCCESS {msg}")
-        send_whatsapp(f"∞ {msg}")
+        send_whatsapp(f"Infinity {msg}")
         if not exit_in_progress:
             active_grid_orders.setdefault(symbol, []).append(order['orderId'])
         active_orders += 1
@@ -430,30 +443,11 @@ def cancel_symbol_orders(symbol):
             active_grid_orders[symbol] = []
     except: pass
 
-
-## -------------------- MOMENTUM BUY LIST --------------------
-# Large proven high-liquidity fallback list (activated only when <25 dynamic coins)
-FALLBACK_BUY_LIST = [
-    'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'MATICUSDT', 'UNIUSDT', 'AAVEUSDT',
-    'NEARUSDT', 'INJUSDT', 'APTUSDT', 'SUIUSDT', 'OPUSDT', 'ARBUSDT', 'HBARUSDT',
-    'VETUSDT', 'ATOMUSDT', 'ALGOUSDT', 'FILUSDT', 'ICPUSDT', 'RUNEUSDT', 'GRTUSDT',
-    'MANAUSDT', 'SANDUSDT', 'AXSUSDT', 'EGLDUSDT', 'FTMUSDT', 'THETAUSDT', 'XTZUSDT',
-    'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'CFXUSDT', 'RNDRUSDT', 'STXUSDT', 'FLOWUSDT',
-    'IMXUSDT', 'MINAUSDT', 'KAVAUSDT', 'ROSEUSDT', 'LRCUSDT', 'ZILUSDT', 'ENJUSDT',
-    'BATUSDT', '1INCHUSDT', 'SNXUSDT', 'COMPUSDT', 'YFIUSDT', 'MKRUSDT', 'CRVUSDT',
-    'BALUSDT', 'SUSHIUSDT', 'KSMUSDT', 'WAVESUSDT', 'DASHUSDT', 'ZECUSDT', 'ONTUSDT',
-    'IOSTUSDT', 'REEFUSDT', 'TRBUSDT', 'EOSUSDT', 'QTUMUSDT', 'ICXUSDT', 'BTGUSDT',
-    'ZENUSDT', 'ONEUSDT', 'KLAYUSDT', 'HNTUSDT', 'ARUSDT', 'CELOUSDT', 'ANKRUSDT',
-    'SKLUSDT', 'DENTUSDT', 'CVCUSDT', 'HOTUSDT', 'BLZUSDT', 'OGNUSDT', 'FLUXUSDT',
-    'AUDIOUSDT', 'BANDUSDT', 'CELRUSDT', 'CHRUSDT', 'COTIUSDT', 'DOCKUSDT', 'LINAUSDT'
-]
-
+# -------------------- MOM0ENTUM BUY LIST (FIXED) --------------------
 def generate_buy_list():
-    global buy_list, last_buy_list_update
-    if exit_in_progress or not is_trading_allowed(): 
-        return
-    if time.time() - last_buy_list_update < 1800:
-        return
+    global buy_list, last_buy_list_update, using_fallback_list
+    if exit_in_progress or not is_trading_allowed(): return
+    if time.time() - last_buy_list_update < 1800: return
 
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -462,87 +456,91 @@ def generate_buy_list():
             'order': 'market_cap_desc',
             'per_page': 250,
             'page': 1,
-            'price_change_percentage': '24h,7d'
+            'price_change_percentage': '24h,7d',
+            'sparkline': 'false'
         }
-        coins = requests.get(url, params=params, timeout=25).json()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Accept': 'application/json'
+        }
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code}")
+        coins = response.json()
+        if not isinstance(coins, list):
+            raise Exception("Invalid response")
 
         candidates = []
         for coin in coins:
             base = coin['symbol'].upper()
-            if base in BLACKLISTED_BASE_ASSETS: 
-                continue
+            if base in BLACKLISTED_BASE_ASSETS: continue
             sym = base + 'USDT'
-            if sym not in symbol_info: 
+            if sym not in symbol_info: continue
+            volume_24h = Decimal(str(coin.get('total_volume') or 0))
+            change_24h = Decimal(str(coin.get('price_change_percentage_24h') or 0))
+            market_cap = Decimal(str(coin.get('market_cap') or 0))
+            if volume_24h < Decimal('40000000') or change_24h < Decimal('3') or market_cap < Decimal('500000000'):
                 continue
-
-            raw_volume = coin.get('total_volume') or 0
-            raw_change_24h = coin.get('price_change_percentage_24h') or 0
-            raw_market_cap = coin.get('market_cap') or 0
-
-            volume_24h   = Decimal(str(raw_volume))
-            change_24h   = Decimal(str(raw_change_24h))
-            market_cap   = Decimal(str(raw_market_cap))
-
-            if volume_24h < Decimal('40000000'): 
-                continue
-            if change_24h < Decimal('3'):  
-                continue
-            if market_cap < Decimal('500000000'): 
-                continue
-
             score = float(volume_24h / Decimal('1000000')) * (1 + float(change_24h) / 100)
-            pretty_name = f"{base} +{change_24h:.2f}% ${volume_24h/Decimal('1000000'):.0f}M vol"
+            pretty_name = f"{base} +{change_24h:.2f}% ${volume_24h/Decimal('1000000'):.0f}M"
             candidates.append((sym, score, pretty_name))
 
         candidates.sort(key=lambda x: -x[1])
         dynamic_list = [x[0] for x in candidates[:80]]
 
-        # ←←← NEW SAFETY LOGIC ←←←
         if len(dynamic_list) < 25:
-            terminal_insert(f"[{now_cst()}] ⚠️ Only {len(dynamic_list)} dynamic coins found — activating LARGE FALLBACK LIST ({len(FALLBACK_BUY_LIST)} coins)")
-            send_whatsapp(f"⚠️ Low momentum — switched to safe fallback list ({len(FALLBACK_BUY_LIST)} coins)")
+            terminal_insert(f"[{now_cst()}] Low momentum → activating SAFE FALLBACK LIST")
+            send_whatsapp("Low momentum → SAFE FALLBACK LIST active")
             buy_list = FALLBACK_BUY_LIST[:]
+            using_fallback_list = True
         else:
             buy_list = dynamic_list
+            using_fallback_list = False
 
-        # ←←← END NEW LOGIC ←←←
-        
         last_buy_list_update = time.time()
-        names = [x[2].split()[0] for x in candidates[:15]]
-        source = "FALLBACK" if len(dynamic_list) < 25 else "CoinGecko"
-        terminal_insert(f"[{now_cst()}] 🚀 Buy list refreshed ({source}) — {len(buy_list)} coins: {', '.join(names[:15])}")
-        send_whatsapp(f"🚀 New rocket list ({source}, {len(buy_list)} coins): {', '.join(names[:15])}")
+        top_names = [x[2].split()[0] for x in candidates[:15]]
+        source = "FALLBACK" if using_fallback_list else "CoinGecko"
+        terminal_insert(f"[{now_cst()}] Buy list refreshed ({source}): {', '.join(top_names[:15])}")
+        send_whatsapp(f"Infinity New list ({source}): {', '.join(top_names[:15])}")
 
     except Exception as e:
-        terminal_insert(f"Buy list error — using SAFE FALLBACK list: {e}")
-        send_whatsapp("🚨 CoinGecko failed — activated safe fallback list")
+        terminal_insert(f"[{now_cst()}] CoinGecko failed → FALLBACK LIST: {e}")
+        send_whatsapp("CoinGecko down → FALLBACK LIST")
         buy_list = FALLBACK_BUY_LIST[:]
-        last_buy_list_update = time.time()
+        using_fallback_list = True
+        last_buy_list_update = time.time() - 1500
 
-# -------------------- GRID USING TA-LIB --------------------
+# -------------------- GRID LOGIC WITH BOLLINGER POWER --------------------
 def place_platinum_grid(symbol):
     if exit_in_progress or not is_trading_allowed(): return
-    if is_whale_wall_danger(symbol):
-        terminal_insert(f"[{now_cst()}] 🐳 Whale wall detected on {symbol} — skipping grid")
-        return
-
+    if is_whale_wall_danger(symbol): return
     ind = get_indicators(symbol)
     if not ind: return
-
     price = ind['price']
     info = symbol_info[symbol]
     grid_pct = Decimal('0.012')
     cash = BASE_CASH_PER_LEVEL * Decimal('1.5')
 
-    rsi_ok = Decimal('60') <= ind['rsi'] <= Decimal('74')
-    mfi_ok = Decimal('50') < ind['mfi'] < Decimal('82')
-    macd_ok = ind['macd_bullish']
-    pressure, _ = get_buy_pressure_and_slippage(symbol)
-    momentum_ok = ind['above_sma200'] and ind['volume_spike']
-    pattern_ok = ind['macd_cross_bull'] or ind['bullish_pattern']
+    base_conditions = (
+        Decimal('60') <= ind['rsi'] <= Decimal('74') and
+        Decimal('50') < ind['mfi'] < Decimal('82') and
+        ind['macd_bullish'] and
+        ind['above_sma200'] and
+        ind['volume_spike'] and
+        (ind['macd_cross_bull'] or ind['bullish_pattern'])
+    )
 
-    if not (rsi_ok and mfi_ok and macd_ok and pressure > Decimal('0.58') and momentum_ok and pattern_ok):
+    bb_power = (
+        (ind['bb_squeeze'] and ind['bb_expanding']) or
+        (ind['price_near_lower'] and ind['price_bounce']) or
+        (ind['bb_squeeze'] and ind['macd_cross_bull'])
+    )
+
+    if not (base_conditions and bb_power):
         return
+
+    terminal_insert(f"[{now_cst()}] BOLLINGER ROCKET DETECTED → {symbol.replace('USDT','')} | "
+                    f"RSI {ind['rsi']:.1f} | BB Width {ind['bb_bandwidth']:.3f}")
 
     for i in range(1, 9):
         buy_price = price * ((ONE - grid_pct) ** i)
@@ -568,45 +566,68 @@ def regrid_symbol(symbol):
     cancel_symbol_orders(symbol)
     place_platinum_grid(symbol)
 
-def dynamic_rebalance():
-    if exit_in_progress or not is_trading_allowed(): 
-        return
+def scan_and_grid_healthy_coins():
+    if not buy_list: return
+    candidates = buy_list[:]
+    random.shuffle(candidates)
+    added = 0
+    for sym in candidates:
+        if added >= 12: break
+        if sym in placing_order_for or (sym in active_grid_orders and active_grid_orders[sym]):
+            continue
+        if is_whale_wall_danger(sym): continue
+        ind = get_indicators(sym)
+        if not ind: continue
 
+        base_ok = (
+            Decimal('60') <= ind['rsi'] <= Decimal('74') and
+            Decimal('50') < ind['mfi'] < Decimal('82') and
+            ind['macd_bullish'] and
+            ind['above_sma200'] and
+            ind['volume_spike'] and
+            (ind['macd_cross_bull'] or ind['bullish_pattern'])
+        )
+
+        bb_ok = (
+            (ind['bb_squeeze'] and ind['bb_expanding']) or
+            (ind['price_near_lower'] and ind['price_bounce']) or
+            (ind['bb_squeeze'] and ind['macd_cross_bull'])
+        )
+
+        if base_ok and bb_ok:
+            terminal_insert(f"[{now_cst()}] BOLLINGER ROCKET → {sym.replace('USDT','')} (RSI {ind['rsi']:.1f})")
+            regrid_symbol(sym)
+            added += 1
+
+    if added == 0:
+        terminal_insert(f"[{now_cst()}] No BB-powered rockets right now... waiting for squeeze")
+
+def dynamic_rebalance():
+    if exit_in_progress or not is_trading_allowed(): return
     try:
         update_balances()
-        total_portfolio = Decimal('0')
+        total_portfolio = ZERO
         for asset, qty in account_balances.items():
             if asset == 'USDT':
                 total_portfolio += qty
                 continue
             sym = asset + 'USDT'
-            if sym not in symbol_info: 
-                continue
+            if sym not in symbol_info: continue
             price = price_cache.get(sym) or Decimal(client.get_symbol_ticker(symbol=sym)['price'])
             total_portfolio += qty * price
-        if total_portfolio <= ZERO: 
-            return
-
-        terminal_insert(f"[{now_cst()}] Rebalance — Portfolio ${total_portfolio:,.0f}")
+        if total_portfolio <= ZERO: return
 
         for asset in list(account_balances.keys()):
-            if asset == 'USDT': 
-                continue
+            if asset == 'USDT': continue
             sym = asset + 'USDT'
-            if sym not in symbol_info: 
-                continue
-
+            if sym not in symbol_info: continue
             ind = get_indicators(sym)
             if not ind: continue
-
             current_price = price_cache.get(sym) or Decimal(client.get_symbol_ticker(symbol=sym)['price'])
             current_qty = account_balances.get(asset, ZERO)
             current_value = current_qty * current_price
-
             pressure, _ = get_buy_pressure_and_slippage(sym)
-
-            if (pressure >= Decimal('0.70') and ind['rsi'] < Decimal('75') and 
-                ind['mfi'] > Decimal('62') and ind['macd_bullish'] and ind['above_sma200']):
+            if (pressure >= Decimal('0.70') and ind['rsi'] < Decimal('75') and ind['mfi'] > Decimal('62') and ind['macd_bullish'] and ind['above_sma200']):
                 target_pct = Decimal('0.20')
             elif pressure >= Decimal('0.60') and ind['rsi'] < Decimal('72') and ind['macd_bullish']:
                 target_pct = Decimal('0.12')
@@ -614,43 +635,33 @@ def dynamic_rebalance():
                 target_pct = Decimal('0.06')
             else:
                 target_pct = Decimal('0.02')
-
             target_value = total_portfolio * target_pct
-
             if current_value > target_value * Decimal('1.12'):
                 sell_qty = floor_to_step((current_value - target_value) / current_price, symbol_info[sym]['stepSize'])
                 if sell_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'SELL', current_price * Decimal('0.999'), sell_qty)
-
             elif current_value < target_value * Decimal('0.88'):
                 buy_qty = floor_to_step((target_value - current_value) / current_price, symbol_info[sym]['stepSize'])
                 required = current_price * buy_qty * (ONE + taker_fee)
                 if get_available_usdt_after_reserve() >= required and buy_qty >= symbol_info[sym]['minQty']:
                     place_limit_order(sym, 'BUY', current_price * Decimal('1.001'), buy_qty)
-
     except Exception as e:
         terminal_insert(f"Rebalance error (ignored): {e}")
 
-# -------------------- EVENING EXIT & SCANNER --------------------
 def aggressive_evening_exit():
     global exit_in_progress, last_exit_attempt
-
     if not is_evening_exit_time() and not exit_in_progress: return
-
     if is_portfolio_fully_in_usdt():
         if exit_in_progress:
-            terminal_insert(f"[{now_cst()}] FULL EXIT COMPLETE — 100% USDT — NIGHT MODE")
-            send_whatsapp("EXIT COMPLETE — 100% USDT — Safe until 3 AM")
+            terminal_insert(f"[{now_cst()}] FULL EXIT COMPLETE — 100% USDT")
+            send_whatsapp("EXIT COMPLETE — Safe until 3 AM")
             exit_in_progress = False
         return
-
     if time.time() - last_exit_attempt < EXIT_RETRY_INTERVAL: return
     last_exit_attempt = time.time()
-
     if not exit_in_progress:
         exit_in_progress = True
         send_whatsapp("EVENING EXIT STARTED — Dumping all assets")
-
     update_balances()
     for asset, qty in list(account_balances.items()):
         if asset == 'USDT' or qty <= ZERO: continue
@@ -665,60 +676,19 @@ def aggressive_evening_exit():
                 place_limit_order(sym, 'SELL', sell_price, sell_qty, is_exit=True)
         except: pass
 
-def scan_and_grid_healthy_coins():
-    if not buy_list:
-        return
-
-    candidates = buy_list[:]
-    random.shuffle(candidates)
-
-    added = 0
-    for sym in candidates:
-        if added >= 12:
-            break
-        if sym in placing_order_for:
-            continue
-        if sym in active_grid_orders and active_grid_orders[sym]:
-            continue
-
-        if is_whale_wall_danger(sym):
-            continue
-
-        ind = get_indicators(sym)
-        if not ind: continue
-
-        pressure, _ = get_buy_pressure_and_slippage(sym)
-
-        if (Decimal('60') <= ind['rsi'] <= Decimal('74') and
-            Decimal('50') < ind['mfi'] < Decimal('82') and
-            ind['macd_bullish'] and
-            pressure > Decimal('0.58') and
-            ind['above_sma200'] and ind['volume_spike'] and
-            (ind['macd_cross_bull'] or ind['bullish_pattern'])):
-
-            terminal_insert(f"[{now_cst()}] 🚀 Healthy rocket found → placing grid on {sym}")
-            regrid_symbol(sym)
-            added += 1
-
-    if added == 0:
-        terminal_insert(f"[{now_cst()}] No healthy coins right now — waiting for whale walls to clear...")
-
 # -------------------- MAIN LOOP --------------------
 def main_loop():
     if not running: return
-
     aggressive_evening_exit()
-
     if not exit_in_progress and is_trading_allowed():
         generate_buy_list()
         scan_and_grid_healthy_coins()
         dynamic_rebalance()
-
     root.after(15000, main_loop)
 
 # -------------------- GUI --------------------
 root = tk.Tk()
-root.title("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION + TA-LIB")
+root.title("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION + BOLLINGER BANDS")
 root.geometry("800x900")
 root.resizable(False, False)
 root.configure(bg="#0d1117")
@@ -738,7 +708,7 @@ tk.Label(root, text="PLATINUM 2025", font=title_font, fg="#ffffff", bg="#0d1117"
 
 stats = tk.Frame(root, bg="#0d1117")
 stats.pack(padx=40, fill="x", pady=20)
-usdt_label = tk.Label(stats, text="USDT Balance: $0.00", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
+usdt_label = tk.Label(stats, text="USDT Balance: $--,---.--", font=big_font, fg="#8b949e", bg="#0d1117", anchor="w")
 usdt_label.pack(fill="x", pady=5)
 orders_label = tk.Label(stats, text="Active Orders: 0", font=big_font, fg="#39d353", bg="#0d1117", anchor="w")
 orders_label.pack(fill="x", pady=5)
@@ -758,8 +728,8 @@ def start_bot():
     if running: return
     running = True
     status_label.config(text="Status: RUNNING", fg="#00ff00")
-    terminal_insert(f"[{now_cst()}] BOT STARTED — FINAL PERFECTION + TA-LIB ENGAGED")
-    send_whatsapp("INFINITY GRID PLATINUM 2025 — FINAL PERFECTION STARTED")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION + BOLLINGER BANDS ENGAGED")
+    send_whatsapp("INFINITY GRID PLATINUM 2025 — STARTED")
     root.after(100, main_loop)
 
 def stop_bot():
@@ -784,6 +754,6 @@ if __name__ == "__main__":
     update_fees()
     start_user_stream()
     generate_buy_list()
-    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — FINAL PERFECTION + TA-LIB LOADED")
+    terminal_insert(f"[{now_cst()}] INFINITY GRID PLATINUM 2025 — ULTIMATE FINAL PERFECTION + BOLLINGER BANDS LOADED")
     update_gui()
     root.mainloop()
