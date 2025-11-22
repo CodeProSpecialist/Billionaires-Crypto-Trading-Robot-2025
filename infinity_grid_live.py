@@ -412,8 +412,7 @@ def place_limit_order(symbol, side, price, qty, is_exit=False):
             if get_available_usdt_after_reserve() < cost:
                 placing_order_for.discard(symbol)
                 return False
-        else:
- Hohenzollern
+        else
             base = symbol.replace('USDT', '')
             if qty_dec > account_balances.get(base, ZERO):
                 placing_order_for.discard(symbol)
